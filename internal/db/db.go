@@ -32,6 +32,26 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_users_wallet_address ON users(wallet_address);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON user_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	wallet_address TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	token TEXT NOT NULL,
+	amount NUMERIC(38,0) NOT NULL,
+	tx_hash TEXT,
+	status TEXT NOT NULL DEFAULT 'confirmed',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_tx_hash ON ledger_entries(tx_hash) WHERE tx_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ledger_user_id ON ledger_entries(user_id);
+
+CREATE TABLE IF NOT EXISTS chain_cursor (
+	key TEXT PRIMARY KEY,
+	block_number BIGINT NOT NULL
+);
 `
 
 // New connects to Postgres and ensures the auth schema exists.
