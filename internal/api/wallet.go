@@ -29,22 +29,34 @@ func (s *WalletServer) Balance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
-	balance, err := s.Ledger.BalanceFor(r.Context(), claims.UserID, usdcToken)
+	balances, err := s.Ledger.BalancesFor(r.Context(), claims.UserID)
 	if err != nil {
 		s.Log.Error("balance lookup failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not load balance")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": usdcToken, "amount": balance})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"balances": balances,
+		"token":    usdcToken,
+		"amount":   balances[usdcToken],
+	})
 }
 
 type withdrawRequestBody struct {
 	Amount string `json:"amount"`
+	Asset  string `json:"asset"`
 }
 
-// WithdrawRequest: POST /wallet/withdraw-request {amount}
-// Records an off-chain withdrawal request against the user's ledger balance. Actual approval
-// and payout happen separately (see AdminApproveWithdrawal) — the contract never moves funds.
+func requestAsset(asset string) string {
+	if strings.TrimSpace(asset) == "" {
+		return usdcToken
+	}
+	return asset
+}
+
+// WithdrawRequest: POST /wallet/withdraw-request {amount, asset?}
+// Records an off-chain withdrawal request against the user's current balance. Actual approval
+// and payout happen separately (see AdminApproveWithdrawal) - the contract never moves funds.
 func (s *WalletServer) WithdrawRequest(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(r)
 	if !ok {
@@ -57,6 +69,7 @@ func (s *WalletServer) WithdrawRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	asset := requestAsset(req.Asset)
 
 	amount, ok := new(big.Int).SetString(req.Amount, 10)
 	if !ok || amount.Sign() <= 0 {
@@ -64,34 +77,35 @@ func (s *WalletServer) WithdrawRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	balanceStr, err := s.Ledger.BalanceFor(r.Context(), claims.UserID, usdcToken)
+	balanceStr, err := s.Ledger.BalanceFor(r.Context(), claims.UserID, asset)
 	if err != nil {
 		s.Log.Error("balance lookup failed", "err", err)
-		writeError(w, http.StatusInternalServerError, "could not load balance")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	balance, _ := new(big.Int).SetString(balanceStr, 10)
 	if balance == nil || amount.Cmp(balance) > 0 {
-		writeError(w, http.StatusBadRequest, "amount exceeds available balance")
+		writeError(w, http.StatusBadRequest, "amount exceeds balance")
 		return
 	}
 
-	id, err := s.Ledger.InsertWithdrawalRequest(r.Context(), claims.UserID, claims.WalletAddress, usdcToken, amount.String())
+	id, err := s.Ledger.InsertWithdrawalRequest(r.Context(), claims.UserID, claims.WalletAddress, asset, amount.String())
 	if err != nil {
 		s.Log.Error("insert withdrawal request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not record withdrawal request")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "pending"})
+	writeJSON(w, http.StatusOK, map[string]string{"id": id, "asset": asset, "status": "pending"})
 }
 
 type adminApproveBody struct {
 	UserID string `json:"userId"`
 	Amount string `json:"amount"`
+	Asset  string `json:"asset"`
 }
 
-// AdminApproveWithdrawal: POST /admin/withdraw-approve {userId, amount}
+// AdminApproveWithdrawal: POST /admin/withdraw-approve {userId, amount, asset?}
 // Restricted to wallet addresses in the ADMIN_WALLET_ADDRESSES allowlist. Submits
 // recordWithdrawalApproval on-chain for auditability; treasury still pays the user directly,
 // off-chain, outside this flow (manual today, automatable later).
@@ -119,6 +133,7 @@ func (s *WalletServer) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "userId required")
 		return
 	}
+	asset := requestAsset(req.Asset)
 
 	amount, ok := new(big.Int).SetString(req.Amount, 10)
 	if !ok || amount.Sign() <= 0 {
@@ -139,11 +154,11 @@ func (s *WalletServer) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := s.Ledger.MarkWithdrawalApproved(r.Context(), user.ID, user.WalletAddress, usdcToken, amount.String(), txHash); err != nil {
+	if err := s.Ledger.MarkWithdrawalApproved(r.Context(), user.ID, user.WalletAddress, asset, amount.String(), txHash); err != nil {
 		s.Log.Error("mark withdrawal approved failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "approval submitted on-chain but ledger update failed")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"txHash": txHash, "status": "approved"})
+	writeJSON(w, http.StatusOK, map[string]string{"txHash": txHash, "asset": asset, "status": "approved"})
 }

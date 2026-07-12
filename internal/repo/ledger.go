@@ -3,6 +3,8 @@ package repo
 
 import (
 	"context"
+	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/models"
@@ -18,58 +20,315 @@ func NewLedgerRepo(pool *pgxpool.Pool) *LedgerRepo {
 	return &LedgerRepo{pool: pool}
 }
 
-// InsertDeposit records a confirmed on-chain deposit. Idempotent on txHash: replaying the
-// same event (e.g. after a listener restart) is a no-op.
+var assetColumns = map[string]string{
+	"USDC":      `"USDC"`,
+	"USDT":      `"USDT"`,
+	"BUSD":      `"BUSD"`,
+	"OUR_TOKEN": `"OUR_Token"`,
+}
+
+func normalizeAsset(asset string) (string, string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(asset))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	if normalized == "OURTOKEN" {
+		normalized = "OUR_TOKEN"
+	}
+	column, ok := assetColumns[normalized]
+	if !ok {
+		return "", "", fmt.Errorf("unsupported asset %q", asset)
+	}
+	return normalized, column, nil
+}
+func validatePositiveAmount(amountRaw string) error {
+	amount, ok := new(big.Int).SetString(amountRaw, 10)
+	if !ok || amount.Sign() <= 0 {
+		return fmt.Errorf("amount must be a positive integer raw token amount")
+	}
+	return nil
+}
+
+func (r *LedgerRepo) lockUser(ctx context.Context, tx pgx.Tx, userID string) error {
+	var exists int
+	if err := tx.QueryRow(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&exists); err != nil {
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("user %s not found", userID)
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *LedgerRepo) lockBalance(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_balances (user_id)
+		VALUES ($1)
+		ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+		return err
+	}
+	var exists int
+	return tx.QueryRow(ctx,
+		`SELECT 1 FROM user_balances WHERE user_id = $1 FOR UPDATE`,
+		userID,
+	).Scan(&exists)
+}
+
+func (r *LedgerRepo) lockBalances(ctx context.Context, tx pgx.Tx, userIDs []string) error {
+	for _, userID := range userIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_balances (user_id)
+			VALUES ($1)
+			ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+			return err
+		}
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT user_id FROM user_balances
+		WHERE user_id = ANY($1)
+		ORDER BY user_id
+		FOR UPDATE`, userIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if count != len(userIDs) {
+		return fmt.Errorf("could not lock all user balance records")
+	}
+	return nil
+}
+
+func (r *LedgerRepo) creditBalanceTx(ctx context.Context, tx pgx.Tx, userID, asset, amountRaw string) error {
+	_, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` + $2::numeric, updated_at = now() WHERE user_id = $1`, userID, amountRaw)
+	return err
+}
+
+func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asset, amountRaw string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` - $2::numeric, updated_at = now() WHERE user_id = $1 AND `+column+` >= $2::numeric`, userID, amountRaw)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("insufficient %s balance", normalized)
+	}
+	return nil
+}
+func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.creditBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *LedgerRepo) DebitBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.debitBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *LedgerRepo) TransferBalance(ctx context.Context, senderID, recipientID, asset, amountRaw string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if senderID == recipientID {
+		return fmt.Errorf("sender and recipient must be different users")
+	}
+	ids := []string{senderID, recipientID}
+	if strings.Compare(ids[0], ids[1]) > 0 {
+		ids[0], ids[1] = ids[1], ids[0]
+	}
+	for _, id := range ids {
+		if err := r.lockUser(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	if err := r.lockBalances(ctx, tx, ids); err != nil {
+		return err
+	}
+	if err := r.debitBalanceTx(ctx, tx, senderID, asset, amountRaw); err != nil {
+		return err
+	}
+	if err := r.creditBalanceTx(ctx, tx, recipientID, asset, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourceAmountRaw, destinationAsset, destinationAmountRaw string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.debitBalanceTx(ctx, tx, userID, sourceAsset, sourceAmountRaw); err != nil {
+		return err
+	}
+	if err := r.creditBalanceTx(ctx, tx, userID, destinationAsset, destinationAmountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// InsertDeposit records a confirmed on-chain deposit and credits the user's asset balance.
 func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, token, amountRaw, txHash string) error {
-	_, err := r.pool.Exec(ctx,
+	normalizedToken, _, err := normalizeAsset(token)
+	if err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	commandTag, err := tx.Exec(ctx,
 		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, tx_hash, status)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (tx_hash) WHERE tx_hash IS NOT NULL DO NOTHING`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindDeposit, token, amountRaw, txHash, models.LedgerStatusConfirmed,
+		userID, strings.ToLower(walletAddress), models.LedgerKindDeposit, normalizedToken, amountRaw, txHash, models.LedgerStatusConfirmed,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() > 0 {
+		if err := r.creditBalanceTx(ctx, tx, userID, normalizedToken, amountRaw); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // InsertWithdrawalRequest records an off-chain withdrawal request pending admin approval.
 func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, walletAddress, token, amountRaw string) (string, error) {
+	normalizedToken, _, err := normalizeAsset(token)
+	if err != nil {
+		return "", err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return "", err
+	}
+
 	var id string
-	err := r.pool.QueryRow(ctx,
+	err = r.pool.QueryRow(ctx,
 		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, status)
 		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, token, amountRaw, models.LedgerStatusPending,
+		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, normalizedToken, amountRaw, models.LedgerStatusPending,
 	).Scan(&id)
 	return id, err
 }
 
-// MarkWithdrawalApproved records the on-chain WithdrawalApproved audit event for userID/amount.
+// MarkWithdrawalApproved records the on-chain WithdrawalApproved audit event and debits the user's balance.
 func (r *LedgerRepo) MarkWithdrawalApproved(ctx context.Context, userID, walletAddress, token, amountRaw, txHash string) error {
-	_, err := r.pool.Exec(ctx,
+	normalizedToken, _, err := normalizeAsset(token)
+	if err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, tx_hash, status)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalApproved, token, amountRaw, txHash, models.LedgerStatusConfirmed,
-	)
-	return err
+		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalApproved, normalizedToken, amountRaw, txHash, models.LedgerStatusConfirmed,
+	); err != nil {
+		return err
+	}
+	if err := r.debitBalanceTx(ctx, tx, userID, normalizedToken, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-// BalanceFor returns confirmed deposits minus approved withdrawals for userID/token, in raw
-// token units (as a decimal string, since amounts may exceed int64).
+// BalanceFor returns the current balance for userID/token.
 func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (string, error) {
+	_, column, err := normalizeAsset(token)
+	if err != nil {
+		return "0", err
+	}
 	var balance string
-	err := r.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(
-			CASE
-				WHEN kind = $2 AND status = $3 THEN amount
-				WHEN kind = $4 AND status = $3 THEN -amount
-				ELSE 0
-			END
-		), 0)::text
-		 FROM ledger_entries WHERE user_id = $1 AND token = $5`,
-		userID, models.LedgerKindDeposit, models.LedgerStatusConfirmed, models.LedgerKindWithdrawalApproved, token,
-	).Scan(&balance)
-	if err != nil && err != pgx.ErrNoRows {
+	err = r.pool.QueryRow(ctx, `SELECT `+column+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balance)
+	if err == pgx.ErrNoRows {
+		return "0", nil
+	}
+	if err != nil {
 		return "0", err
 	}
 	return balance, nil
+}
+
+func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
+	balances := map[string]string{}
+	var usdc, usdt, busd, ourToken string
+	err := r.pool.QueryRow(ctx, `
+		SELECT "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
+		FROM user_balances
+		WHERE user_id = $1`, userID).Scan(&usdc, &usdt, &busd, &ourToken)
+	if err == pgx.ErrNoRows {
+		return map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	balances["USDC"] = usdc
+	balances["USDT"] = usdt
+	balances["BUSD"] = busd
+	balances["OUR_Token"] = ourToken
+	return balances, nil
+}
+
+// AvailableBalanceFor is kept for compatibility with existing callers.
+func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token string) (string, error) {
+	return r.BalanceFor(ctx, userID, token)
 }
 
 // PendingWithdrawalRequest returns the most recent pending withdrawal request for userID, if any.
