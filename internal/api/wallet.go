@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"math/big"
 	"net/http"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/chain"
+	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/repo"
 )
 
@@ -17,9 +20,11 @@ const usdcToken = "USDC"
 // (RPC/treasury key) isn't configured for a given deployment.
 type WalletServer struct {
 	*Server
-	Ledger *repo.LedgerRepo
-	Signer *chain.Signer
-	Admins map[string]bool
+	Ledger       *repo.LedgerRepo
+	Signer       *chain.Signer
+	Admins       map[string]bool
+	EngineSecret string
+	EngineClient *engineclient.Client
 }
 
 // Balance: GET /wallet/balance
@@ -35,8 +40,15 @@ func (s *WalletServer) Balance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not load balance")
 		return
 	}
+	locked, err := s.Ledger.LockedBalancesFor(r.Context(), claims.UserID)
+	if err != nil {
+		s.Log.Error("locked balance lookup failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load balance")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"balances": balances,
+		"locked":   locked,
 		"token":    usdcToken,
 		"amount":   balances[usdcToken],
 	})
@@ -160,5 +172,126 @@ func (s *WalletServer) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	engineclient.Async("debit", func(ctx context.Context) error {
+		return s.EngineClient.Debit(ctx, user.ID, asset, amount.String())
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"txHash": txHash, "asset": asset, "status": "approved"})
+}
+
+// AdminEngineBackfill: POST /admin/engine-backfill
+// One-time (admin-triggered) push of every existing nonzero Postgres balance into
+// the matching-engine's in-memory ledger, for balances that predate the
+// deposit/withdrawal sync hooks.
+func (s *WalletServer) AdminEngineBackfill(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	if !s.Admins[strings.ToLower(claims.WalletAddress)] {
+		writeError(w, http.StatusForbidden, "not authorized")
+		return
+	}
+	if !s.EngineClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "engine ledger-sync bridge not configured")
+		return
+	}
+
+	balances, err := s.Ledger.AllNonzeroBalances(r.Context())
+	if err != nil {
+		s.Log.Error("backfill: load balances failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load balances")
+		return
+	}
+
+	synced, failed := 0, 0
+	for _, b := range balances {
+		if err := s.EngineClient.Credit(r.Context(), b.UserID, b.Asset, b.Amount); err != nil {
+			s.Log.Error("backfill: credit failed", "err", err, "userId", b.UserID, "asset", b.Asset)
+			failed++
+			continue
+		}
+		synced++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]int{"synced": synced, "failed": failed, "total": len(balances)})
+}
+
+type internalLockBody struct {
+	UserID string `json:"userId"`
+	Asset  string `json:"asset"`
+	Amount string `json:"amount"`
+}
+
+// checkEngineSecret authorizes the matching-engine, which is not a logged-in wallet
+// user and so can't present a JWT. Returns false (and writes the error response)
+// if the shared secret is missing/misconfigured or doesn't match.
+func (s *WalletServer) checkEngineSecret(w http.ResponseWriter, r *http.Request) bool {
+	if s.EngineSecret == "" {
+		writeError(w, http.StatusServiceUnavailable, "engine balance bridge not configured")
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Engine-Secret")), []byte(s.EngineSecret)) != 1 {
+		writeError(w, http.StatusForbidden, "not authorized")
+		return false
+	}
+	return true
+}
+
+// InternalLockBalance: POST /internal/balance/lock {userId, asset, amount}
+// Called by the matching-engine when it reserves margin/notional for a new order,
+// to mirror the hold against the user's real Postgres balance.
+func (s *WalletServer) InternalLockBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.LockBalance(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "locked"})
+}
+
+// InternalUnlockBalance: POST /internal/balance/unlock {userId, asset, amount}
+// Called by the matching-engine when a reservation is released (order cancelled,
+// rejected, or partially filled).
+func (s *WalletServer) InternalUnlockBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.UnlockBalance(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "unlocked"})
+}
+
+// InternalSettleBalance: POST /internal/balance/settle {userId, asset, amount}
+// Called by the matching-engine when a reserved order fills, converting the
+// Postgres-side hold into a real debit.
+func (s *WalletServer) InternalSettleBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.SettleLockedDebit(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "settled"})
 }

@@ -114,6 +114,10 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC" NUMERIC(38,0) NOT NULL
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
@@ -198,13 +202,17 @@ BEGIN
 			"USDT" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"OUR_Token" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"OUR_Token_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 
 		INSERT INTO user_balances_reordered
-			(balance_id, user_id, "USDC", "USDT", "BUSD", "OUR_Token", created_at, updated_at)
-		SELECT balance_id, user_id, "USDC", "USDT", "BUSD", "OUR_Token", created_at, updated_at
+			(balance_id, user_id, "USDC", "USDT", "BUSD", "OUR_Token", "USDC_locked", "USDT_locked", "BUSD_locked", "OUR_Token_locked", created_at, updated_at)
+		SELECT balance_id, user_id, "USDC", "USDT", "BUSD", "OUR_Token", "USDC_locked", "USDT_locked", "BUSD_locked", "OUR_Token_locked", created_at, updated_at
 		FROM user_balances;
 
 		SELECT EXISTS (SELECT 1 FROM user_balances_reordered) INTO has_rows;

@@ -27,6 +27,13 @@ var assetColumns = map[string]string{
 	"OUR_TOKEN": `"OUR_Token"`,
 }
 
+var lockedColumns = map[string]string{
+	"USDC":      `"USDC_locked"`,
+	"USDT":      `"USDT_locked"`,
+	"BUSD":      `"BUSD_locked"`,
+	"OUR_TOKEN": `"OUR_Token_locked"`,
+}
+
 func normalizeAsset(asset string) (string, string, error) {
 	normalized := strings.ToUpper(strings.TrimSpace(asset))
 	normalized = strings.ReplaceAll(normalized, "-", "_")
@@ -138,6 +145,102 @@ func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asse
 	}
 	return nil
 }
+// LockBalance soft-holds amountRaw of asset for userID, e.g. for an open order's
+// margin/notional. Fails if the unlocked (balance - locked) amount is insufficient.
+func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
+		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` >= $2::numeric`,
+		userID, amountRaw)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("insufficient %s balance to lock", normalized)
+	}
+	return tx.Commit(ctx)
+}
+
+// UnlockBalance releases a previously locked amountRaw of asset for userID, e.g. on
+// order cancel/rejection. Floors at zero locked, mirroring the matching-engine's
+// in-memory Ledger.Release semantics.
+func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
+		 WHERE user_id = $1`,
+		userID, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SettleLockedDebit converts a previously locked hold into a real debit, e.g. when an
+// order fills: both balance and locked amount are reduced together in one transaction.
+func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amountRaw string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE user_balances
+		 SET `+column+` = `+column+` - $2::numeric,
+		     `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric),
+		     updated_at = now()
+		 WHERE user_id = $1 AND `+column+` >= $2::numeric`,
+		userID, amountRaw)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("insufficient %s balance to settle", normalized)
+	}
+	return tx.Commit(ctx)
+}
+
 func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -326,9 +429,64 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	return balances, nil
 }
 
+// LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
+func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
+	locked := map[string]string{}
+	var usdc, usdt, busd, ourToken string
+	err := r.pool.QueryRow(ctx, `
+		SELECT "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
+		FROM user_balances
+		WHERE user_id = $1`, userID).Scan(&usdc, &usdt, &busd, &ourToken)
+	if err == pgx.ErrNoRows {
+		return map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	locked["USDC"] = usdc
+	locked["USDT"] = usdt
+	locked["BUSD"] = busd
+	locked["OUR_Token"] = ourToken
+	return locked, nil
+}
+
 // AvailableBalanceFor is kept for compatibility with existing callers.
 func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token string) (string, error) {
 	return r.BalanceFor(ctx, userID, token)
+}
+
+// NonzeroBalance is one user's nonzero balance for one asset.
+type NonzeroBalance struct {
+	UserID string
+	Asset  string
+	Amount string
+}
+
+// AllNonzeroBalances returns every (user, asset) pair with a positive balance,
+// for one-time backfill of the matching-engine's in-memory ledger.
+func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT user_id, 'USDC', "USDC"::text FROM user_balances WHERE "USDC" > 0
+		UNION ALL
+		SELECT user_id, 'USDT', "USDT"::text FROM user_balances WHERE "USDT" > 0
+		UNION ALL
+		SELECT user_id, 'BUSD', "BUSD"::text FROM user_balances WHERE "BUSD" > 0
+		UNION ALL
+		SELECT user_id, 'OUR_Token', "OUR_Token"::text FROM user_balances WHERE "OUR_Token" > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []NonzeroBalance
+	for rows.Next() {
+		var b NonzeroBalance
+		if err := rows.Scan(&b.UserID, &b.Asset, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 // PendingWithdrawalRequest returns the most recent pending withdrawal request for userID, if any.

@@ -16,6 +16,7 @@ import (
 	"github.com/dex/dex-backend/internal/auth"
 	"github.com/dex/dex-backend/internal/chain"
 	"github.com/dex/dex-backend/internal/db"
+	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/repo"
 	"github.com/joho/godotenv"
 )
@@ -45,6 +46,7 @@ func main() {
 
 	userRepo := repo.NewUserRepo(pool)
 	ledgerRepo := repo.NewLedgerRepo(pool)
+	engineClient := engineclient.New()
 
 	srv := &api.Server{
 		Nonces: auth.NewNonceStore(),
@@ -54,9 +56,14 @@ func main() {
 	}
 
 	walletSrv := &api.WalletServer{
-		Server: srv,
-		Ledger: ledgerRepo,
-		Admins: parseAdminAddresses(os.Getenv("ADMIN_WALLET_ADDRESSES")),
+		Server:       srv,
+		Ledger:       ledgerRepo,
+		Admins:       parseAdminAddresses(os.Getenv("ADMIN_WALLET_ADDRESSES")),
+		EngineSecret: os.Getenv("ENGINE_SHARED_SECRET"),
+		EngineClient: engineClient,
+	}
+	if walletSrv.EngineSecret == "" {
+		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
 	}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
@@ -72,12 +79,13 @@ func main() {
 		}
 
 		listener := &chain.Listener{
-			Client:     chainClient,
-			Pool:       pool,
-			Users:      userRepo,
-			Ledger:     ledgerRepo,
-			Log:        slog.Default(),
-			StartBlock: startBlock,
+			Client:       chainClient,
+			Pool:         pool,
+			Users:        userRepo,
+			Ledger:       ledgerRepo,
+			Log:          slog.Default(),
+			StartBlock:   startBlock,
+			EngineClient: engineClient,
 		}
 		go listener.Run(ctx)
 
@@ -107,6 +115,10 @@ func main() {
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
+	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
+	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
+	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
+	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

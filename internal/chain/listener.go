@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/repo"
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -23,12 +24,13 @@ const (
 )
 
 type Listener struct {
-	Client     *Client
-	Pool       *pgxpool.Pool
-	Users      *repo.UserRepo
-	Ledger     *repo.LedgerRepo
-	Log        *slog.Logger
-	StartBlock uint64 // used only to seed chain_cursor on first run
+	Client       *Client
+	Pool         *pgxpool.Pool
+	Users        *repo.UserRepo
+	Ledger       *repo.LedgerRepo
+	Log          *slog.Logger
+	StartBlock   uint64 // used only to seed chain_cursor on first run
+	EngineClient *engineclient.Client
 }
 
 func (l *Listener) Run(ctx context.Context) {
@@ -106,7 +108,14 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 		return err
 	}
 
-	return l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), tokenLabel, event.Amount.String(), vLog.TxHash.Hex())
+	if err := l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), tokenLabel, event.Amount.String(), vLog.TxHash.Hex()); err != nil {
+		return err
+	}
+
+	engineclient.Async("credit", func(ctx context.Context) error {
+		return l.EngineClient.Credit(ctx, user.ID, tokenLabel, event.Amount.String())
+	})
+	return nil
 }
 
 func (l *Listener) cursor(ctx context.Context) (uint64, error) {
