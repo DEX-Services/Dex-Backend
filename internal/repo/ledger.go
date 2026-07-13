@@ -145,8 +145,30 @@ func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asse
 	}
 	return nil
 }
-// LockBalance soft-holds amountRaw of asset for userID, e.g. for an open order's
-// margin/notional. Fails if the unlocked (balance - locked) amount is insufficient.
+func (r *LedgerRepo) pendingWithdrawalHoldTx(ctx context.Context, tx pgx.Tx, userID, normalizedToken string) (*big.Int, error) {
+	var holdRaw string
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(amount), 0)::text
+		FROM ledger_entries
+		WHERE user_id = $1
+		  AND token = $2
+		  AND kind = $3
+		  AND status IN ($4, $5)`,
+		userID,
+		normalizedToken,
+		models.LedgerKindWithdrawalRequest,
+		models.LedgerStatusPending,
+		models.LedgerStatusProcessing,
+	).Scan(&holdRaw)
+	if err != nil {
+		return nil, err
+	}
+	hold, ok := new(big.Int).SetString(holdRaw, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid pending withdrawal amount %q", holdRaw)
+	}
+	return hold, nil
+}
 func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw string) error {
 	normalized, column, err := normalizeAsset(asset)
 	if err != nil {
@@ -164,10 +186,14 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
+	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+	if err != nil {
+		return err
+	}
 	commandTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
-		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` >= $2::numeric`,
-		userID, amountRaw)
+		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - $3::numeric >= $2::numeric`,
+		userID, amountRaw, pendingHold.String())
 	if err != nil {
 		return err
 	}
@@ -344,52 +370,145 @@ func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, t
 	return tx.Commit(ctx)
 }
 
-// InsertWithdrawalRequest records an off-chain withdrawal request pending admin approval.
+// InsertWithdrawalRequest records a withdrawal request and reserves the amount by
+// counting pending/processing requests against available balance.
 func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, walletAddress, token, amountRaw string) (string, error) {
-	normalizedToken, _, err := normalizeAsset(token)
+	normalizedToken, column, err := normalizeAsset(token)
 	if err != nil {
 		return "", err
 	}
+	lockedColumn := lockedColumns[normalizedToken]
 	if err := validatePositiveAmount(amountRaw); err != nil {
 		return "", err
-	}
-
-	var id string
-	err = r.pool.QueryRow(ctx,
-		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, status)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, normalizedToken, amountRaw, models.LedgerStatusPending,
-	).Scan(&id)
-	return id, err
-}
-
-// MarkWithdrawalApproved records the on-chain WithdrawalApproved audit event and debits the user's balance.
-func (r *LedgerRepo) MarkWithdrawalApproved(ctx context.Context, userID, walletAddress, token, amountRaw, txHash string) error {
-	normalizedToken, _, err := normalizeAsset(token)
-	if err != nil {
-		return err
-	}
-	if err := validatePositiveAmount(amountRaw); err != nil {
-		return err
 	}
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return "", err
+	}
+	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalizedToken)
+	if err != nil {
+		return "", err
+	}
+
+	var balanceRaw, lockedRaw string
+	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
+		return "", err
+	}
+	balance, _ := new(big.Int).SetString(balanceRaw, 10)
+	locked, _ := new(big.Int).SetString(lockedRaw, 10)
+	amount, _ := new(big.Int).SetString(amountRaw, 10)
+	available := new(big.Int).Sub(balance, locked)
+	available.Sub(available, pendingHold)
+	if available.Cmp(amount) < 0 {
+		return "", fmt.Errorf("insufficient %s available balance", normalizedToken)
+	}
+
+	var id string
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, status)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, normalizedToken, amountRaw, models.LedgerStatusPending,
+	).Scan(&id); err != nil {
+		return "", err
+	}
+	return id, tx.Commit(ctx)
+}
+
+// MarkWithdrawalProcessing atomically claims a pending withdrawal request for payout.
+func (r *LedgerRepo) MarkWithdrawalProcessing(ctx context.Context, requestID string) (*models.LedgerEntry, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var e models.LedgerEntry
+	err = tx.QueryRow(ctx,
+		`UPDATE ledger_entries
+		 SET status = $2
+		 WHERE id = $1 AND kind = $3 AND status = $4
+		 RETURNING id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at`,
+		requestID, models.LedgerStatusProcessing, models.LedgerKindWithdrawalRequest, models.LedgerStatusPending,
+	).Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("withdrawal request is not pending")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := r.lockBalance(ctx, tx, e.UserID); err != nil {
+		return nil, err
+	}
+	return &e, tx.Commit(ctx)
+}
+
+// MarkWithdrawalConfirmed records the successful vault payout and debits the user's balance.
+func (r *LedgerRepo) MarkWithdrawalConfirmed(ctx context.Context, requestID, txHash string) (*models.LedgerEntry, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var e models.LedgerEntry
+	err = tx.QueryRow(ctx,
+		`SELECT id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at
+		 FROM ledger_entries
+		 WHERE id = $1 AND kind = $2 FOR UPDATE`,
+		requestID, models.LedgerKindWithdrawalRequest,
+	).Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if e.Status != models.LedgerStatusProcessing {
+		return nil, fmt.Errorf("withdrawal request is not processing")
+	}
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, tx_hash, status)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalApproved, normalizedToken, amountRaw, txHash, models.LedgerStatusConfirmed,
+		e.UserID, strings.ToLower(e.WalletAddress), models.LedgerKindWithdrawalApproved, e.Token, e.Amount, txHash, models.LedgerStatusConfirmed,
 	); err != nil {
+		return nil, err
+	}
+	if err := r.debitBalanceTx(ctx, tx, e.UserID, e.Token, e.Amount); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE ledger_entries SET status = $2 WHERE id = $1`,
+		requestID, models.LedgerStatusConfirmed,
+	); err != nil {
+		return nil, err
+	}
+	return &e, tx.Commit(ctx)
+}
+
+func (r *LedgerRepo) MarkWithdrawalFailed(ctx context.Context, requestID string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE ledger_entries SET status = $2 WHERE id = $1 AND kind = $3 AND status = $4`,
+		requestID, models.LedgerStatusFailed, models.LedgerKindWithdrawalRequest, models.LedgerStatusProcessing,
+	)
+	return err
+}
+
+func (r *LedgerRepo) RejectWithdrawalRequest(ctx context.Context, requestID string) error {
+	commandTag, err := r.pool.Exec(ctx,
+		`UPDATE ledger_entries SET status = $2 WHERE id = $1 AND kind = $3 AND status = $4`,
+		requestID, models.LedgerStatusRejected, models.LedgerKindWithdrawalRequest, models.LedgerStatusPending,
+	)
+	if err != nil {
 		return err
 	}
-	if err := r.debitBalanceTx(ctx, tx, userID, normalizedToken, amountRaw); err != nil {
-		return err
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("withdrawal request is not pending")
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // BalanceFor returns the current balance for userID/token.
@@ -450,9 +569,68 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	return locked, nil
 }
 
-// AvailableBalanceFor is kept for compatibility with existing callers.
+// PendingWithdrawalHoldsFor returns pending/processing withdrawal holds per asset for userID.
+func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID string) (map[string]string, error) {
+	holds := map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
+	rows, err := r.pool.Query(ctx, `
+		SELECT token, COALESCE(SUM(amount), 0)::text
+		FROM ledger_entries
+		WHERE user_id = $1
+		  AND kind = $2
+		  AND status IN ($3, $4)
+		GROUP BY token`,
+		userID, models.LedgerKindWithdrawalRequest, models.LedgerStatusPending, models.LedgerStatusProcessing,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var token, amount string
+		if err := rows.Scan(&token, &amount); err != nil {
+			return nil, err
+		}
+		switch token {
+		case "OUR_TOKEN":
+			holds["OUR_Token"] = amount
+		default:
+			holds[token] = amount
+		}
+	}
+	return holds, rows.Err()
+}
+
+// AvailableBalanceFor returns balance minus trading locks and pending withdrawal holds.
 func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token string) (string, error) {
-	return r.BalanceFor(ctx, userID, token)
+	normalized, column, err := normalizeAsset(token)
+	if err != nil {
+		return "0", err
+	}
+	lockedColumn := lockedColumns[normalized]
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return "0", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return "0", err
+	}
+	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+	if err != nil {
+		return "0", err
+	}
+	var balanceRaw, lockedRaw string
+	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
+		return "0", err
+	}
+	balance, _ := new(big.Int).SetString(balanceRaw, 10)
+	locked, _ := new(big.Int).SetString(lockedRaw, 10)
+	available := new(big.Int).Sub(balance, locked)
+	available.Sub(available, pendingHold)
+	if available.Sign() < 0 {
+		available.SetInt64(0)
+	}
+	return available.String(), tx.Commit(ctx)
 }
 
 // NonzeroBalance is one user's nonzero balance for one asset.

@@ -19,5 +19,8 @@ const (
 	LedgerKindWithdrawalRequest  = "withdrawal_request"
 	LedgerKindWithdrawalApproved = "withdrawal_approved"
 	LedgerStatusPending          = "pending"
+	LedgerStatusProcessing       = "processing"
 	LedgerStatusConfirmed        = "confirmed"
+	LedgerStatusFailed           = "failed"
+	LedgerStatusRejected         = "rejected"
 )
