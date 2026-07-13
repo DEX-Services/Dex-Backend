@@ -198,24 +198,54 @@ func (s *WalletServer) AdminEngineBackfill(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	balances, err := s.Ledger.AllNonzeroBalances(r.Context())
+	synced, failed, total, err := s.runBackfill(r.Context())
 	if err != nil {
 		s.Log.Error("backfill: load balances failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not load balances")
 		return
 	}
 
-	synced, failed := 0, 0
+	writeJSON(w, http.StatusOK, map[string]int{"synced": synced, "failed": failed, "total": total})
+}
+
+// runBackfill pushes every nonzero Postgres balance into the engine ledger,
+// shared by AdminEngineBackfill (human-triggered) and InternalEngineBackfill
+// (engine self-triggered on startup).
+func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total int, err error) {
+	balances, err := s.Ledger.AllNonzeroBalances(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
 	for _, b := range balances {
-		if err := s.EngineClient.Credit(r.Context(), b.UserID, b.Asset, b.Amount); err != nil {
-			s.Log.Error("backfill: credit failed", "err", err, "userId", b.UserID, "asset", b.Asset)
+		if cerr := s.EngineClient.Credit(ctx, b.UserID, b.Asset, b.Amount); cerr != nil {
+			s.Log.Error("backfill: credit failed", "err", cerr, "userId", b.UserID, "asset", b.Asset)
 			failed++
 			continue
 		}
 		synced++
 	}
+	return synced, failed, len(balances), nil
+}
 
-	writeJSON(w, http.StatusOK, map[string]int{"synced": synced, "failed": failed, "total": len(balances)})
+// InternalEngineBackfill: POST /internal/engine-backfill
+// Same as AdminEngineBackfill but authorized via the engine shared secret
+// instead of an admin session, so the matching-engine can self-trigger this
+// on its own startup without a human in the loop.
+func (s *WalletServer) InternalEngineBackfill(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	if !s.EngineClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "engine ledger-sync bridge not configured")
+		return
+	}
+	synced, failed, total, err := s.runBackfill(r.Context())
+	if err != nil {
+		s.Log.Error("backfill: load balances failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load balances")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"synced": synced, "failed": failed, "total": total})
 }
 
 type internalLockBody struct {
