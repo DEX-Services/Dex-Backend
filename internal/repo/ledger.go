@@ -448,7 +448,8 @@ func (r *LedgerRepo) MarkWithdrawalProcessing(ctx context.Context, requestID str
 	return &e, tx.Commit(ctx)
 }
 
-// MarkWithdrawalConfirmed records the successful vault payout and debits the user's balance.
+// MarkWithdrawalConfirmed stores the successful payout hash on the original request row
+// and debits the user's balance. One completed withdrawal remains one ledger row.
 func (r *LedgerRepo) MarkWithdrawalConfirmed(ctx context.Context, requestID, txHash string) (*models.LedgerEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -470,25 +471,20 @@ func (r *LedgerRepo) MarkWithdrawalConfirmed(ctx context.Context, requestID, txH
 		return nil, fmt.Errorf("withdrawal request is not processing")
 	}
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, tx_hash, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		e.UserID, strings.ToLower(e.WalletAddress), models.LedgerKindWithdrawalApproved, e.Token, e.Amount, txHash, models.LedgerStatusConfirmed,
-	); err != nil {
-		return nil, err
-	}
 	if err := r.debitBalanceTx(ctx, tx, e.UserID, e.Token, e.Amount); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE ledger_entries SET status = $2 WHERE id = $1`,
-		requestID, models.LedgerStatusConfirmed,
-	); err != nil {
+	if err := tx.QueryRow(ctx,
+		`UPDATE ledger_entries
+		 SET status = $2, tx_hash = $3
+		 WHERE id = $1
+		 RETURNING id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at`,
+		requestID, models.LedgerStatusConfirmed, txHash,
+	).Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &e, tx.Commit(ctx)
 }
-
 func (r *LedgerRepo) MarkWithdrawalFailed(ctx context.Context, requestID string) error {
 	_, err := r.pool.Exec(ctx,
 		`UPDATE ledger_entries SET status = $2 WHERE id = $1 AND kind = $3 AND status = $4`,
