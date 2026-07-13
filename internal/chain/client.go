@@ -1,5 +1,5 @@
-// Package chain talks to the Avalanche Fuji DexVault contract: it watches for Deposit events
-// and submits recordWithdrawalApproval transactions signed by the treasury key.
+// Package chain talks to Avalanche Fuji contracts: it watches DexVault Deposit events
+// and submits treasury-signed USDC withdrawal transactions.
 package chain
 
 import (
@@ -17,26 +17,51 @@ const dexVaultABIJSON = `[
 		{"name":"amount","type":"uint256","indexed":false},
 		{"name":"timestamp","type":"uint256","indexed":false}
 	]},
+	{"type":"function","name":"depositToken","stateMutability":"nonpayable","inputs":[
+		{"name":"token","type":"address"},
+		{"name":"amount","type":"uint256"}
+	],"outputs":[]},
+	{"type":"function","name":"withdrawToken","stateMutability":"nonpayable","inputs":[
+		{"name":"token","type":"address"},
+		{"name":"to","type":"address"},
+		{"name":"amount","type":"uint256"}
+	],"outputs":[]},
 	{"type":"function","name":"recordWithdrawalApproval","stateMutability":"nonpayable","inputs":[
 		{"name":"user","type":"address"},
 		{"name":"amount","type":"uint256"}
 	],"outputs":[]}
 ]`
 
+const erc20ABIJSON = `[
+	{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[
+		{"name":"to","type":"address"},
+		{"name":"amount","type":"uint256"}
+	],"outputs":[{"name":"","type":"bool"}]},
+	{"type":"function","name":"balanceOf","stateMutability":"view","inputs":[
+		{"name":"account","type":"address"}
+	],"outputs":[{"name":"","type":"uint256"}]}
+]`
+
 type Client struct {
 	ETH          *ethclient.Client
 	VaultAddress common.Address
+	TokenAddress common.Address
 	VaultABI     abi.ABI
+	TokenABI     abi.ABI
 	DepositTopic common.Hash
 }
 
-func NewClient(ctx context.Context, rpcURL, vaultAddress string) (*Client, error) {
+func NewClient(ctx context.Context, rpcURL, vaultAddress, tokenAddress string) (*Client, error) {
 	eth, err := ethclient.DialContext(ctx, rpcURL)
 	if err != nil {
 		return nil, err
 	}
 
-	parsedABI, err := abi.JSON(strings.NewReader(dexVaultABIJSON))
+	parsedVaultABI, err := abi.JSON(strings.NewReader(dexVaultABIJSON))
+	if err != nil {
+		return nil, err
+	}
+	parsedTokenABI, err := abi.JSON(strings.NewReader(erc20ABIJSON))
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +69,9 @@ func NewClient(ctx context.Context, rpcURL, vaultAddress string) (*Client, error
 	return &Client{
 		ETH:          eth,
 		VaultAddress: common.HexToAddress(vaultAddress),
-		VaultABI:     parsedABI,
-		DepositTopic: parsedABI.Events["Deposit"].ID,
+		TokenAddress: common.HexToAddress(tokenAddress),
+		VaultABI:     parsedVaultABI,
+		TokenABI:     parsedTokenABI,
+		DepositTopic: parsedVaultABI.Events["Deposit"].ID,
 	}, nil
 }

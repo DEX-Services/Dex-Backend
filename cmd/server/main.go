@@ -67,7 +67,7 @@ func main() {
 	}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
-		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress)
+		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
 		if err != nil {
 			slog.Error("failed to connect to Fuji RPC", "err", err)
 			os.Exit(1)
