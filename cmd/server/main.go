@@ -118,6 +118,7 @@ func main() {
 	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
+	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

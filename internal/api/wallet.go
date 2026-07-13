@@ -325,3 +325,36 @@ func (s *WalletServer) InternalSettleBalance(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "settled"})
 }
+
+// InternalCreditBalance: POST /internal/balance/credit {userId, asset, amount}
+// Called by the matching-engine when a futures position is closed, to realize
+// released margin plus PnL into the user's real Postgres balance. Amount may
+// be negative (a net loss beyond the released margin); a negative amount is
+// applied as a debit instead of a credit.
+func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	amount := new(big.Int)
+	if _, ok := amount.SetString(req.Amount, 10); !ok {
+		writeError(w, http.StatusBadRequest, "invalid amount")
+		return
+	}
+	if amount.Sign() < 0 {
+		if err := s.Ledger.DebitBalance(r.Context(), req.UserID, req.Asset, amount.Neg(amount).String()); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+	} else if amount.Sign() > 0 {
+		if err := s.Ledger.CreditBalance(r.Context(), req.UserID, req.Asset, amount.String()); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
+}
