@@ -93,8 +93,88 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, err
 	}
+	if _, err := pool.Exec(ctx, ensureP2PTables); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return pool, nil
 }
+
+const ensureP2PTables = `
+CREATE TABLE IF NOT EXISTS p2p_price_history (
+	id BIGSERIAL PRIMARY KEY,
+	asset TEXT NOT NULL,
+	fiat_currency TEXT NOT NULL DEFAULT 'INR',
+	price NUMERIC(38,8) NOT NULL CHECK (price > 0),
+	price_date DATE NOT NULL DEFAULT CURRENT_DATE,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	UNIQUE (asset, fiat_currency, price_date)
+);
+INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
+VALUES ('USDC', 'INR', 100, CURRENT_DATE)
+ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+CREATE TABLE IF NOT EXISTS p2p_listings (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset = 'USDC'), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	remaining_raw NUMERIC(38,0) NOT NULL CHECK (remaining_raw >= 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
+	fiat_currency TEXT NOT NULL DEFAULT 'INR', payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI', 'Bank Transfer', 'NEFT', 'IMPS')),
+	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_listings_active ON p2p_listings (created_at DESC) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_p2p_listings_seller ON p2p_listings (seller_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS p2p_orders (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), listing_id UUID NOT NULL REFERENCES p2p_listings(id) ON DELETE RESTRICT,
+	seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT, buyer_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+	asset TEXT NOT NULL, amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
+	fiat_currency TEXT NOT NULL, gross_amount NUMERIC(38,8) NOT NULL, buyer_fee NUMERIC(38,8) NOT NULL,
+	seller_fee NUMERIC(38,8) NOT NULL, buyer_payable NUMERIC(38,8) NOT NULL, seller_receivable NUMERIC(38,8) NOT NULL,
+	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status = 'COMPLETED'),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_orders_buyer ON p2p_orders (buyer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_p2p_orders_seller ON p2p_orders (seller_id, created_at DESC);
+
+-- Compatibility for the P2P order table that existed before listings were introduced.
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS listing_id UUID REFERENCES p2p_listings(id) ON DELETE RESTRICT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS amount_raw NUMERIC(38,0);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS fiat_currency TEXT DEFAULT 'INR';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_payable NUMERIC(38,8);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_receivable NUMERIC(38,8);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_credit NUMERIC(38,0) NOT NULL DEFAULT 1;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_debit NUMERIC(38,0) NOT NULL DEFAULT 1;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS fiat_amount NUMERIC(38,8);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_fee_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_fee_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_pays_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_receives_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+UPDATE p2p_orders SET
+	amount_raw = COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount),
+	fiat_currency = COALESCE(fiat_currency, 'INR'),
+	fiat_amount = COALESCE(fiat_amount, round((COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount) / 1000000) * price, 8)),
+	buyer_payable = COALESCE(buyer_payable, NULLIF(buyer_pays_fiat, 0), round(((COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount) / 1000000) * price) * 1.01, 8)),
+	seller_receivable = COALESCE(seller_receivable, NULLIF(seller_receives_fiat, 0), round(((COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount) / 1000000) * price) * .99, 8));
+
+UPDATE p2p_orders SET
+	gross_amount = fiat_amount,
+	buyer_fee = COALESCE(NULLIF(buyer_fee_fiat, 0), round(fiat_amount * .01, 8)),
+	seller_fee = COALESCE(NULLIF(seller_fee_fiat, 0), round(fiat_amount * .01, 8)),
+	buyer_fee_fiat = COALESCE(NULLIF(buyer_fee_fiat, 0), round(fiat_amount * .01, 8)),
+	seller_fee_fiat = COALESCE(NULLIF(seller_fee_fiat, 0), round(fiat_amount * .01, 8)),
+	buyer_pays_fiat = buyer_payable,
+	seller_receives_fiat = seller_receivable;
+
+ALTER TABLE p2p_orders ALTER COLUMN amount_raw SET NOT NULL;
+ALTER TABLE p2p_orders ALTER COLUMN fiat_currency SET NOT NULL;
+ALTER TABLE p2p_orders ALTER COLUMN buyer_payable SET NOT NULL;
+ALTER TABLE p2p_orders ALTER COLUMN seller_receivable SET NOT NULL;
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_status_check CHECK (status IN ('COMPLETED','completed','pending_payment','payment_made','cancelled','appeal'));
+`
 
 // ensureIDDefault (re)applies the DEXUSER_N default on users.id. Needed because
 // the UUID->TEXT migration drops any prior default, and CREATE TABLE IF NOT EXISTS

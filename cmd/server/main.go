@@ -47,6 +47,7 @@ func main() {
 	userRepo := repo.NewUserRepo(pool)
 	ledgerRepo := repo.NewLedgerRepo(pool)
 	adminRepo := repo.NewAdminRepo(pool)
+	p2pRepo := repo.NewP2PRepo(pool)
 	engineClient := engineclient.New()
 
 	srv := &api.Server{
@@ -70,6 +71,7 @@ func main() {
 		Server: srv,
 		Admin:  adminRepo,
 	}
+	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -129,6 +131,12 @@ func main() {
 	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
+	mux.HandleFunc("/p2p/price", p2pSrv.Price)
+	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
+	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
+	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
+	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
+	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
