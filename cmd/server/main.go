@@ -46,6 +46,7 @@ func main() {
 
 	userRepo := repo.NewUserRepo(pool)
 	ledgerRepo := repo.NewLedgerRepo(pool)
+	adminRepo := repo.NewAdminRepo(pool)
 	engineClient := engineclient.New()
 
 	srv := &api.Server{
@@ -64,6 +65,10 @@ func main() {
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
+	}
+	adminSrv := &api.AdminServer{
+		Server: srv,
+		Admin:  adminRepo,
 	}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
@@ -112,6 +117,9 @@ func main() {
 	mux.HandleFunc("/auth/login", srv.Login)
 	mux.HandleFunc("/auth/logout", srv.Logout)
 	mux.HandleFunc("/auth/me", srv.Me)
+	mux.HandleFunc("/admin/login", adminSrv.Login)
+	mux.HandleFunc("/admin/dashboard", adminSrv.Dashboard)
+	mux.HandleFunc("/admin/profile", adminSrv.Profile)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)

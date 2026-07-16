@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS chain_cursor (
 	key TEXT PRIMARY KEY,
 	block_number BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS admin_profiles (
+	login_id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	email TEXT NOT NULL,
+	phone TEXT NOT NULL,
+	role TEXT NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO admin_profiles (login_id, name, email, phone, role)
+VALUES ('admin', 'DEX Admin', 'admin@dex.ai', '+91 00000 00000', 'Super Admin')
+ON CONFLICT (login_id) DO NOTHING;
 `
 
 // New connects to Postgres and ensures the auth schema exists.
