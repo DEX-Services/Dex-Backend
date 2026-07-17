@@ -1,4 +1,5 @@
-// Package repo holds Postgres access for users and sessions.
+// Package repo holds Postgres data access for users, sessions, the deposit/
+// withdrawal ledger, P2P marketplace, and admin dashboard aggregates.
 package repo
 
 import (

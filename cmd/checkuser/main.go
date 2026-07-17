@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	_ = godotenv.Load("/Users/trimplingroup/Desktop/Dex Everything/Dex-Backend/.env")
+	_ = godotenv.Load()
 	ctx := context.Background()
 	pool, err := db.New(ctx, os.Getenv("POSTGRES_SERVICE_URI"))
 	if err != nil {

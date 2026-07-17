@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -9,7 +10,11 @@ import (
 	"time"
 )
 
-const nonceTTL = 5 * time.Minute
+const (
+	nonceTTL      = 5 * time.Minute
+	nonceMax      = 100_000
+	nonceReapEvery = 1 * time.Minute
+)
 
 type nonceEntry struct {
 	value     string
@@ -17,6 +22,7 @@ type nonceEntry struct {
 }
 
 // NonceStore issues and consumes one-time sign-in challenges per wallet address.
+// A background reaper evicts expired entries so the map cannot grow unbounded.
 type NonceStore struct {
 	mu      sync.Mutex
 	entries map[string]nonceEntry
@@ -24,6 +30,31 @@ type NonceStore struct {
 
 func NewNonceStore() *NonceStore {
 	return &NonceStore{entries: make(map[string]nonceEntry)}
+}
+
+// Run periodically removes expired nonces until ctx is cancelled.
+func (s *NonceStore) Run(ctx context.Context) {
+	t := time.NewTicker(nonceReapEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reap()
+		}
+	}
+}
+
+func (s *NonceStore) reap() {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, e := range s.entries {
+		if now.After(e.expiresAt) {
+			delete(s.entries, k)
+		}
+	}
 }
 
 func (s *NonceStore) Create(address string) (string, error) {
@@ -35,6 +66,18 @@ func (s *NonceStore) Create(address string) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.entries) >= nonceMax {
+		// Evict any expired entries to make room; if none expired, refuse.
+		now := time.Now()
+		for k, e := range s.entries {
+			if now.After(e.expiresAt) {
+				delete(s.entries, k)
+			}
+		}
+		if len(s.entries) >= nonceMax {
+			return "", fmt.Errorf("nonce store at capacity")
+		}
+	}
 	s.entries[strings.ToLower(address)] = nonceEntry{value: nonce, expiresAt: time.Now().Add(nonceTTL)}
 	return nonce, nil
 }

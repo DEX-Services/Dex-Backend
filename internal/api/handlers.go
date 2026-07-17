@@ -17,10 +17,12 @@ const sessionCookie = "dex_session"
 var validWalletTypes = map[string]bool{"metamask": true, "coinbase": true, "bitget": true}
 
 type Server struct {
-	Nonces *auth.NonceStore
-	JWT    *auth.JWTIssuer
-	Users  *repo.UserRepo
-	Log    *slog.Logger
+	Nonces       *auth.NonceStore
+	JWT          *auth.JWTIssuer
+	Users        *repo.UserRepo
+	Log          *slog.Logger
+	SecureCookie bool
+	TrustedProxy string
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -94,7 +96,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	if err := s.Users.TouchLogin(ctx, user.ID); err != nil {
 		s.Log.Warn("touch login failed", "err", err)
 	}
-	if _, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, clientIP(r), r.UserAgent()); err != nil {
+	if _, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, s.clientIP(r), r.UserAgent()); err != nil {
 		s.Log.Warn("create session failed", "err", err)
 	}
 
@@ -109,6 +111,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.SecureCookie,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expiresAt,
 	})
@@ -132,6 +135,7 @@ func (s *Server) Logout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.SecureCookie,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Unix(0, 0),
 		MaxAge:   -1,
@@ -171,9 +175,17 @@ func (s *Server) authenticate(r *http.Request) (*auth.Claims, bool) {
 	return claims, true
 }
 
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+func (s *Server) clientIP(r *http.Request) string {
+	if s.TrustedProxy != "" {
+		if r.RemoteAddr == s.TrustedProxy || strings.HasPrefix(r.RemoteAddr, s.TrustedProxy) {
+			if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+				return strings.TrimSpace(strings.Split(fwd, ",")[0])
+			}
+		}
 	}
+	return r.RemoteAddr
+}
+
+func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }

@@ -51,11 +51,14 @@ func main() {
 	engineClient := engineclient.New()
 
 	srv := &api.Server{
-		Nonces: auth.NewNonceStore(),
-		JWT:    auth.NewJWTIssuer(jwtSecret, 7*24*time.Hour),
-		Users:  userRepo,
-		Log:    slog.Default(),
+		Nonces:       auth.NewNonceStore(),
+		JWT:          auth.NewJWTIssuer(jwtSecret, 7*24*time.Hour),
+		Users:        userRepo,
+		Log:          slog.Default(),
+		SecureCookie: os.Getenv("COOKIE_SECURE") != "false",
+		TrustedProxy: os.Getenv("TRUSTED_PROXY"),
 	}
+	go srv.Nonces.Run(ctx)
 
 	walletSrv := &api.WalletServer{
 		Server:       srv,
@@ -68,8 +71,13 @@ func main() {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
 	}
 	adminSrv := &api.AdminServer{
-		Server: srv,
-		Admin:  adminRepo,
+		Server:        srv,
+		Admin:         adminRepo,
+		AdminLoginID:  os.Getenv("ADMIN_LOGIN_ID"),
+		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
+	}
+	if adminSrv.AdminLoginID == "" || adminSrv.AdminPassword == "" {
+		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
 
@@ -125,6 +133,7 @@ func main() {
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
+	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)
 	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
@@ -152,7 +161,13 @@ func main() {
 		port = "8081"
 	}
 
-	httpSrv := &http.Server{Addr: ":" + port, Handler: api.CORS(origin, mux)}
+	httpSrv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      api.CORS(origin, mux),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
 	go func() {
 		slog.Info("dex-backend listening", "port", port)

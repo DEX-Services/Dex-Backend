@@ -1,4 +1,3 @@
-// Package repo holds Postgres access for the deposit/withdrawal ledger.
 package repo
 
 import (
@@ -400,9 +399,18 @@ func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, wallet
 	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
 		return "", err
 	}
-	balance, _ := new(big.Int).SetString(balanceRaw, 10)
-	locked, _ := new(big.Int).SetString(lockedRaw, 10)
-	amount, _ := new(big.Int).SetString(amountRaw, 10)
+	balance, ok := new(big.Int).SetString(balanceRaw, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid balance value %q", balanceRaw)
+	}
+	locked, ok := new(big.Int).SetString(lockedRaw, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid locked value %q", lockedRaw)
+	}
+	amount, ok := new(big.Int).SetString(amountRaw, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid amount value %q", amountRaw)
+	}
 	available := new(big.Int).Sub(balance, locked)
 	available.Sub(available, pendingHold)
 	if available.Cmp(amount) < 0 {
@@ -619,8 +627,14 @@ func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token stri
 	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
 		return "0", err
 	}
-	balance, _ := new(big.Int).SetString(balanceRaw, 10)
-	locked, _ := new(big.Int).SetString(lockedRaw, 10)
+	balance, ok := new(big.Int).SetString(balanceRaw, 10)
+	if !ok {
+		return "0", fmt.Errorf("invalid balance value %q", balanceRaw)
+	}
+	locked, ok := new(big.Int).SetString(lockedRaw, 10)
+	if !ok {
+		return "0", fmt.Errorf("invalid locked value %q", lockedRaw)
+	}
 	available := new(big.Int).Sub(balance, locked)
 	available.Sub(available, pendingHold)
 	if available.Sign() < 0 {

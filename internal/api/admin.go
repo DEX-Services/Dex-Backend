@@ -7,15 +7,23 @@ import (
 
 	"github.com/dex/dex-backend/internal/models"
 	"github.com/dex/dex-backend/internal/repo"
+	"golang.org/x/crypto/bcrypt"
 )
 
-const adminLoginID = "admin"
-const adminPassword = "admin"
-
+// AdminServer authenticates administrators. Credentials are env-driven:
+//   - ADMIN_LOGIN_ID  (default: disabled if unset)
+//   - ADMIN_PASSWORD  (bcrypt hash of the password; must be set)
+//
+// If ADMIN_PASSWORD is unset, admin login is refused entirely so the old
+// hardcoded "admin"/"admin" backdoor can never be reached.
 type AdminServer struct {
 	*Server
-	Admin *repo.AdminRepo
+	Admin         *repo.AdminRepo
+	AdminLoginID  string
+	AdminPassword string
 }
+
+const adminLoginID = "admin"
 
 type adminLoginRequest struct {
 	LoginID  string `json:"loginId"`
@@ -27,12 +35,20 @@ func (s *AdminServer) Login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.AdminLoginID == "" || s.AdminPassword == "" {
+		writeError(w, http.StatusServiceUnavailable, "admin login not configured")
+		return
+	}
 	var req adminLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(req.LoginID) != adminLoginID || req.Password != adminPassword {
+	if strings.TrimSpace(req.LoginID) != s.AdminLoginID {
+		writeError(w, http.StatusUnauthorized, "invalid admin credentials")
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(s.AdminPassword), []byte(req.Password)); err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}

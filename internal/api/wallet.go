@@ -218,6 +218,56 @@ func (s *WalletServer) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Req
 	writeJSON(w, status, response)
 }
 
+// AdminRecoverWithdrawal: POST /admin/withdraw-recover {requestId, action}
+// Recovers withdrawals stuck in "processing" (e.g. after a crash between marking
+// processing and the on-chain tx). action=retry re-attempts the payout;
+// action=fail marks it failed without payout. Restricted to admin wallets.
+func (s *WalletServer) AdminRecoverWithdrawal(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	if !s.Admins[strings.ToLower(claims.WalletAddress)] {
+		writeError(w, http.StatusForbidden, "not authorized")
+		return
+	}
+	var req adminApproveBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		writeError(w, http.StatusBadRequest, "requestId required")
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action == "" {
+		action = "retry"
+	}
+	switch action {
+	case "fail":
+		if err := s.Ledger.MarkWithdrawalFailed(r.Context(), req.RequestID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": req.RequestID, "status": "failed"})
+	case "retry":
+		if s.Signer == nil {
+			writeError(w, http.StatusServiceUnavailable, "treasury signer not configured")
+			return
+		}
+		response, status, err := s.processWithdrawalRequest(r.Context(), req.RequestID)
+		if err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, status, response)
+	default:
+		writeError(w, http.StatusBadRequest, "action must be retry or fail")
+	}
+}
+
 // AdminEngineBackfill: POST /admin/engine-backfill
 // One-time (admin-triggered) push of every existing nonzero Postgres balance into
 // the matching-engine's in-memory ledger, for balances that predate the
