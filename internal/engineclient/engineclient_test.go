@@ -83,6 +83,24 @@ func TestClient_Debit_SendsDebitDirection(t *testing.T) {
 	}
 }
 
+func TestClient_SyncSendsIdempotencyKey(t *testing.T) {
+	var gotHeader string
+	var gotBody syncReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("Idempotency-Key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := &Client{baseURL: srv.URL, secret: "s", http: srv.Client()}
+	if err := c.Sync(context.Background(), "event-123", "u1", "USDC", "10", "debit"); err != nil {
+		t.Fatal(err)
+	}
+	if gotHeader != "event-123" || gotBody.EventID != "event-123" {
+		t.Fatalf("idempotency key header/body = %q/%q", gotHeader, gotBody.EventID)
+	}
+}
+
 func TestClient_NonOKStatusReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "insufficient balance", http.StatusConflict)

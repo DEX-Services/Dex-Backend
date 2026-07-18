@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"github.com/dex/dex-backend/internal/models"
 	"github.com/dex/dex-backend/internal/repo"
 	"net/http"
+	"strings"
 )
 
 type P2PServer struct {
@@ -16,11 +19,15 @@ type createListingRequest struct {
 	PaymentMethod string `json:"paymentMethod"`
 }
 type buyListingRequest struct {
-	ListingID string `json:"listingId"`
-	AmountRaw string `json:"amountRaw"`
+	ListingID      string `json:"listingId"`
+	AmountRaw      string `json:"amountRaw"`
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 type cancelListingRequest struct {
 	ListingID string `json:"listingId"`
+}
+type orderActionRequest struct {
+	OrderID string `json:"orderId"`
 }
 
 func requirePost(w http.ResponseWriter, r *http.Request) bool {
@@ -113,22 +120,63 @@ func (s *P2PServer) Buy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	order, err := s.P2P.Buy(r.Context(), userID, req.ListingID, req.AmountRaw)
+	order, err := s.P2P.CreateOrder(r.Context(), userID, req.ListingID, req.AmountRaw, req.IdempotencyKey)
 	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, repo.ErrP2PNotFound) {
-			status = http.StatusNotFound
-		}
-		if errors.Is(err, repo.ErrP2PSelfPurchase) {
-			status = http.StatusForbidden
-		}
-		if errors.Is(err, repo.ErrP2PUnavailable) {
-			status = http.StatusConflict
-		}
-		writeError(w, status, err.Error())
+		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"order": order})
+}
+
+func p2pErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, repo.ErrP2PNotFound), errors.Is(err, repo.ErrP2POrderNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, repo.ErrP2PSelfPurchase), errors.Is(err, repo.ErrP2PForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, repo.ErrP2PUnavailable), errors.Is(err, repo.ErrP2PInvalidState),
+		errors.Is(err, repo.ErrP2PExpired), errors.Is(err, repo.ErrP2PIdempotencyKey):
+		return http.StatusConflict
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func (s *P2PServer) orderAction(w http.ResponseWriter, r *http.Request, action func(context.Context, string, string) (*models.P2POrder, error)) {
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req orderActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.OrderID) == "" {
+		writeError(w, http.StatusBadRequest, "orderId is required")
+		return
+	}
+	order, err := action(r.Context(), userID, req.OrderID)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *P2PServer) MarkPaid(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.MarkPaid)
+}
+
+func (s *P2PServer) CancelOrder(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.CancelOrder)
+}
+
+func (s *P2PServer) ReleaseOrder(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.ReleaseOrder)
+}
+
+func (s *P2PServer) AppealOrder(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.AppealOrder)
 }
 
 func (s *P2PServer) Orders(w http.ResponseWriter, r *http.Request) {

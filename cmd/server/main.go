@@ -73,6 +73,7 @@ func main() {
 	adminSrv := &api.AdminServer{
 		Server:        srv,
 		Admin:         adminRepo,
+		P2P:           p2pRepo,
 		AdminLoginID:  os.Getenv("ADMIN_LOGIN_ID"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 	}
@@ -80,6 +81,7 @@ func main() {
 		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
+	go p2pRepo.RunMaintenance(ctx, engineClient)
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -130,6 +132,9 @@ func main() {
 	mux.HandleFunc("/admin/login", adminSrv.Login)
 	mux.HandleFunc("/admin/dashboard", adminSrv.Dashboard)
 	mux.HandleFunc("/admin/profile", adminSrv.Profile)
+	mux.HandleFunc("/admin/p2p/price", adminSrv.P2PPrice)
+	mux.HandleFunc("/admin/p2p/appeals", adminSrv.P2PAppeals)
+	mux.HandleFunc("/admin/p2p/appeals/resolve", adminSrv.ResolveP2PAppeal)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
@@ -145,6 +150,10 @@ func main() {
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
+	mux.HandleFunc("/p2p/orders/paid", p2pSrv.MarkPaid)
+	mux.HandleFunc("/p2p/orders/cancel", p2pSrv.CancelOrder)
+	mux.HandleFunc("/p2p/orders/release", p2pSrv.ReleaseOrder)
+	mux.HandleFunc("/p2p/orders/appeal", p2pSrv.AppealOrder)
 	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -19,8 +19,84 @@ import (
 type AdminServer struct {
 	*Server
 	Admin         *repo.AdminRepo
+	P2P           *repo.P2PRepo
 	AdminLoginID  string
 	AdminPassword string
+}
+
+type adminP2PPriceRequest struct {
+	Price string `json:"price"`
+}
+
+func (s *AdminServer) P2PPrice(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		price, err := s.P2P.TodayPrice(r.Context())
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"price": price})
+	case http.MethodPost, http.MethodPut:
+		var req adminP2PPriceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		price, err := s.P2P.SetTodayPrice(r.Context(), req.Price)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"price": price})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+type resolveP2PAppealRequest struct {
+	OrderID string `json:"orderId"`
+	Action  string `json:"action"`
+}
+
+func (s *AdminServer) ResolveP2PAppeal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	var req resolveP2PAppealRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	order, err := s.P2P.ResolveAppeal(r.Context(), req.OrderID, req.Action)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *AdminServer) P2PAppeals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	orders, err := s.P2P.AppealOrders(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load P2P appeals")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"orders": orders})
 }
 
 const adminLoginID = "admin"

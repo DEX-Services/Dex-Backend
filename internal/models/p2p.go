@@ -24,20 +24,24 @@ type P2PListing struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 }
 type P2POrder struct {
-	ID               string    `json:"id"`
-	ListingID        string    `json:"listingId"`
-	SellerID         string    `json:"sellerId"`
-	BuyerID          string    `json:"buyerId"`
-	Asset            string    `json:"asset"`
-	AmountRaw        string    `json:"amountRaw"`
-	Price            string    `json:"price"`
-	FiatCurrency     string    `json:"fiatCurrency"`
-	GrossAmount      string    `json:"grossAmount"`
-	BuyerFee         string    `json:"buyerFee"`
-	SellerFee        string    `json:"sellerFee"`
-	BuyerPayable     string    `json:"buyerPayable"`
-	SellerReceivable string    `json:"sellerReceivable"`
-	PaymentMethod    string    `json:"paymentMethod"`
-	Status           string    `json:"status"`
-	CreatedAt        time.Time `json:"createdAt"`
+	ID                 string     `json:"id"`
+	ListingID          string     `json:"listingId"`
+	SellerID           string     `json:"sellerId"`
+	BuyerID            string     `json:"buyerId"`
+	Asset              string     `json:"asset"`
+	AmountRaw          string     `json:"amountRaw"`
+	Price              string     `json:"price"`
+	FiatCurrency       string     `json:"fiatCurrency"`
+	GrossAmount        string     `json:"grossAmount"`
+	BuyerFee           string     `json:"buyerFee"`
+	SellerFee          string     `json:"sellerFee"`
+	BuyerPayable       string     `json:"buyerPayable"`
+	SellerReceivable   string     `json:"sellerReceivable"`
+	PaymentMethod      string     `json:"paymentMethod"`
+	Status             string     `json:"status"`
+	ExpiresAt          time.Time  `json:"expiresAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
+	CancellationReason string     `json:"cancellationReason,omitempty"`
+	CompletedAt        *time.Time `json:"completedAt,omitempty"`
+	CreatedAt          time.Time  `json:"createdAt"`
 }
