@@ -106,13 +106,12 @@ CREATE TABLE IF NOT EXISTS p2p_price_history (
 	asset TEXT NOT NULL,
 	fiat_currency TEXT NOT NULL DEFAULT 'INR',
 	price NUMERIC(38,8) NOT NULL CHECK (price > 0),
-	price_date DATE NOT NULL DEFAULT CURRENT_DATE,
+	price_date DATE NOT NULL DEFAULT ((now() AT TIME ZONE 'Asia/Kolkata')::date),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	UNIQUE (asset, fiat_currency, price_date)
 );
-INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
-VALUES ('USDC', 'INR', 100, CURRENT_DATE)
-ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+ALTER TABLE p2p_price_history ALTER COLUMN price_date
+	SET DEFAULT ((now() AT TIME ZONE 'Asia/Kolkata')::date);
 CREATE TABLE IF NOT EXISTS p2p_listings (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
 	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset = 'USDC'), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
@@ -129,8 +128,10 @@ CREATE TABLE IF NOT EXISTS p2p_orders (
 	asset TEXT NOT NULL, amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
 	fiat_currency TEXT NOT NULL, gross_amount NUMERIC(38,8) NOT NULL, buyer_fee NUMERIC(38,8) NOT NULL,
 	seller_fee NUMERIC(38,8) NOT NULL, buyer_payable NUMERIC(38,8) NOT NULL, seller_receivable NUMERIC(38,8) NOT NULL,
-	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status = 'COMPLETED'),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
+	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending_payment',
+	idempotency_key TEXT, expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
+	cancellation_reason TEXT, completed_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
 );
 CREATE INDEX IF NOT EXISTS idx_p2p_orders_buyer ON p2p_orders (buyer_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_p2p_orders_seller ON p2p_orders (seller_id, created_at DESC);
@@ -149,6 +150,10 @@ ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_fee_fiat NUMERIC(38,8) NO
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_pays_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_receives_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes');
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
 UPDATE p2p_orders SET
 	amount_raw = COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount),
@@ -174,6 +179,27 @@ ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_status_check CHECK (status IN ('COMPLETED','completed','pending_payment','payment_made','cancelled','appeal'));
+UPDATE p2p_orders SET status='completed' WHERE status='COMPLETED';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_orders_idempotency ON p2p_orders (buyer_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_p2p_orders_expiry ON p2p_orders (expires_at) WHERE status = 'pending_payment';
+
+CREATE TABLE IF NOT EXISTS p2p_engine_outbox (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE CASCADE,
+	sequence SMALLINT NOT NULL CHECK (sequence IN (1,2)),
+	direction TEXT NOT NULL CHECK (direction IN ('debit','credit')),
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+	asset TEXT NOT NULL,
+	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','processing','synced','failed')),
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	UNIQUE (order_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_engine_outbox_pending ON p2p_engine_outbox (next_attempt_at, created_at) WHERE status IN ('pending','failed');
 `
 
 // ensureIDDefault (re)applies the DEXUSER_N default on users.id. Needed because

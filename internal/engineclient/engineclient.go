@@ -49,6 +49,7 @@ func (c *Client) Enabled() bool {
 }
 
 type syncReq struct {
+	EventID   string `json:"eventId,omitempty"`
 	AccountID string `json:"accountId"`
 	Asset     string `json:"asset"`
 	Amount    string `json:"amount"`
@@ -57,19 +58,22 @@ type syncReq struct {
 
 // Credit tells the engine to add amount to accountID's asset balance.
 func (c *Client) Credit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "credit")
+	return c.Sync(ctx, "", accountID, asset, amount, "credit")
 }
 
 // Debit tells the engine to subtract amount from accountID's asset balance.
 func (c *Client) Debit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "debit")
+	return c.Sync(ctx, "", accountID, asset, amount, "debit")
 }
 
-func (c *Client) call(ctx context.Context, accountID, asset, amount, direction string) error {
+// Sync delivers a durable ledger event. The eventID is also sent as an
+// Idempotency-Key so an engine that supports deduplication can make retries
+// exactly-once.
+func (c *Client) Sync(ctx context.Context, eventID, accountID, asset, amount, direction string) error {
 	if !c.Enabled() {
 		return nil
 	}
-	body, err := json.Marshal(syncReq{AccountID: accountID, Asset: asset, Amount: amount, Direction: direction})
+	body, err := json.Marshal(syncReq{EventID: eventID, AccountID: accountID, Asset: asset, Amount: amount, Direction: direction})
 	if err != nil {
 		return err
 	}
@@ -79,6 +83,9 @@ func (c *Client) call(ctx context.Context, accountID, asset, amount, direction s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Engine-Secret", c.secret)
+	if eventID != "" {
+		req.Header.Set("Idempotency-Key", eventID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
