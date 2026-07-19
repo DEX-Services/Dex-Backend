@@ -26,6 +26,9 @@ type WalletServer struct {
 	Admins       map[string]bool
 	EngineSecret string
 	EngineClient *engineclient.Client
+	// EngineOutbox durably queues engine balance syncs; nil falls back to the
+	// non-durable async path.
+	EngineOutbox *engineclient.Outbox
 }
 
 // Balance: GET /wallet/balance
@@ -65,6 +68,9 @@ func (s *WalletServer) Balance(w http.ResponseWriter, r *http.Request) {
 type withdrawRequestBody struct {
 	Amount string `json:"amount"`
 	Asset  string `json:"asset"`
+	// IdempotencyKey makes client retries safe: the same key never creates a
+	// second withdrawal. Can also be supplied via the Idempotency-Key header.
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 func requestAsset(asset string) string {
@@ -105,10 +111,31 @@ func (s *WalletServer) WithdrawRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.Ledger.InsertWithdrawalRequest(r.Context(), claims.UserID, claims.WalletAddress, asset, amount.String())
+	idemKey := strings.TrimSpace(req.IdempotencyKey)
+	if idemKey == "" {
+		idemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+
+	id, alreadyExists, err := s.Ledger.InsertWithdrawalRequest(r.Context(), claims.UserID, claims.WalletAddress, asset, amount.String(), idemKey)
 	if err != nil {
 		s.Log.Error("insert withdrawal request failed", "err", err)
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if alreadyExists {
+		// Retry of a request we already accepted: report current state, do NOT
+		// run the payout again (the original flow or admin recovery owns it).
+		entry, err := s.Ledger.WithdrawalByID(r.Context(), id)
+		if err != nil {
+			s.Log.Error("idempotent withdrawal lookup failed", "err", err, "requestId", id)
+			writeError(w, http.StatusInternalServerError, "could not load withdrawal state")
+			return
+		}
+		txHash := ""
+		if entry.TxHash != nil {
+			txHash = *entry.TxHash
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": entry.ID, "txHash": txHash, "asset": entry.Token, "status": entry.Status})
 		return
 	}
 
@@ -153,9 +180,13 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 		return nil, http.StatusInternalServerError, errors.New("withdrawal submitted on-chain but ledger update failed")
 	}
 
-	engineclient.Async("debit", func(ctx context.Context) error {
-		return s.EngineClient.Debit(ctx, confirmed.UserID, confirmed.Token, confirmed.Amount)
-	})
+	if s.EngineOutbox != nil {
+		s.EngineOutbox.EnqueueDebit(ctx, confirmed.UserID, confirmed.Token, confirmed.Amount)
+	} else {
+		engineclient.Async("debit", func(ctx context.Context) error {
+			return s.EngineClient.Debit(ctx, confirmed.UserID, confirmed.Token, confirmed.Amount)
+		})
+	}
 
 	return map[string]string{"id": requestID, "txHash": txHash, "asset": confirmed.Token, "status": "confirmed"}, http.StatusOK, nil
 }

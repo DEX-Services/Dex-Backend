@@ -371,61 +371,92 @@ func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, t
 
 // InsertWithdrawalRequest records a withdrawal request and reserves the amount by
 // counting pending/processing requests against available balance.
-func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, walletAddress, token, amountRaw string) (string, error) {
+//
+// idempotencyKey is a client-supplied token that makes retries safe: if a
+// request with the same (user, kind, key) already exists, its ID is returned
+// with alreadyExists=true instead of creating a second withdrawal. An empty
+// key skips the check (legacy clients).
+func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, walletAddress, token, amountRaw, idempotencyKey string) (id string, alreadyExists bool, err error) {
 	normalizedToken, column, err := normalizeAsset(token)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	lockedColumn := lockedColumns[normalizedToken]
 	if err := validatePositiveAmount(amountRaw); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if idempotencyKey != "" {
+		var existingID string
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM ledger_entries
+			 WHERE user_id = $1 AND kind = $2 AND idempotency_key = $3`,
+			userID, models.LedgerKindWithdrawalRequest, idempotencyKey,
+		).Scan(&existingID)
+		if err == nil {
+			return existingID, true, nil
+		}
+		if err != pgx.ErrNoRows {
+			return "", false, err
+		}
+	}
+
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
-		return "", err
+		return "", false, err
 	}
 	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalizedToken)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	var balanceRaw, lockedRaw string
 	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
-		return "", err
+		return "", false, err
 	}
 	balance, ok := new(big.Int).SetString(balanceRaw, 10)
 	if !ok {
-		return "", fmt.Errorf("invalid balance value %q", balanceRaw)
+		return "", false, fmt.Errorf("invalid balance value %q", balanceRaw)
 	}
 	locked, ok := new(big.Int).SetString(lockedRaw, 10)
 	if !ok {
-		return "", fmt.Errorf("invalid locked value %q", lockedRaw)
+		return "", false, fmt.Errorf("invalid locked value %q", lockedRaw)
 	}
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok {
-		return "", fmt.Errorf("invalid amount value %q", amountRaw)
+		return "", false, fmt.Errorf("invalid amount value %q", amountRaw)
 	}
 	available := new(big.Int).Sub(balance, locked)
 	available.Sub(available, pendingHold)
 	if available.Cmp(amount) < 0 {
-		return "", fmt.Errorf("insufficient %s available balance", normalizedToken)
+		return "", false, fmt.Errorf("insufficient %s available balance", normalizedToken)
 	}
 
-	var id string
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, status)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, normalizedToken, amountRaw, models.LedgerStatusPending,
+		`INSERT INTO ledger_entries (user_id, wallet_address, kind, token, amount, status, idempotency_key)
+		 VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
+		 ON CONFLICT (user_id, kind, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+		 RETURNING id`,
+		userID, strings.ToLower(walletAddress), models.LedgerKindWithdrawalRequest, normalizedToken, amountRaw, models.LedgerStatusPending, idempotencyKey,
 	).Scan(&id); err != nil {
-		return "", err
+		if err == pgx.ErrNoRows && idempotencyKey != "" {
+			// Concurrent request with the same key won the race; return its ID.
+			if err := tx.QueryRow(ctx,
+				`SELECT id FROM ledger_entries WHERE user_id = $1 AND kind = $2 AND idempotency_key = $3`,
+				userID, models.LedgerKindWithdrawalRequest, idempotencyKey,
+			).Scan(&id); err != nil {
+				return "", false, err
+			}
+			return id, true, nil
+		}
+		return "", false, err
 	}
-	return id, tx.Commit(ctx)
+	return id, false, tx.Commit(ctx)
 }
 
 // MarkWithdrawalProcessing atomically claims a pending withdrawal request for payout.
@@ -499,6 +530,21 @@ func (r *LedgerRepo) MarkWithdrawalFailed(ctx context.Context, requestID string)
 		requestID, models.LedgerStatusFailed, models.LedgerKindWithdrawalRequest, models.LedgerStatusProcessing,
 	)
 	return err
+}
+
+// WithdrawalByID loads a withdrawal request by ID. Used to report current
+// state for idempotent request replays.
+func (r *LedgerRepo) WithdrawalByID(ctx context.Context, requestID string) (*models.LedgerEntry, error) {
+	var e models.LedgerEntry
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at
+		 FROM ledger_entries WHERE id = $1 AND kind = $2`,
+		requestID, models.LedgerKindWithdrawalRequest,
+	).Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 func (r *LedgerRepo) RejectWithdrawalRequest(ctx context.Context, requestID string) error {

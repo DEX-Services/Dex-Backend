@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
@@ -14,6 +15,7 @@ import (
 const dexVaultABIJSON = `[
 	{"type":"event","name":"Deposit","inputs":[
 		{"name":"user","type":"address","indexed":true},
+		{"name":"token","type":"address","indexed":true},
 		{"name":"amount","type":"uint256","indexed":false},
 		{"name":"timestamp","type":"uint256","indexed":false}
 	]},
@@ -28,6 +30,7 @@ const dexVaultABIJSON = `[
 	],"outputs":[]},
 	{"type":"function","name":"recordWithdrawalApproval","stateMutability":"nonpayable","inputs":[
 		{"name":"user","type":"address"},
+		{"name":"token","type":"address"},
 		{"name":"amount","type":"uint256"}
 	],"outputs":[]}
 ]`
@@ -49,6 +52,10 @@ type Client struct {
 	VaultABI     abi.ABI
 	TokenABI     abi.ABI
 	DepositTopic common.Hash
+	// LegacyDepositTopic matches Deposit events emitted by vaults deployed
+	// before the token address was added to the event. Kept so historical
+	// logs (and not-yet-redeployed vaults) still index.
+	LegacyDepositTopic common.Hash
 }
 
 func NewClient(ctx context.Context, rpcURL, vaultAddress, tokenAddress string) (*Client, error) {
@@ -67,11 +74,12 @@ func NewClient(ctx context.Context, rpcURL, vaultAddress, tokenAddress string) (
 	}
 
 	return &Client{
-		ETH:          eth,
-		VaultAddress: common.HexToAddress(vaultAddress),
-		TokenAddress: common.HexToAddress(tokenAddress),
-		VaultABI:     parsedVaultABI,
-		TokenABI:     parsedTokenABI,
-		DepositTopic: parsedVaultABI.Events["Deposit"].ID,
+		ETH:                eth,
+		VaultAddress:       common.HexToAddress(vaultAddress),
+		TokenAddress:       common.HexToAddress(tokenAddress),
+		VaultABI:           parsedVaultABI,
+		TokenABI:           parsedTokenABI,
+		DepositTopic:       parsedVaultABI.Events["Deposit"].ID,
+		LegacyDepositTopic: crypto.Keccak256Hash([]byte("Deposit(address,uint256,uint256)")),
 	}, nil
 }

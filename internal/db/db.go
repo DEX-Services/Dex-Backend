@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_tx_hash ON ledger_entries(tx_hash) WHERE tx_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ledger_user_id ON ledger_entries(user_id);
 
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idempotency
+	ON ledger_entries(user_id, kind, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS chain_cursor (
 	key TEXT PRIMARY KEY,
 	block_number BIGINT NOT NULL

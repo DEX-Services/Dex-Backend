@@ -104,7 +104,7 @@ func (s *Signer) SubmitWithdrawal(ctx context.Context, userAddress string, amoun
 // SubmitWithdrawalApproval keeps the older audit-only path available for deployments
 // whose vault contract has not yet been upgraded with withdrawToken.
 func (s *Signer) SubmitWithdrawalApproval(ctx context.Context, userAddress string, amountRaw *big.Int) (string, error) {
-	data, err := s.Client.VaultABI.Pack("recordWithdrawalApproval", common.HexToAddress(userAddress), amountRaw)
+	data, err := s.Client.VaultABI.Pack("recordWithdrawalApproval", common.HexToAddress(userAddress), s.Client.TokenAddress, amountRaw)
 	if err != nil {
 		return "", err
 	}

@@ -49,6 +49,12 @@ func main() {
 	adminRepo := repo.NewAdminRepo(pool)
 	p2pRepo := repo.NewP2PRepo(pool)
 	engineClient := engineclient.New()
+	engineOutbox, err := engineclient.NewOutbox(ctx, pool, engineClient)
+	if err != nil {
+		slog.Error("failed to init engine sync outbox", "err", err)
+		os.Exit(1)
+	}
+	go engineOutbox.Run(ctx)
 
 	srv := &api.Server{
 		Nonces:       auth.NewNonceStore(),
@@ -66,6 +72,7 @@ func main() {
 		Admins:       parseAdminAddresses(os.Getenv("ADMIN_WALLET_ADDRESSES")),
 		EngineSecret: os.Getenv("ENGINE_SHARED_SECRET"),
 		EngineClient: engineClient,
+		EngineOutbox: engineOutbox,
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
@@ -101,6 +108,7 @@ func main() {
 			Log:          slog.Default(),
 			StartBlock:   startBlock,
 			EngineClient: engineClient,
+			EngineOutbox: engineOutbox,
 		}
 		go listener.Run(ctx)
 
@@ -123,17 +131,26 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/auth/nonce", srv.Nonce)
-	mux.HandleFunc("/auth/login", srv.Login)
+	trustedProxy := os.Getenv("TRUSTED_PROXY")
+	// Sensitive endpoints get per-IP token buckets. Auth flows are tighter
+	// than money flows only in burst; internal engine routes are exempt (they
+	// authenticate via shared secret and are high-frequency by design).
+	authLimit := api.NewRateLimiter(10, time.Minute, 10, trustedProxy)
+	adminAuthLimit := api.NewRateLimiter(5, time.Minute, 5, trustedProxy)
+	moneyLimit := api.NewRateLimiter(20, time.Minute, 10, trustedProxy)
+	p2pLimit := api.NewRateLimiter(30, time.Minute, 15, trustedProxy)
+
+	mux.HandleFunc("/auth/nonce", authLimit.Wrap(srv.Nonce))
+	mux.HandleFunc("/auth/login", authLimit.Wrap(srv.Login))
 	mux.HandleFunc("/auth/logout", srv.Logout)
 	mux.HandleFunc("/auth/me", srv.Me)
-	mux.HandleFunc("/admin/login", adminSrv.Login)
+	mux.HandleFunc("/admin/login", adminAuthLimit.Wrap(adminSrv.Login))
 	mux.HandleFunc("/admin/dashboard", adminSrv.Dashboard)
 	mux.HandleFunc("/admin/profile", adminSrv.Profile)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
-	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
-	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
-	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)
+	mux.HandleFunc("/wallet/withdraw-request", moneyLimit.Wrap(walletSrv.WithdrawRequest))
+	mux.HandleFunc("/admin/withdraw-approve", moneyLimit.Wrap(walletSrv.AdminApproveWithdrawal))
+	mux.HandleFunc("/admin/withdraw-recover", moneyLimit.Wrap(walletSrv.AdminRecoverWithdrawal))
 	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
@@ -143,9 +160,9 @@ func main() {
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)
 	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
-	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
+	mux.HandleFunc("/p2p/buy", p2pLimit.Wrap(p2pSrv.Buy))
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
-	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
+	mux.HandleFunc("/p2p/listings/cancel", p2pLimit.Wrap(p2pSrv.CancelListing))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

@@ -31,6 +31,9 @@ type Listener struct {
 	Log          *slog.Logger
 	StartBlock   uint64 // used only to seed chain_cursor on first run
 	EngineClient *engineclient.Client
+	// EngineOutbox durably queues engine credit syncs for deposits; nil falls
+	// back to the non-durable async path.
+	EngineOutbox *engineclient.Outbox
 }
 
 func (l *Listener) Run(ctx context.Context) {
@@ -70,7 +73,7 @@ func (l *Listener) poll(ctx context.Context) error {
 			FromBlock: new(big.Int).SetUint64(from),
 			ToBlock:   new(big.Int).SetUint64(to),
 			Addresses: []common.Address{l.Client.VaultAddress},
-			Topics:    [][]common.Hash{{l.Client.DepositTopic}},
+			Topics:    [][]common.Hash{{l.Client.DepositTopic, l.Client.LegacyDepositTopic}},
 		})
 		if err != nil {
 			return err
@@ -103,18 +106,34 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 		return err
 	}
 
+	// New-format events carry the token address as the second indexed topic;
+	// legacy events don't, and are assumed to be the configured USDC token.
+	label := tokenLabel
+	if len(vLog.Topics) > 2 && vLog.Topics[0] == l.Client.DepositTopic {
+		depositedToken := common.HexToAddress(vLog.Topics[2].Hex())
+		if depositedToken != l.Client.TokenAddress {
+			l.Log.Warn("deposit of unrecognized token ignored",
+				"token", depositedToken.Hex(), "tx", vLog.TxHash.Hex(), "user", userAddr.Hex())
+			return nil
+		}
+	}
+
 	user, err := l.Users.FindOrCreate(ctx, userAddr.Hex(), "metamask")
 	if err != nil {
 		return err
 	}
 
-	if err := l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), tokenLabel, event.Amount.String(), vLog.TxHash.Hex()); err != nil {
+	if err := l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), label, event.Amount.String(), vLog.TxHash.Hex()); err != nil {
 		return err
 	}
 
-	engineclient.Async("credit", func(ctx context.Context) error {
-		return l.EngineClient.Credit(ctx, user.ID, tokenLabel, event.Amount.String())
-	})
+	if l.EngineOutbox != nil {
+		l.EngineOutbox.EnqueueCredit(ctx, user.ID, label, event.Amount.String())
+	} else {
+		engineclient.Async("credit", func(ctx context.Context) error {
+			return l.EngineClient.Credit(ctx, user.ID, label, event.Amount.String())
+		})
+	}
 	return nil
 }
 
