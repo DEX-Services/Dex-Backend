@@ -73,8 +73,21 @@ func (r *UserRepo) CloseSession(ctx context.Context, userID string) error {
 	return err
 }
 
-func (r *UserRepo) FindByID(ctx context.Context, userID string) (models.User, error) {
-	var u models.User
+// EnsureInternalUser creates a users row whose id is exactly id (not the
+// generated DEXUSER_ sequence), for synthetic platform accounts like
+// market-maker desk wallets. The matching engine risk-locks these wallets by
+// their literal id, so user_balances rows for them need a matching users row to
+// satisfy the foreign key. Idempotent: a no-op if the id already exists.
+func (r *UserRepo) EnsureInternalUser(ctx context.Context, id, walletType string) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO users (id, wallet_address, wallet_type) VALUES ($1, $1, $2)
+		 ON CONFLICT (id) DO NOTHING`,
+		id, walletType,
+	)
+	return err
+}
+
+func (r *UserRepo) FindByID(ctx context.Context, userID string) (models.User, error) {	var u models.User
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, wallet_address, wallet_type, created_at, last_login_at FROM users WHERE id = $1`,
 		userID,

@@ -266,8 +266,43 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 	return tx.Commit(ctx)
 }
 
-func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw string) error {
-	tx, err := r.pool.Begin(ctx)
+// ResetBalance zeroes both the free and locked balance of one asset for a
+// wallet. Used to fully reclaim a synthetic market-maker desk wallet on desk
+// deletion, including any locks orphaned by an engine restart (the in-memory
+// order book is wiped but Postgres locks survive). Not for real user accounts.
+func (r *LedgerRepo) ResetBalance(ctx context.Context, userID, asset string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	_, err = r.pool.Exec(ctx,
+		`UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now()
+		 WHERE user_id = $1`,
+		userID)
+	return err
+}
+
+// ReleaseLocks zeroes ONLY the locked column for one asset, leaving the free
+// balance intact. It reconciles the durable ledger to an empty order book after
+// a matching-engine restart wipes the in-memory holds (the engine never sends
+// the matching /unlock for orders it forgot). Unlike ResetBalance it preserves
+// capital, so it is safe to run on every recredit — provided the caller knows
+// the book is genuinely empty (i.e. the engine just restarted).
+func (r *LedgerRepo) ReleaseLocks(ctx context.Context, userID, asset string) error {
+	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	_, err = r.pool.Exec(ctx,
+		`UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now()
+		 WHERE user_id = $1`,
+		userID)
+	return err
+}
+
+func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw string) error {	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}

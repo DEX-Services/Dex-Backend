@@ -478,3 +478,74 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
 }
+
+// InternalEnsureUser: POST /internal/user/ensure {userId}
+// Creates a synthetic users row whose id equals userId (e.g. a market-maker
+// desk wallet), so subsequent balance credits/locks against it satisfy the
+// user_balances foreign key. Idempotent. Called by the bots service when it
+// provisions or funds an MM desk.
+func (s *WalletServer) InternalEnsureUser(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Users.EnsureInternalUser(r.Context(), req.UserID, "mm_desk"); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ensured"})
+}
+
+// InternalResetBalance: POST /internal/balance/reset {userId, asset}
+// Zeroes the free and locked balance of a synthetic market-maker desk wallet,
+// reclaiming any capital and releasing locks orphaned by an engine restart.
+// Refuses non-"mm:" ids so a real user account can never be wiped this way.
+func (s *WalletServer) InternalResetBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !strings.HasPrefix(req.UserID, "mm:") {
+		writeError(w, http.StatusForbidden, "reset only permitted for mm: desk wallets")
+		return
+	}
+	if err := s.Ledger.ResetBalance(r.Context(), req.UserID, req.Asset); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reset"})
+}
+
+// InternalReleaseLocks: POST /internal/balance/release-locks {userId, asset}
+// Zeroes ONLY the locked balance of a synthetic market-maker desk wallet,
+// preserving its free capital. Called on bots startup (recredit) to release
+// holds orphaned by a matching-engine restart, so the desk can lock margin for
+// new quotes again. Refuses non-"mm:" ids so a real user's holds can never be
+// released this way.
+func (s *WalletServer) InternalReleaseLocks(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !strings.HasPrefix(req.UserID, "mm:") {
+		writeError(w, http.StatusForbidden, "release-locks only permitted for mm: desk wallets")
+		return
+	}
+	if err := s.Ledger.ReleaseLocks(r.Context(), req.UserID, req.Asset); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
