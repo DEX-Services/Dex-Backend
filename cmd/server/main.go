@@ -148,6 +148,7 @@ func main() {
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
 	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
 	mux.HandleFunc("/trade/order", tradeSrv.Order)
+	mux.HandleFunc("/trade/attached-order", tradeSrv.AttachedOrder)
 	mux.HandleFunc("/trade/cancel", tradeSrv.Cancel)
 	mux.HandleFunc("/trade/orders", tradeSrv.Orders)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)

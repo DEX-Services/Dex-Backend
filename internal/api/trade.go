@@ -40,6 +40,12 @@ type tradeCancelRequest struct {
 	OrderID string `json:"orderId"`
 }
 
+type attachedOrderRequest struct {
+	Parent     tradeOrderRequest  `json:"parent"`
+	TakeProfit *tradeOrderRequest `json:"takeProfit,omitempty"`
+	StopLoss   *tradeOrderRequest `json:"stopLoss,omitempty"`
+}
+
 func (s *TradeServer) claims(w http.ResponseWriter, r *http.Request) (string, bool) {
 	claims, ok := s.authenticate(r)
 	if !ok {
@@ -80,6 +86,39 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 		ReduceOnly: req.ReduceOnly, SlippageBps: req.SlippageBps, Leverage: req.Leverage,
 		MarginMode: req.MarginMode, OptionType: req.OptionType, Strike: req.Strike, Expiry: req.Expiry,
 	})
+	if err != nil {
+		s.tradeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *TradeServer) AttachedOrder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req attachedOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	toOrder := func(in *tradeOrderRequest) *engineclient.TradeOrder {
+		if in == nil {
+			return nil
+		}
+		return &engineclient.TradeOrder{AccountID: accountID, Symbol: strings.TrimSpace(in.Symbol), Market: strings.ToUpper(in.Market), Side: strings.ToUpper(in.Side), Type: strings.ToUpper(in.Type), Price: in.Price, Qty: in.Qty, StopPrice: in.StopPrice, ReduceOnly: in.ReduceOnly, SlippageBps: in.SlippageBps, Leverage: in.Leverage, MarginMode: in.MarginMode}
+	}
+	parent := toOrder(&req.Parent)
+	if parent == nil || parent.Symbol == "" || parent.Qty == "" {
+		writeError(w, http.StatusBadRequest, "parent order is required")
+		return
+	}
+	response, err := s.Engine.SubmitAttachedOrder(r.Context(), engineclient.AttachedOrder{Parent: *parent, TakeProfit: toOrder(req.TakeProfit), StopLoss: toOrder(req.StopLoss)})
 	if err != nil {
 		s.tradeError(w, err)
 		return

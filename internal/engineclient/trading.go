@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 // TradeOrder is the gateway's validated representation of an engine order.
@@ -35,6 +36,35 @@ type OrderResponse struct {
 	Status  string `json:"status"`
 	Filled  string `json:"filled"`
 	Trades  int    `json:"trades"`
+}
+
+type AttachedOrder struct {
+	Parent     TradeOrder
+	TakeProfit *TradeOrder
+	StopLoss   *TradeOrder
+}
+
+func (c *Client) SubmitAttachedOrder(ctx context.Context, attached AttachedOrder) (OrderResponse, error) {
+	parent, err := c.SubmitOrder(ctx, attached.Parent)
+	if err != nil {
+		return parent, err
+	}
+	filled, err := strconv.ParseFloat(parent.Filled, 64)
+	if err != nil || filled <= 0 {
+		return parent, nil
+	}
+	for _, leg := range []*TradeOrder{attached.TakeProfit, attached.StopLoss} {
+		if leg == nil {
+			continue
+		}
+		copy := *leg
+		copy.Qty = strconv.FormatFloat(filled, 'f', -1, 64)
+		copy.ReduceOnly = true
+		if _, err := c.SubmitOrder(ctx, copy); err != nil {
+			return parent, err
+		}
+	}
+	return parent, nil
 }
 
 type OrdersResponse struct {
