@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 )
 
 // TradeOrder is the gateway's validated representation of an engine order.
@@ -44,27 +43,56 @@ type AttachedOrder struct {
 	StopLoss   *TradeOrder
 }
 
-func (c *Client) SubmitAttachedOrder(ctx context.Context, attached AttachedOrder) (OrderResponse, error) {
-	parent, err := c.SubmitOrder(ctx, attached.Parent)
-	if err != nil {
-		return parent, err
+// AttachedOrderResponse is the payload from the engine's atomic
+// POST /attached-order.
+type AttachedOrderResponse struct {
+	OrderID      string `json:"orderId"`
+	Status       string `json:"status"`
+	Filled       string `json:"filled"`
+	Trades       int    `json:"trades"`
+	GroupID      string `json:"groupId,omitempty"`
+	TakeProfitID string `json:"takeProfitId,omitempty"`
+	StopLossID   string `json:"stopLossId,omitempty"`
+}
+
+// SubmitAttachedOrder places the entry and its TP/SL legs as one atomic
+// engine request. The engine itself only activates and places the legs
+// once the entry actually fills, sized to the real fill (not the requested
+// quantity), and links them with a shared GroupID so the engine's OCO
+// listener can cancel the sibling leg the instant one triggers and resize
+// both on partial close/liquidation/reversal. This replaced a prior
+// implementation that submitted the entry and each leg as independent,
+// unlinked /order calls with no OCO or resize guarantees.
+func (c *Client) SubmitAttachedOrder(ctx context.Context, attached AttachedOrder) (AttachedOrderResponse, error) {
+	q := url.Values{}
+	q.Set("account", attached.Parent.AccountID)
+	q.Set("symbol", attached.Parent.Symbol)
+	q.Set("market", attached.Parent.Market)
+	q.Set("side", attached.Parent.Side)
+	q.Set("type", attached.Parent.Type)
+	q.Set("price", attached.Parent.Price)
+	q.Set("qty", attached.Parent.Qty)
+	setOptional(q, "stopPrice", attached.Parent.StopPrice)
+	if attached.Parent.ReduceOnly {
+		q.Set("reduceOnly", "true")
 	}
-	filled, err := strconv.ParseFloat(parent.Filled, 64)
-	if err != nil || filled <= 0 {
-		return parent, nil
+	if attached.Parent.SlippageBps != nil {
+		q.Set("slippageBps", fmt.Sprintf("%d", *attached.Parent.SlippageBps))
 	}
-	for _, leg := range []*TradeOrder{attached.TakeProfit, attached.StopLoss} {
-		if leg == nil {
-			continue
-		}
-		copy := *leg
-		copy.Qty = strconv.FormatFloat(filled, 'f', -1, 64)
-		copy.ReduceOnly = true
-		if _, err := c.SubmitOrder(ctx, copy); err != nil {
-			return parent, err
-		}
+	if attached.Parent.Leverage != nil {
+		q.Set("leverage", fmt.Sprintf("%d", *attached.Parent.Leverage))
 	}
-	return parent, nil
+	setOptional(q, "marginMode", attached.Parent.MarginMode)
+	if attached.TakeProfit != nil {
+		setOptional(q, "tpPrice", attached.TakeProfit.Price)
+	}
+	if attached.StopLoss != nil {
+		setOptional(q, "slStopPrice", attached.StopLoss.StopPrice)
+	}
+
+	var out AttachedOrderResponse
+	err := c.tradeCall(ctx, http.MethodPost, "/attached-order", q, &out)
+	return out, err
 }
 
 type OrdersResponse struct {

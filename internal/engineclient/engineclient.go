@@ -48,6 +48,13 @@ func (c *Client) Enabled() bool {
 	return c != nil && c.baseURL != ""
 }
 
+// NewForTest builds a Client pointed at an arbitrary base URL/secret/http
+// client, for other packages' tests (e.g. internal/api) that need to stub
+// the matching engine without depending on unexported fields or env vars.
+func NewForTest(baseURL, secret string, httpClient *http.Client) *Client {
+	return &Client{baseURL: baseURL, secret: secret, http: httpClient}
+}
+
 type syncReq struct {
 	AccountID string `json:"accountId"`
 	Asset     string `json:"asset"`
