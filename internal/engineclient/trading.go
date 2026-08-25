@@ -85,8 +85,8 @@ func (c *Client) SubmitOrder(ctx context.Context, order TradeOrder) (OrderRespon
 	return out, err
 }
 
-func (c *Client) CancelOrder(ctx context.Context, symbol, market, orderID string) (OrderResponse, error) {
-	q := url.Values{"symbol": {symbol}, "market": {market}, "order_id": {orderID}}
+func (c *Client) CancelOrder(ctx context.Context, accountID, symbol, market, orderID string) (OrderResponse, error) {
+	q := url.Values{"account": {accountID}, "symbol": {symbol}, "market": {market}, "order_id": {orderID}}
 	var out OrderResponse
 	err := c.tradeCall(ctx, http.MethodPost, "/cancel", q, &out)
 	return out, err

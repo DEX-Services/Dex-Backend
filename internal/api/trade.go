@@ -92,7 +92,8 @@ func (s *TradeServer) Cancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if _, ok := s.claims(w, r); !ok {
+	accountID, ok := s.claims(w, r)
+	if !ok {
 		return
 	}
 	var req tradeCancelRequest
@@ -104,7 +105,7 @@ func (s *TradeServer) Cancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "symbol, market, and orderId are required")
 		return
 	}
-	response, err := s.Engine.CancelOrder(r.Context(), req.Symbol, strings.ToUpper(req.Market), req.OrderID)
+	response, err := s.Engine.CancelOrder(r.Context(), accountID, req.Symbol, strings.ToUpper(req.Market), req.OrderID)
 	if err != nil {
 		s.tradeError(w, err)
 		return
