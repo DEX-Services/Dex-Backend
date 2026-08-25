@@ -80,6 +80,7 @@ func main() {
 		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
+	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -146,6 +147,11 @@ func main() {
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
 	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
+	mux.HandleFunc("/trade/order", tradeSrv.Order)
+	mux.HandleFunc("/trade/cancel", tradeSrv.Cancel)
+	mux.HandleFunc("/trade/orders", tradeSrv.Orders)
+	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
+	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
