@@ -103,10 +103,41 @@ type OrderHistoryResponse struct {
 	NextCursor string          `json:"nextCursor,omitempty"`
 }
 
-func (c *Client) OrderHistory(ctx context.Context, accountID, before string, limit int) (OrderHistoryResponse, error) {
-	q := url.Values{"account": {accountID}, "before": {before}, "limit": {fmt.Sprintf("%d", limit)}}
+// HistoryFilter narrows an order-history or fills query. Empty/zero fields
+// impose no filter. Shared by OrderHistory and Fills since both endpoints
+// accept the same filter shape.
+type HistoryFilter struct {
+	Symbol string
+	Market string
+	After  string // RFC3339Nano
+	Before string // RFC3339Nano; also the pagination cursor
+	Limit  int
+}
+
+func (c *Client) OrderHistory(ctx context.Context, accountID string, f HistoryFilter) (OrderHistoryResponse, error) {
+	q := url.Values{"account": {accountID}, "limit": {fmt.Sprintf("%d", f.Limit)}}
+	setOptional(q, "symbol", f.Symbol)
+	setOptional(q, "market", f.Market)
+	setOptional(q, "after", f.After)
+	setOptional(q, "before", f.Before)
 	var out OrderHistoryResponse
 	err := c.tradeCall(ctx, http.MethodGet, "/order-history", q, &out)
+	return out, err
+}
+
+type FillsResponse struct {
+	Fills      json.RawMessage `json:"fills"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+func (c *Client) Fills(ctx context.Context, accountID string, f HistoryFilter) (FillsResponse, error) {
+	q := url.Values{"account": {accountID}, "limit": {fmt.Sprintf("%d", f.Limit)}}
+	setOptional(q, "symbol", f.Symbol)
+	setOptional(q, "market", f.Market)
+	setOptional(q, "after", f.After)
+	setOptional(q, "before", f.Before)
+	var out FillsResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/fills", q, &out)
 	return out, err
 }
 

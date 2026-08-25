@@ -179,18 +179,50 @@ func (s *TradeServer) OrderHistory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			limit = n
-		}
-	}
-	response, err := s.Engine.OrderHistory(r.Context(), accountID, r.URL.Query().Get("before"), limit)
+	response, err := s.Engine.OrderHistory(r.Context(), accountID, parseHistoryFilter(r))
 	if err != nil {
 		s.tradeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// Fills returns individual trade executions for the caller's account — the
+// fill-level complement to OrderHistory's per-order aggregates.
+func (s *TradeServer) Fills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	response, err := s.Engine.Fills(r.Context(), accountID, parseHistoryFilter(r))
+	if err != nil {
+		s.tradeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// parseHistoryFilter reads the symbol/market/after/before/limit query params
+// shared by OrderHistory and Fills.
+func parseHistoryFilter(r *http.Request) engineclient.HistoryFilter {
+	q := r.URL.Query()
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	return engineclient.HistoryFilter{
+		Symbol: strings.TrimSpace(q.Get("symbol")),
+		Market: strings.ToUpper(strings.TrimSpace(q.Get("market"))),
+		After:  q.Get("after"),
+		Before: q.Get("before"),
+		Limit:  limit,
+	}
 }
 
 func (s *TradeServer) Positions(w http.ResponseWriter, r *http.Request) {

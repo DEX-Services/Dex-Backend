@@ -152,6 +152,7 @@ func main() {
 	mux.HandleFunc("/trade/cancel", tradeSrv.Cancel)
 	mux.HandleFunc("/trade/orders", tradeSrv.Orders)
 	mux.HandleFunc("/trade/order-history", tradeSrv.OrderHistory)
+	mux.HandleFunc("/trade/fills", tradeSrv.Fills)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
 	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
