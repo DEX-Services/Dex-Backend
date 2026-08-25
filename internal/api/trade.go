@@ -206,6 +206,42 @@ func (s *TradeServer) Fills(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+// FundingHistory returns the caller's persisted funding payments.
+func (s *TradeServer) FundingHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	response, err := s.Engine.FundingHistory(r.Context(), accountID, parseHistoryFilter(r))
+	if err != nil {
+		s.tradeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// PnlHistory returns the caller's authoritative realized-PnL events.
+func (s *TradeServer) PnlHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	response, err := s.Engine.PnlHistory(r.Context(), accountID, parseHistoryFilter(r))
+	if err != nil {
+		s.tradeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 // parseHistoryFilter reads the symbol/market/after/before/limit query params
 // shared by OrderHistory and Fills.
 func parseHistoryFilter(r *http.Request) engineclient.HistoryFilter {

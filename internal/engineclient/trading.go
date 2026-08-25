@@ -141,6 +141,41 @@ func (c *Client) Fills(ctx context.Context, accountID string, f HistoryFilter) (
 	return out, err
 }
 
+type FundingHistoryResponse struct {
+	Payments   json.RawMessage `json:"payments"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+// FundingHistory returns an account's persisted funding payments — the
+// queryable complement to the live WebSocket FUNDING event, so the funding
+// tab survives a refresh, reconnect, or login on another device.
+func (c *Client) FundingHistory(ctx context.Context, accountID string, f HistoryFilter) (FundingHistoryResponse, error) {
+	q := url.Values{"account": {accountID}, "limit": {fmt.Sprintf("%d", f.Limit)}}
+	setOptional(q, "symbol", f.Symbol)
+	setOptional(q, "after", f.After)
+	setOptional(q, "before", f.Before)
+	var out FundingHistoryResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/funding-history", q, &out)
+	return out, err
+}
+
+type PnlHistoryResponse struct {
+	Entries    json.RawMessage `json:"entries"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+// PnlHistory returns an account's authoritative realized-PnL events (each
+// full or partial futures position close, including forced liquidations).
+func (c *Client) PnlHistory(ctx context.Context, accountID string, f HistoryFilter) (PnlHistoryResponse, error) {
+	q := url.Values{"account": {accountID}, "limit": {fmt.Sprintf("%d", f.Limit)}}
+	setOptional(q, "symbol", f.Symbol)
+	setOptional(q, "after", f.After)
+	setOptional(q, "before", f.Before)
+	var out PnlHistoryResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/pnl-history", q, &out)
+	return out, err
+}
+
 type PositionsResponse struct {
 	Futures json.RawMessage `json:"futures"`
 	Options json.RawMessage `json:"options"`
