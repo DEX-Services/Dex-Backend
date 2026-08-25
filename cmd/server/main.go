@@ -135,6 +135,7 @@ func main() {
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
 	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)
+	mux.HandleFunc("/internal/user/ensure", walletSrv.InternalEnsureUser)
 	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)

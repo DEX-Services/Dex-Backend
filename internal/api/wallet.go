@@ -358,6 +358,37 @@ func (s *WalletServer) checkEngineSecret(w http.ResponseWriter, r *http.Request)
 	return true
 }
 
+type internalEnsureUserBody struct {
+	UserID string `json:"userId"`
+}
+
+// InternalEnsureUser: POST /internal/user/ensure {userId}
+// Called by the bots service before it funds a market-maker desk's synthetic
+// account, so the desk's user_balances credits/locks satisfy the foreign key
+// to users. The bots service risk-locks the desk by this literal id against
+// Dex-Backend's ledger, so the id in the users row must be exactly userId,
+// not a database-generated one - see repo.UserRepo.EnsureByID. Idempotent.
+func (s *WalletServer) InternalEnsureUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalEnsureUserBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.UserID) == "" {
+		writeError(w, http.StatusBadRequest, "userId is required")
+		return
+	}
+	if err := s.Users.EnsureByID(r.Context(), req.UserID, "market-maker"); err != nil {
+		s.Log.Error("ensure backend user failed", "userId", req.UserID, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not ensure user")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "userId": req.UserID})
+}
+
 // InternalLockBalance: POST /internal/balance/lock {userId, asset, amount}
 // Called by the matching-engine when it reserves margin/notional for a new order,
 // to mirror the hold against the user's real Postgres balance.

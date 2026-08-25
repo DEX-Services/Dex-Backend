@@ -43,6 +43,25 @@ func (r *UserRepo) FindOrCreate(ctx context.Context, walletAddress, walletType s
 	return u, err
 }
 
+// EnsureByID upserts a users row with an explicit, caller-supplied id rather
+// than letting Postgres assign one (unlike FindOrCreate, which is keyed by
+// wallet_address and generates id via dex_user_seq). This is for synthetic,
+// non-wallet identities — e.g. a market-maker desk's internal account id
+// like "mm:BTC:spot" — that the matching engine and ledger reference
+// directly as the literal user id, so the id must be exactly what the
+// caller passed in, not database-generated. wallet_address is set to the
+// same value since the column is NOT NULL UNIQUE and there is no real
+// wallet address for a desk account; walletType records the caller's kind
+// (e.g. "market-maker") for auditing.
+func (r *UserRepo) EnsureByID(ctx context.Context, userID, walletType string) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO users (id, wallet_address, wallet_type) VALUES ($1, $1, $2)
+		 ON CONFLICT (id) DO NOTHING`,
+		userID, walletType,
+	)
+	return err
+}
+
 func (r *UserRepo) TouchLogin(ctx context.Context, userID string) error {
 	_, err := r.pool.Exec(ctx, `UPDATE users SET last_login_at = now() WHERE id = $1`, userID)
 	return err
