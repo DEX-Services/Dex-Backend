@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/engineclient"
@@ -162,6 +163,29 @@ func (s *TradeServer) Orders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response, err := s.Engine.Orders(r.Context(), accountID)
+	if err != nil {
+		s.tradeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *TradeServer) OrderHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	response, err := s.Engine.OrderHistory(r.Context(), accountID, r.URL.Query().Get("before"), limit)
 	if err != nil {
 		s.tradeError(w, err)
 		return

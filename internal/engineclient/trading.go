@@ -70,6 +70,17 @@ func (c *Client) SubmitAttachedOrder(ctx context.Context, attached AttachedOrder
 type OrdersResponse struct {
 	Orders json.RawMessage `json:"orders"`
 }
+type OrderHistoryResponse struct {
+	Orders     json.RawMessage `json:"orders"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+func (c *Client) OrderHistory(ctx context.Context, accountID, before string, limit int) (OrderHistoryResponse, error) {
+	q := url.Values{"account": {accountID}, "before": {before}, "limit": {fmt.Sprintf("%d", limit)}}
+	var out OrderHistoryResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/order-history", q, &out)
+	return out, err
+}
 
 type PositionsResponse struct {
 	Futures json.RawMessage `json:"futures"`
