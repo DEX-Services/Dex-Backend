@@ -160,6 +160,69 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 	return map[string]string{"id": requestID, "txHash": txHash, "asset": confirmed.Token, "status": "confirmed"}, http.StatusOK, nil
 }
 
+type swapRequestBody struct {
+	Amount           string `json:"amount"`
+	SourceAsset      string `json:"sourceAsset"`
+	DestinationAsset string `json:"destinationAsset"`
+}
+
+// swapTestPairs is the allowlist of asset pairs the test-only 1:1 swap
+// accepts, in either direction. USDC and USDT are both raw integer token
+// balances (see assetColumns in repo/ledger.go) so a 1:1 swap needs no
+// decimal conversion between them.
+var swapTestPairs = map[[2]string]bool{
+	{"USDC", "USDT"}: true,
+	{"USDT", "USDC"}: true,
+}
+
+// Swap: POST /wallet/swap {amount, sourceAsset, destinationAsset}
+// Test-only fixed 1:1 conversion between USDC and USDT ledger balances, for
+// exercising swap UI/flows without real market pricing. Deliberately
+// restricted to that single pair; NOT a general-purpose swap endpoint and
+// should not be reused for real market-priced conversions.
+func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+
+	var req swapRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	source := strings.ToUpper(strings.TrimSpace(req.SourceAsset))
+	destination := strings.ToUpper(strings.TrimSpace(req.DestinationAsset))
+	if source == destination {
+		writeError(w, http.StatusBadRequest, "source and destination asset must differ")
+		return
+	}
+	if !swapTestPairs[[2]string{source, destination}] {
+		writeError(w, http.StatusBadRequest, "swap is only available for USDC <-> USDT (test only)")
+		return
+	}
+
+	amount, ok := new(big.Int).SetString(req.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
+		writeError(w, http.StatusBadRequest, "amount must be a positive integer (raw token units)")
+		return
+	}
+
+	// Fixed 1:1 rate: destination amount equals source amount, raw unit for raw unit.
+	if err := s.Ledger.SwapBalance(r.Context(), claims.UserID, source, amount.String(), destination, amount.String()); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":           "swapped",
+		"sourceAsset":      source,
+		"destinationAsset": destination,
+		"amount":           amount.String(),
+	})
+}
+
 type adminApproveBody struct {
 	RequestID string `json:"requestId"`
 	Action    string `json:"action"`
