@@ -20,6 +20,7 @@ func NewLedgerRepo(pool *pgxpool.Pool) *LedgerRepo {
 }
 
 var assetColumns = map[string]string{
+	"BTC":       `"BTC"`,
 	"USDC":      `"USDC"`,
 	"USDT":      `"USDT"`,
 	"BUSD":      `"BUSD"`,
@@ -27,6 +28,7 @@ var assetColumns = map[string]string{
 }
 
 var lockedColumns = map[string]string{
+	"BTC":       `"BTC_locked"`,
 	"USDC":      `"USDC_locked"`,
 	"USDT":      `"USDT_locked"`,
 	"BUSD":      `"BUSD_locked"`,
@@ -49,6 +51,14 @@ func validatePositiveAmount(amountRaw string) error {
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok || amount.Sign() <= 0 {
 		return fmt.Errorf("amount must be a positive integer raw token amount")
+	}
+	return nil
+}
+
+func validateNonNegativeAmount(amountRaw string) error {
+	amount, ok := new(big.Int).SetString(amountRaw, 10)
+	if !ok || amount.Sign() < 0 {
+		return fmt.Errorf("amount must be a non-negative integer raw token amount")
 	}
 	return nil
 }
@@ -226,6 +236,78 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
 		 WHERE user_id = $1`,
 		userID, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReleaseLocksFor clears all trading locks for one internal desk wallet and
+// asset after the matching engine has restarted and discarded its in-memory
+// orders. It preserves the wallet's balance.
+func (r *LedgerRepo) ReleaseLocksFor(ctx context.Context, userID, asset string) error {
+	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ResetBalanceFor clears a desk wallet's balance and trading locks for one
+// asset. It is used only when deleting/reclaiming an internal desk wallet.
+func (r *LedgerRepo) ResetBalanceFor(ctx context.Context, userID, asset string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SyncBalanceFor makes an internal desk wallet's durable balance match its
+// authoritative desk allocation and clears trading locks. It is used only
+// during matching-engine restart recovery, after the engine has discarded all
+// in-memory orders and positions for that desk.
+func (r *LedgerRepo) SyncBalanceFor(ctx context.Context, userID, asset, amountRaw string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	if err := validateNonNegativeAmount(amountRaw); err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = $2::numeric, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID, amountRaw); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -534,17 +616,18 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var usdc, usdt, busd, ourToken string
+	var btc, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
+		SELECT "BTC"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	balances["BTC"] = btc
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
 	balances["BUSD"] = busd
@@ -555,17 +638,18 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var usdc, usdt, busd, ourToken string
+	var btc, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
+		SELECT "BTC_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	locked["BTC"] = btc
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
 	locked["BUSD"] = busd
@@ -575,7 +659,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 
 // PendingWithdrawalHoldsFor returns pending/processing withdrawal holds per asset for userID.
 func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID string) (map[string]string, error) {
-	holds := map[string]string{"USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
+	holds := map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
 	rows, err := r.pool.Query(ctx, `
 		SELECT token, COALESCE(SUM(amount), 0)::text
 		FROM ledger_entries
@@ -655,6 +739,8 @@ type NonzeroBalance struct {
 func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT user_id, 'USDC', "USDC"::text FROM user_balances WHERE "USDC" > 0
+		UNION ALL
+		SELECT user_id, 'BTC', "BTC"::text FROM user_balances WHERE "BTC" > 0
 		UNION ALL
 		SELECT user_id, 'USDT', "USDT"::text FROM user_balances WHERE "USDT" > 0
 		UNION ALL

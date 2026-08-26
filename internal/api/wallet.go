@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strings"
@@ -369,7 +370,16 @@ func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total i
 		return 0, 0, 0, err
 	}
 	for _, b := range balances {
-		if cerr := s.EngineClient.Credit(ctx, b.UserID, b.Asset, b.Amount); cerr != nil {
+		// Postgres stores token amounts in 10^-6 raw units, while the matching
+		// engine ledger uses human units. Passing the raw integer through here
+		// inflated every restored balance by one million after a restart.
+		amount, convErr := rawToHumanUnits(b.Amount)
+		if convErr != nil {
+			s.Log.Error("backfill: invalid raw balance", "err", convErr, "userId", b.UserID, "asset", b.Asset)
+			failed++
+			continue
+		}
+		if cerr := s.EngineClient.Credit(ctx, b.UserID, b.Asset, amount); cerr != nil {
 			s.Log.Error("backfill: credit failed", "err", cerr, "userId", b.UserID, "asset", b.Asset)
 			failed++
 			continue
@@ -377,6 +387,17 @@ func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total i
 		synced++
 	}
 	return synced, failed, len(balances), nil
+}
+
+// rawToHumanUnits converts this platform's six-decimal database representation
+// to the decimal representation used by the matching engine.
+func rawToHumanUnits(raw string) (string, error) {
+	n, ok := new(big.Int).SetString(raw, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid raw token amount %q", raw)
+	}
+	r := new(big.Rat).SetFrac(n, big.NewInt(1_000_000))
+	return strings.TrimRight(strings.TrimRight(r.FloatString(6), "0"), "."), nil
 }
 
 // InternalEngineBackfill: POST /internal/engine-backfill
@@ -488,6 +509,58 @@ func (s *WalletServer) InternalUnlockBalance(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unlocked"})
+}
+
+// InternalReleaseLocks clears locks orphaned by a matching-engine restart.
+func (s *WalletServer) InternalReleaseLocks(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.ReleaseLocksFor(r.Context(), req.UserID, req.Asset); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "locks released"})
+}
+
+// InternalResetBalance reclaims an internal desk wallet during desk deletion.
+func (s *WalletServer) InternalResetBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.ResetBalanceFor(r.Context(), req.UserID, req.Asset); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "balance reset"})
+}
+
+// InternalSyncBalance restores an internal desk wallet to its authoritative
+// allocated capital after an engine restart discarded its in-memory state.
+func (s *WalletServer) InternalSyncBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.Ledger.SyncBalanceFor(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "balance synchronized"})
 }
 
 // InternalSettleBalance: POST /internal/balance/settle {userId, asset, amount}
