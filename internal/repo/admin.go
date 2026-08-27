@@ -39,7 +39,12 @@ func (r *AdminRepo) UpdateProfile(ctx context.Context, p models.AdminProfile) (m
 }
 
 func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
-	var s models.AdminSummary
+	s := models.AdminSummary{
+		TotalBalances:       make([]models.AdminTokenTotal, 0),
+		TopUsers:            make([]models.AdminTopUser, 0),
+		RecentLedgerEntries: make([]models.AdminLedgerEntry, 0),
+		RecentUsers:         make([]models.AdminRecentUser, 0),
+	}
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
 			(SELECT COUNT(*) FROM users),
@@ -57,6 +62,7 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 		FROM (
 			SELECT 'USDC' AS token, COALESCE(SUM("USDC"), 0) AS amount, COALESCE(SUM("USDC_locked"), 0) AS locked FROM user_balances
 			UNION ALL SELECT 'USDT', COALESCE(SUM("USDT"), 0), COALESCE(SUM("USDT_locked"), 0) FROM user_balances
+			UNION ALL SELECT 'BTC', COALESCE(SUM("BTC"), 0), COALESCE(SUM("BTC_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BUSD', COALESCE(SUM("BUSD"), 0), COALESCE(SUM("BUSD_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'OUR_Token', COALESCE(SUM("OUR_Token"), 0), COALESCE(SUM("OUR_Token_locked"), 0) FROM user_balances
 		) totals`)

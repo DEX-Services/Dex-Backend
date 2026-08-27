@@ -241,6 +241,44 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 	return tx.Commit(ctx)
 }
 
+// ReplaceLocksFor atomically replaces the trading holds for a dedicated
+// market-maker wallet. targets are raw integer amounts keyed by asset. It is
+// deliberately an absolute replacement rather than unlock-then-lock, so a
+// quote refresh cannot temporarily expose an unfunded or over-locked state.
+func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets map[string]string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	for asset, amountRaw := range targets {
+		normalized, column, err := normalizeAsset(asset)
+		if err != nil {
+			return err
+		}
+		if err := validateNonNegativeAmount(amountRaw); err != nil {
+			return err
+		}
+		pending, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+		if err != nil {
+			return err
+		}
+		lockedColumn := lockedColumns[normalized]
+		ct, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = $2::numeric, updated_at = now()
+			WHERE user_id = $1 AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String())
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			return fmt.Errorf("insufficient %s balance to lock", normalized)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 // ReleaseLocksFor clears all trading locks for one internal desk wallet and
 // asset after the matching engine has restarted and discarded its in-memory
 // orders. It preserves the wallet's balance.
@@ -344,6 +382,64 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 	}
 	if commandTag.RowsAffected() == 0 {
 		return fmt.Errorf("insufficient %s balance to settle", normalized)
+	}
+	return tx.Commit(ctx)
+}
+
+// SettleSpotTrade completes both legs of a spot fill in one database
+// transaction. The buyer's quote and seller's base were already reserved by
+// the matching engine; this method consumes those reservations and credits the
+// received assets atomically, so a timeout cannot leave a trade half-persisted.
+func (r *LedgerRepo) SettleSpotTrade(ctx context.Context, buyerID, sellerID, base, quote, baseQtyRaw, buyerQuoteRaw, sellerQuoteRaw string) error {
+	if buyerID == sellerID {
+		return fmt.Errorf("spot trade buyer and seller must differ")
+	}
+	if err := validatePositiveAmount(baseQtyRaw); err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(buyerQuoteRaw); err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(sellerQuoteRaw); err != nil {
+		return err
+	}
+	baseName, baseColumn, err := normalizeAsset(base)
+	if err != nil {
+		return err
+	}
+	quoteName, quoteColumn, err := normalizeAsset(quote)
+	if err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.lockBalances(ctx, tx, []string{buyerID, sellerID}); err != nil {
+		return err
+	}
+	baseLocked := lockedColumns[baseName]
+	quoteLocked := lockedColumns[quoteName]
+	buyerTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`-$2::numeric, `+quoteLocked+`=`+quoteLocked+`-$2::numeric, updated_at=now() WHERE user_id=$1 AND `+quoteColumn+` >= $2::numeric AND `+quoteLocked+` >= $2::numeric`, buyerID, buyerQuoteRaw)
+	if err != nil {
+		return err
+	}
+	if buyerTag.RowsAffected() != 1 {
+		return fmt.Errorf("insufficient locked %s for buyer", quoteName)
+	}
+	sellerTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`-$2::numeric, `+baseLocked+`=`+baseLocked+`-$2::numeric, updated_at=now() WHERE user_id=$1 AND `+baseColumn+` >= $2::numeric AND `+baseLocked+` >= $2::numeric`, sellerID, baseQtyRaw)
+	if err != nil {
+		return err
+	}
+	if sellerTag.RowsAffected() != 1 {
+		return fmt.Errorf("insufficient locked %s for seller", baseName)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`+$2::numeric, updated_at=now() WHERE user_id=$1`, buyerID, baseQtyRaw); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`+$2::numeric, updated_at=now() WHERE user_id=$1`, sellerID, sellerQuoteRaw); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

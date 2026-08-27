@@ -80,7 +80,7 @@ func main() {
 		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
-	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient}
+	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -139,10 +139,12 @@ func main() {
 	mux.HandleFunc("/internal/user/ensure", walletSrv.InternalEnsureUser)
 	mux.HandleFunc("/internal/balance/lock", walletSrv.InternalLockBalance)
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
+	mux.HandleFunc("/internal/balance/replace-locks", walletSrv.InternalReplaceLocks)
 	mux.HandleFunc("/internal/balance/release-locks", walletSrv.InternalReleaseLocks)
 	mux.HandleFunc("/internal/balance/reset", walletSrv.InternalResetBalance)
 	mux.HandleFunc("/internal/balance/sync", walletSrv.InternalSyncBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
+	mux.HandleFunc("/internal/balance/spot-settle", walletSrv.InternalSettleSpot)
 	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)

@@ -427,6 +427,21 @@ type internalLockBody struct {
 	Amount string `json:"amount"`
 }
 
+type internalSpotSettleBody struct {
+	BuyerID           string `json:"buyerId"`
+	SellerID          string `json:"sellerId"`
+	Base              string `json:"base"`
+	Quote             string `json:"quote"`
+	BaseQuantity      string `json:"baseQuantity"`
+	BuyerQuoteDebit   string `json:"buyerQuoteDebit"`
+	SellerQuoteCredit string `json:"sellerQuoteCredit"`
+}
+
+type internalReplaceLocksBody struct {
+	UserID string            `json:"userId"`
+	Locks  map[string]string `json:"locks"`
+}
+
 // checkEngineSecret authorizes the matching-engine, which is not a logged-in wallet
 // user and so can't present a JWT. Returns false (and writes the error response)
 // if the shared secret is missing/misconfigured or doesn't match.
@@ -511,6 +526,25 @@ func (s *WalletServer) InternalUnlockBalance(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unlocked"})
 }
 
+// InternalReplaceLocks atomically sets all active reservation totals for a
+// dedicated market-maker wallet. It avoids the unlock/lock race that used to
+// leave a refresh with no liquidity or with stale durable locks.
+func (s *WalletServer) InternalReplaceLocks(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalReplaceLocksBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" || len(req.Locks) == 0 {
+		writeError(w, http.StatusBadRequest, "userId and locks are required")
+		return
+	}
+	if err := s.Ledger.ReplaceLocksFor(r.Context(), req.UserID, req.Locks); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "replaced"})
+}
+
 // InternalReleaseLocks clears locks orphaned by a matching-engine restart.
 func (s *WalletServer) InternalReleaseLocks(w http.ResponseWriter, r *http.Request) {
 	if !s.checkEngineSecret(w, r) {
@@ -576,6 +610,24 @@ func (s *WalletServer) InternalSettleBalance(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := s.Ledger.SettleLockedDebit(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "settled"})
+}
+
+// InternalSettleSpot atomically persists both sides of one completed spot
+// trade. It replaces the previous sequence of independent settle/credit calls.
+func (s *WalletServer) InternalSettleSpot(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalSpotSettleBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuyerID == "" || req.SellerID == "" || req.Base == "" || req.Quote == "" {
+		writeError(w, http.StatusBadRequest, "invalid spot settlement request")
+		return
+	}
+	if err := s.Ledger.SettleSpotTrade(r.Context(), req.BuyerID, req.SellerID, req.Base, req.Quote, req.BaseQuantity, req.BuyerQuoteDebit, req.SellerQuoteCredit); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}

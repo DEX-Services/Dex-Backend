@@ -1,13 +1,17 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/engineclient"
+	"github.com/dex/dex-backend/internal/repo"
 )
 
 // TradeServer is the authenticated user-facing gateway to the matching
@@ -16,6 +20,7 @@ import (
 type TradeServer struct {
 	*Server
 	Engine *engineclient.Client
+	Ledger *repo.LedgerRepo
 }
 
 type tradeOrderRequest struct {
@@ -81,6 +86,10 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "LIMIT"
 	}
+	if err := s.reconcileOrderBalance(r.Context(), accountID, req.Symbol, req.Side); err != nil {
+		s.tradeError(w, err)
+		return
+	}
 	response, err := s.Engine.SubmitOrder(r.Context(), engineclient.TradeOrder{
 		AccountID: accountID, Symbol: req.Symbol, Market: req.Market, Side: req.Side,
 		Type: req.Type, Price: req.Price, Qty: req.Qty, StopPrice: req.StopPrice,
@@ -92,6 +101,55 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// reconcileOrderBalance repairs the engine mirror immediately before risk
+// checks. This covers balances deposited before the engine started and engine
+// restarts that occurred after the normal startup backfill.
+func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symbol, side string) error {
+	if s.Ledger == nil || s.Engine == nil {
+		return nil
+	}
+	parts := strings.SplitN(symbol, "-", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	asset := parts[1]
+	if strings.EqualFold(side, "SELL") {
+		asset = parts[0]
+	}
+	bals, err := s.Ledger.BalancesFor(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("load balance: %w", err)
+	}
+	raw, ok := bals[strings.ToUpper(asset)]
+	if !ok {
+		return fmt.Errorf("unsupported asset %s", asset)
+	}
+	dbTotal, err := rawToHumanUnits(raw)
+	if err != nil {
+		return fmt.Errorf("convert balance: %w", err)
+	}
+	dbAmount, ok := new(big.Rat).SetString(dbTotal)
+	if !ok {
+		return fmt.Errorf("invalid balance amount %s", dbTotal)
+	}
+	engineBal, err := s.Engine.Balance(ctx, accountID, asset)
+	if err != nil {
+		return fmt.Errorf("check engine balance: %w", err)
+	}
+	engineAmount, ok := new(big.Rat).SetString(engineBal.Balance)
+	if !ok {
+		return fmt.Errorf("invalid engine balance %s", engineBal.Balance)
+	}
+	delta := new(big.Rat).Sub(dbAmount, engineAmount)
+	if delta.Sign() > 0 {
+		return s.Engine.Credit(ctx, accountID, asset, delta.FloatString(18))
+	}
+	if delta.Sign() < 0 {
+		return s.Engine.Debit(ctx, accountID, asset, new(big.Rat).Abs(delta).FloatString(18))
+	}
+	return nil
 }
 
 func (s *TradeServer) AttachedOrder(w http.ResponseWriter, r *http.Request) {
