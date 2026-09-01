@@ -100,3 +100,33 @@ func (r *UserRepo) FindByID(ctx context.Context, userID string) (models.User, er
 	).Scan(&u.ID, &u.WalletAddress, &u.WalletType, &u.CreatedAt, &u.LastLoginAt)
 	return u, err
 }
+
+// Search finds users whose id or wallet_address contains query
+// (case-insensitive), for the admin balance-adjustment picker. Empty query
+// returns the most recently created users instead of everything, so an
+// unfiltered picker load stays bounded.
+func (r *UserRepo) Search(ctx context.Context, query string, limit int) ([]models.User, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, wallet_address, wallet_type, created_at, last_login_at FROM users
+		 WHERE lower(id) LIKE $1 OR lower(wallet_address) LIKE $1
+		 ORDER BY created_at DESC LIMIT $2`,
+		pattern, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []models.User{}
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.WalletAddress, &u.WalletType, &u.CreatedAt, &u.LastLoginAt); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}

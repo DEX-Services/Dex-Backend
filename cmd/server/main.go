@@ -73,6 +73,9 @@ func main() {
 	adminSrv := &api.AdminServer{
 		Server:        srv,
 		Admin:         adminRepo,
+		Users:         userRepo,
+		Ledger:        ledgerRepo,
+		EngineClient:  engineClient,
 		AdminLoginID:  os.Getenv("ADMIN_LOGIN_ID"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 	}
@@ -131,6 +134,8 @@ func main() {
 	mux.HandleFunc("/admin/login", adminSrv.Login)
 	mux.HandleFunc("/admin/dashboard", adminSrv.Dashboard)
 	mux.HandleFunc("/admin/profile", adminSrv.Profile)
+	mux.HandleFunc("/admin/users/search", adminSrv.SearchUsers)
+	mux.HandleFunc("/admin/users/balance", adminSrv.AdjustUserBalance)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)
