@@ -14,7 +14,7 @@ import (
 
 const sessionCookie = "dex_session"
 
-var validWalletTypes = map[string]bool{"metamask": true, "coinbase": true, "bitget": true}
+var validWalletTypes = map[string]bool{"metamask": true, "trust": true, "binance": true, "coinbase": true, "bitget": true}
 
 type Server struct {
 	Nonces       *auth.NonceStore
