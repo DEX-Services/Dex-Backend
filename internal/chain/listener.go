@@ -18,7 +18,13 @@ import (
 const (
 	cursorKey    = "dexvault_deposit"
 	pollInterval = 15 * time.Second
-	tokenLabel   = "USDC"
+	// tokenLabel is the real on-chain asset the vault contract actually
+	// receives — kept for an honest ledger audit trail (see InsertDeposit).
+	tokenLabel = "USDC"
+	// creditTokenLabel is what the deposit actually credits: the platform's
+	// internal stable quote currency, pegged 1:1 to tokenLabel. Every
+	// market's quote leg trades in USDB, not the raw deposited asset.
+	creditTokenLabel = "USDB"
 	// maxBlockRange stays under Fuji's public RPC eth_getLogs cap (2048 blocks per call).
 	maxBlockRange = 2000
 )
@@ -108,12 +114,12 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 		return err
 	}
 
-	if err := l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), tokenLabel, event.Amount.String(), vLog.TxHash.Hex()); err != nil {
+	if err := l.Ledger.InsertDeposit(ctx, user.ID, userAddr.Hex(), tokenLabel, creditTokenLabel, event.Amount.String(), vLog.TxHash.Hex()); err != nil {
 		return err
 	}
 
 	engineclient.Async("credit", func(ctx context.Context) error {
-		return l.EngineClient.Credit(ctx, user.ID, tokenLabel, event.Amount.String())
+		return l.EngineClient.Credit(ctx, user.ID, creditTokenLabel, event.Amount.String())
 	})
 	return nil
 }

@@ -168,18 +168,26 @@ type swapRequestBody struct {
 }
 
 // swapTestPairs is the allowlist of asset pairs the test-only 1:1 swap
-// accepts, in either direction. USDC and USDT are both raw integer token
-// balances (see assetColumns in repo/ledger.go) so a 1:1 swap needs no
-// decimal conversion between them.
+// accepts, in either direction. USDC/USDT/USDB are all raw integer token
+// balances at the same 6-decimal scale (see assetColumns in repo/ledger.go)
+// so a 1:1 swap needs no decimal conversion between any of them. USDB pairs
+// let a user move deposit-intake USDC/USDT they already hold into the
+// tradable USDB balance manually — real on-chain deposits already convert
+// to USDB automatically (see chain.Listener), this just covers the case of
+// a balance credited before that, or credited directly as USDC/USDT.
 var swapTestPairs = map[[2]string]bool{
 	{"USDC", "USDT"}: true,
 	{"USDT", "USDC"}: true,
+	{"USDC", "USDB"}: true,
+	{"USDB", "USDC"}: true,
+	{"USDT", "USDB"}: true,
+	{"USDB", "USDT"}: true,
 }
 
 // Swap: POST /wallet/swap {amount, sourceAsset, destinationAsset}
-// Test-only fixed 1:1 conversion between USDC and USDT ledger balances, for
+// Test-only fixed 1:1 conversion between USDC/USDT/USDB ledger balances, for
 // exercising swap UI/flows without real market pricing. Deliberately
-// restricted to that single pair; NOT a general-purpose swap endpoint and
+// restricted to swapTestPairs; NOT a general-purpose swap endpoint and
 // should not be reused for real market-priced conversions.
 func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(r)
@@ -201,7 +209,7 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !swapTestPairs[[2]string{source, destination}] {
-		writeError(w, http.StatusBadRequest, "swap is only available for USDC <-> USDT (test only)")
+		writeError(w, http.StatusBadRequest, "swap is only available between USDC, USDT, and USDB (test only)")
 		return
 	}
 

@@ -25,6 +25,12 @@ var assetColumns = map[string]string{
 	"USDT":      `"USDT"`,
 	"BUSD":      `"BUSD"`,
 	"OUR_TOKEN": `"OUR_Token"`,
+	// USDB is the platform's internal stable quote currency, pegged 1:1 to
+	// USDT — it has no on-chain contract of its own. Every market's quote
+	// leg trades in USDB, not USDT; a real USDT/USDC deposit is credited as
+	// USDB at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
+	// kept only as the deposit-intake ledger, not as tradable balances.
+	"USDB": `"USDB"`,
 }
 
 var lockedColumns = map[string]string{
@@ -33,6 +39,7 @@ var lockedColumns = map[string]string{
 	"USDT":      `"USDT_locked"`,
 	"BUSD":      `"BUSD_locked"`,
 	"OUR_TOKEN": `"OUR_Token_locked"`,
+	"USDB":      `"USDB_locked"`,
 }
 
 func normalizeAsset(asset string) (string, string, error) {
@@ -514,9 +521,20 @@ func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourc
 	return tx.Commit(ctx)
 }
 
-// InsertDeposit records a confirmed on-chain deposit and credits the user's asset balance.
-func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, token, amountRaw, txHash string) error {
+// InsertDeposit records a confirmed on-chain deposit and credits the user's
+// tradable balance in creditToken at 1:1. token (what actually arrived
+// on-chain, e.g. "USDC") and creditToken (what gets credited, e.g. "USDB")
+// can differ: every market's quote leg trades in USDB, the platform's
+// internal stable unit pegged 1:1 to the real deposited asset, so a real
+// stablecoin deposit converts into USDB at credit time while the ledger row
+// still records the true on-chain asset for an honest audit trail. Pass the
+// same value for both to credit the deposited asset directly (no conversion).
+func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, token, creditToken, amountRaw, txHash string) error {
 	normalizedToken, _, err := normalizeAsset(token)
+	if err != nil {
+		return err
+	}
+	normalizedCreditToken, _, err := normalizeAsset(creditToken)
 	if err != nil {
 		return err
 	}
@@ -540,7 +558,7 @@ func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, t
 		return err
 	}
 	if commandTag.RowsAffected() > 0 {
-		if err := r.creditBalanceTx(ctx, tx, userID, normalizedToken, amountRaw); err != nil {
+		if err := r.creditBalanceTx(ctx, tx, userID, normalizedCreditToken, amountRaw); err != nil {
 			return err
 		}
 	}
@@ -712,18 +730,19 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, usdc, usdt, busd, ourToken string
+	var btc, usdb, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
+		SELECT "BTC"::text, "USDB"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &usdb, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	balances["BTC"] = btc
+	balances["USDB"] = usdb
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
 	balances["BUSD"] = busd
@@ -734,18 +753,19 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, usdc, usdt, busd, ourToken string
+	var btc, usdb, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
+		SELECT "BTC_locked"::text, "USDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &usdb, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	locked["BTC"] = btc
+	locked["USDB"] = usdb
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
 	locked["BUSD"] = busd
@@ -755,7 +775,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 
 // PendingWithdrawalHoldsFor returns pending/processing withdrawal holds per asset for userID.
 func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID string) (map[string]string, error) {
-	holds := map[string]string{"BTC": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
+	holds := map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
 	rows, err := r.pool.Query(ctx, `
 		SELECT token, COALESCE(SUM(amount), 0)::text
 		FROM ledger_entries

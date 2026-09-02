@@ -60,7 +60,8 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 	tokenRows, err := r.pool.Query(ctx, `
 		SELECT token, amount::text, locked::text
 		FROM (
-			SELECT 'USDC' AS token, COALESCE(SUM("USDC"), 0) AS amount, COALESCE(SUM("USDC_locked"), 0) AS locked FROM user_balances
+			SELECT 'USDB' AS token, COALESCE(SUM("USDB"), 0) AS amount, COALESCE(SUM("USDB_locked"), 0) AS locked FROM user_balances
+			UNION ALL SELECT 'USDC', COALESCE(SUM("USDC"), 0), COALESCE(SUM("USDC_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'USDT', COALESCE(SUM("USDT"), 0), COALESCE(SUM("USDT_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BTC', COALESCE(SUM("BTC"), 0), COALESCE(SUM("BTC_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BUSD', COALESCE(SUM("BUSD"), 0), COALESCE(SUM("BUSD_locked"), 0) FROM user_balances

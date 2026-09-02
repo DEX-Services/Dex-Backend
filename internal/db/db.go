@@ -97,6 +97,10 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, err
 	}
+	if _, err := pool.Exec(ctx, migrateUSDTToUSDB); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return pool, nil
 }
 
@@ -215,6 +219,14 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD_locked" NUMERIC(38,0) N
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- USDB: the platform's internal stable quote currency, pegged 1:1 to USDT.
+-- It has no on-chain contract; every market's quote leg trades in USDB. The
+-- USDT/USDC columns above remain only as the deposit-intake ledger (a real
+-- on-chain deposit lands there first via the chain listener), not as a
+-- tradable balance any more.
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
 DO $wallet$
 BEGIN
@@ -357,4 +369,24 @@ BEGIN
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 	END IF;
 END $$;
+`
+
+// migrateUSDTToUSDB is the one-time conversion for the USDT→USDB currency
+// switch: every market's quote leg now trades in USDB (pegged 1:1 to USDT,
+// no on-chain contract of its own), so a balance sitting in the old
+// tradable USDT column must move to USDB or it becomes permanently
+// inaccessible to trading. Converts at 1:1 and zeroes the USDT columns.
+//
+// Idempotent by construction, not by a migration-log flag: it only touches
+// rows where USDT (or USDT_locked) is still nonzero, which is false after
+// the first successful run, so re-running on every boot is a no-op. Must
+// run after `schema` has created the USDB columns.
+const migrateUSDTToUSDB = `
+UPDATE user_balances SET
+	"USDB" = "USDB" + "USDT",
+	"USDB_locked" = "USDB_locked" + "USDT_locked",
+	"USDT" = 0,
+	"USDT_locked" = 0,
+	updated_at = now()
+WHERE "USDT" > 0 OR "USDT_locked" > 0;
 `
