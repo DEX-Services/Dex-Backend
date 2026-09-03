@@ -31,6 +31,12 @@ var assetColumns = map[string]string{
 	// USDB at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
 	// kept only as the deposit-intake ledger, not as tradable balances.
 	"USDB": `"USDB"`,
+	// ETH, SOL, and BNB back the ETH-USDB / SOL-USDB / BNB-USDB spot markets
+	// (matching-engine's currentMarkets) — base-asset balance columns, same
+	// shape as BTC.
+	"ETH": `"ETH"`,
+	"SOL": `"SOL"`,
+	"BNB": `"BNB"`,
 }
 
 var lockedColumns = map[string]string{
@@ -40,6 +46,9 @@ var lockedColumns = map[string]string{
 	"BUSD":      `"BUSD_locked"`,
 	"OUR_TOKEN": `"OUR_Token_locked"`,
 	"USDB":      `"USDB_locked"`,
+	"ETH":       `"ETH_locked"`,
+	"SOL":       `"SOL_locked"`,
+	"BNB":       `"BNB_locked"`,
 }
 
 func normalizeAsset(asset string) (string, string, error) {
@@ -728,20 +737,30 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 	return balance, nil
 }
 
+// zeroBalanceMap is the default all-assets-zero map, shared by BalancesFor,
+// LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
+// results always list the same complete asset set as assetColumns.
+func zeroBalanceMap() map[string]string {
+	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
+}
+
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, usdb, usdc, usdt, busd, ourToken string
+	var btc, eth, sol, bnb, usdb, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "USDB"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
+		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "USDB"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "OUR_Token"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &usdb, &usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &usdb, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return zeroBalanceMap(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	balances["BTC"] = btc
+	balances["ETH"] = eth
+	balances["SOL"] = sol
+	balances["BNB"] = bnb
 	balances["USDB"] = usdb
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
@@ -753,18 +772,21 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, usdb, usdc, usdt, busd, ourToken string
+	var btc, eth, sol, bnb, usdb, usdc, usdt, busd, ourToken string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "USDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
+		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "USDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "OUR_Token_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &usdb, &usdc, &usdt, &busd, &ourToken)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &usdb, &usdc, &usdt, &busd, &ourToken)
 	if err == pgx.ErrNoRows {
-		return map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}, nil
+		return zeroBalanceMap(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	locked["BTC"] = btc
+	locked["ETH"] = eth
+	locked["SOL"] = sol
+	locked["BNB"] = bnb
 	locked["USDB"] = usdb
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
@@ -775,7 +797,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 
 // PendingWithdrawalHoldsFor returns pending/processing withdrawal holds per asset for userID.
 func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID string) (map[string]string, error) {
-	holds := map[string]string{"BTC": "0", "USDB": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "OUR_Token": "0"}
+	holds := zeroBalanceMap()
 	rows, err := r.pool.Query(ctx, `
 		SELECT token, COALESCE(SUM(amount), 0)::text
 		FROM ledger_entries
@@ -858,9 +880,17 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		UNION ALL
 		SELECT user_id, 'BTC', "BTC"::text FROM user_balances WHERE "BTC" > 0
 		UNION ALL
+		SELECT user_id, 'ETH', "ETH"::text FROM user_balances WHERE "ETH" > 0
+		UNION ALL
+		SELECT user_id, 'SOL', "SOL"::text FROM user_balances WHERE "SOL" > 0
+		UNION ALL
+		SELECT user_id, 'BNB', "BNB"::text FROM user_balances WHERE "BNB" > 0
+		UNION ALL
 		SELECT user_id, 'USDT', "USDT"::text FROM user_balances WHERE "USDT" > 0
 		UNION ALL
 		SELECT user_id, 'BUSD', "BUSD"::text FROM user_balances WHERE "BUSD" > 0
+		UNION ALL
+		SELECT user_id, 'USDB', "USDB"::text FROM user_balances WHERE "USDB" > 0
 		UNION ALL
 		SELECT user_id, 'OUR_Token', "OUR_Token"::text FROM user_balances WHERE "OUR_Token" > 0`)
 	if err != nil {

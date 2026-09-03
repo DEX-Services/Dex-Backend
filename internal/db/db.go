@@ -228,6 +228,18 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NU
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
+-- ETH, SOL, and BNB: base assets for the ETH-USDB / SOL-USDB / BNB-USDB spot
+-- markets (matching-engine's currentMarkets). These were registered as
+-- tradable markets before a real balance column backed them, so nobody could
+-- ever actually hold or fund the base leg (deposits/MM desk funding failed
+-- with "unsupported asset"). Added following the exact same pattern as BTC.
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "ETH" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "ETH_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "SOL" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "SOL_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+
 DO $wallet$
 BEGIN
 	IF EXISTS (
