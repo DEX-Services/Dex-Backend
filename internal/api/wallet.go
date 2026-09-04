@@ -167,28 +167,45 @@ type swapRequestBody struct {
 	DestinationAsset string `json:"destinationAsset"`
 }
 
-// swapTestPairs is the allowlist of asset pairs the test-only 1:1 swap
-// accepts, in either direction. USDC/USDT/USDB are all raw integer token
-// balances at the same 6-decimal scale (see assetColumns in repo/ledger.go)
-// so a 1:1 swap needs no decimal conversion between any of them. USDB pairs
-// let a user move deposit-intake USDC/USDT they already hold into the
-// tradable USDB balance manually — real on-chain deposits already convert
-// to USDB automatically (see chain.Listener), this just covers the case of
-// a balance credited before that, or credited directly as USDC/USDT.
-var swapTestPairs = map[[2]string]bool{
-	{"USDC", "USDT"}: true,
-	{"USDT", "USDC"}: true,
-	{"USDC", "USDB"}: true,
-	{"USDB", "USDC"}: true,
-	{"USDT", "USDB"}: true,
-	{"USDB", "USDT"}: true,
+// swapFeeBpsOut is the one-way fee charged when swapping OUT of the platform's
+// internal stable (USDB → USDT/USDC), in basis points of the source amount.
+// Swapping INTO USDB (USDT→USDB, USDC→USDB) is free — it moves deposit-intake
+// funds into the tradable quote currency. The 1% conversion charge on the way
+// back out is deducted from the credited destination amount.
+const swapFeeBpsOut = 100 // 1%
+
+// swapDestinations maps each allowed source asset to the destinations it may
+// be swapped into. The exchange is deliberately one-directional per asset:
+// USDT/USDC convert only into USDB, and USDB converts only back into
+// USDT/USDC. A direct USDT↔USDC conversion is not offered (route through
+// USDB instead), and no other assets participate in swaps.
+var swapDestinations = map[string]map[string]bool{
+	"USDT": {"USDB": true},
+	"USDC": {"USDB": true},
+	"USDB": {"USDT": true, "USDC": true},
+}
+
+// swapFeeRate returns the fee in basis points charged when converting source
+// into destination, and whether any fee applies at all. Into USDB is free;
+// out of USDB carries the conversion charge.
+func swapFeeRate(destination string) (feeBps int64, charged bool) {
+	if destination == "USDB" {
+		return 0, false
+	}
+	return swapFeeBpsOut, true
 }
 
 // Swap: POST /wallet/swap {amount, sourceAsset, destinationAsset}
-// Test-only fixed 1:1 conversion between USDC/USDT/USDB ledger balances, for
-// exercising swap UI/flows without real market pricing. Deliberately
-// restricted to swapTestPairs; NOT a general-purpose swap endpoint and
-// should not be reused for real market-priced conversions.
+// Converts deposit-intake stables and the platform's internal stable:
+//   - USDT → USDB and USDC → USDB: 1:1, no fee.
+//   - USDB → USDT and USDB → USDC: 1:1 with a 1% conversion charge,
+//     deducted from the credited destination amount.
+//
+// All three assets are raw integer token balances at the same 6-decimal
+// scale (see assetColumns in repo/ledger.go), so the 1:1 base rate needs no
+// decimal conversion. Deliberately restricted to swapDestinations; NOT a
+// general-purpose swap endpoint and should not be reused for real
+// market-priced conversions.
 func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(r)
 	if !ok {
@@ -208,8 +225,8 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "source and destination asset must differ")
 		return
 	}
-	if !swapTestPairs[[2]string{source, destination}] {
-		writeError(w, http.StatusBadRequest, "swap is only available between USDC, USDT, and USDB (test only)")
+	if !swapDestinations[source][destination] {
+		writeError(w, http.StatusBadRequest, "swap is only available from USDT or USDC into USDB (no fee), or from USDB into USDT or USDC (1% fee)")
 		return
 	}
 
@@ -219,17 +236,42 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fixed 1:1 rate: destination amount equals source amount, raw unit for raw unit.
-	if err := s.Ledger.SwapBalance(r.Context(), claims.UserID, source, amount.String(), destination, amount.String()); err != nil {
+	// 1:1 base rate; the fee is computed in raw units on the source amount
+	// and deducted from what is credited. Integer arithmetic (no floats) so
+	// raw token amounts stay exact.
+	credited := new(big.Int).Set(amount)
+	feeBps, feeCharged := swapFeeRate(destination)
+	var feeAmount *big.Int
+	if feeCharged {
+		feeAmount = new(big.Int).Mul(amount, big.NewInt(feeBps))
+		feeAmount.Div(feeAmount, big.NewInt(10000))
+		if feeAmount.Sign() < 0 {
+			feeAmount.SetInt64(0)
+		}
+		credited.Sub(credited, feeAmount)
+	}
+	if credited.Sign() <= 0 {
+		writeError(w, http.StatusBadRequest, "amount too small: fee exceeds the swapped amount")
+		return
+	}
+
+	// Debit the full source amount (fee included) from the source balance and
+	// credit only the net amount to the destination balance.
+	if err := s.Ledger.SwapBalance(r.Context(), claims.UserID, source, amount.String(), destination, credited.String()); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
+	resp := map[string]string{
 		"status":           "swapped",
 		"sourceAsset":      source,
 		"destinationAsset": destination,
 		"amount":           amount.String(),
-	})
+		"creditedAmount":   credited.String(),
+	}
+	if feeAmount != nil {
+		resp["feeAmount"] = feeAmount.String()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type adminApproveBody struct {
