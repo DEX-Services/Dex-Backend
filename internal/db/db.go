@@ -3,6 +3,9 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -69,6 +72,11 @@ ON CONFLICT (login_id) DO NOTHING;
 
 // New connects to Postgres and ensures the auth schema exists.
 func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
+	// Startup DDL can wait behind transactions from another running instance.
+	// Cancel that wait before the launcher times out and kills this process.
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	slog.Info("initializing postgres", "timeout", "60s")
 	// Explicitly cap pool size: three services share one Aiven Postgres
 	// instance with a hard 100-connection limit. Without an explicit
 	// MaxConns, pgxpool defaults to max(4, NumCPU()) per process, which is
@@ -86,36 +94,41 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, err
+		return nil, fmt.Errorf("postgres connection: %w", err)
 	}
-	if _, err := pool.Exec(ctx, migrateLegacyIDColumn); err != nil {
-		pool.Close()
-		return nil, err
+	for _, migration := range []struct{ name, sql string }{
+		{"legacy user IDs", migrateLegacyIDColumn},
+		{"base schema", schema},
+		{"user ID defaults", ensureIDDefault},
+		{"wallet balances", ensureUserBalancesTable},
+		{"P2P tables", ensureP2PTables},
+		{"USDT to USDB", migrateUSDTToUSDB},
+	} {
+		slog.Info("running database migration", "migration", migration.name)
+		if _, err := pool.Exec(ctx, migration.sql); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("database migration %q failed (check for blocking transactions if timed out): %w", migration.name, err)
+		}
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	if _, err := pool.Exec(ctx, ensureIDDefault); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	if _, err := pool.Exec(ctx, ensureUserBalancesTable); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	if _, err := pool.Exec(ctx, ensureP2PTables); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	if _, err := pool.Exec(ctx, migrateUSDTToUSDB); err != nil {
-		pool.Close()
-		return nil, err
-	}
+	slog.Info("postgres initialization complete")
 	return pool, nil
 }
 
 const ensureP2PTables = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS p2p_username TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_p2p_username_unique ON users (lower(p2p_username)) WHERE p2p_username IS NOT NULL;
+CREATE OR REPLACE FUNCTION prevent_p2p_username_change() RETURNS trigger AS $$
+BEGIN
+	IF OLD.p2p_username IS NOT NULL AND NEW.p2p_username IS DISTINCT FROM OLD.p2p_username THEN
+		RAISE EXCEPTION 'P2P username cannot be changed';
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_users_p2p_username_immutable ON users;
+CREATE TRIGGER trg_users_p2p_username_immutable BEFORE UPDATE OF p2p_username ON users
+	FOR EACH ROW EXECUTE FUNCTION prevent_p2p_username_change();
+
 CREATE TABLE IF NOT EXISTS p2p_price_history (
 	id BIGSERIAL PRIMARY KEY,
 	asset TEXT NOT NULL,
@@ -139,6 +152,19 @@ CREATE TABLE IF NOT EXISTS p2p_listings (
 	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
 	funding_source TEXT NOT NULL DEFAULT 'P2P_WALLET' CHECK (funding_source IN ('P2P_WALLET', 'MAIN_WALLET_LEGACY')),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT 'SELL';
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_side_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_side_check CHECK (side IN ('BUY','SELL'));
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS payment_methods TEXT[];
+UPDATE p2p_listings SET payment_methods=ARRAY[payment_method] WHERE payment_methods IS NULL OR cardinality(payment_methods)=0;
+ALTER TABLE p2p_listings ALTER COLUMN payment_methods SET NOT NULL;
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_payment_method_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS'));
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_payment_methods_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_payment_methods_check CHECK (
+	cardinality(payment_methods) > 0
+	AND payment_methods <@ ARRAY['UPI','Bank Transfer','MPESN','NEFT','IMPS']::TEXT[]
 );
 CREATE INDEX IF NOT EXISTS idx_p2p_listings_active ON p2p_listings (created_at DESC) WHERE status = 'ACTIVE';
 CREATE INDEX IF NOT EXISTS idx_p2p_listings_seller ON p2p_listings (seller_id, created_at DESC);
@@ -176,6 +202,22 @@ ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes');
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS taker_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
+UPDATE p2p_orders o SET taker_id=CASE WHEN l.side='BUY' THEN o.seller_id ELSE o.buyer_id END
+	FROM p2p_listings l WHERE o.listing_id=l.id AND o.taker_id IS NULL;
+-- A short-lived P2P implementation used initiator_id for the same actor now
+-- represented by taker_id. Preserve its values, then remove the stale NOT
+-- NULL column so current order inserts are not rejected.
+DO $legacy_initiator$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema=current_schema() AND table_name='p2p_orders' AND column_name='initiator_id'
+	) THEN
+		EXECUTE 'UPDATE p2p_orders SET taker_id=COALESCE(taker_id,initiator_id::text) WHERE taker_id IS NULL';
+		EXECUTE 'ALTER TABLE p2p_orders DROP COLUMN initiator_id';
+	END IF;
+END $legacy_initiator$;
 
 -- Listings created before the dedicated P2P wallet existed still reserve
 -- user_balances.USDC_locked. Keep that funding source explicit so they can
@@ -213,7 +255,7 @@ ALTER TABLE p2p_orders ALTER COLUMN seller_receivable SET NOT NULL;
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','USDB'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
 UPDATE p2p_orders SET status='completed',completed_at=COALESCE(completed_at,created_at),escrow_raw=0
 	WHERE status='COMPLETED';
@@ -223,6 +265,9 @@ ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_escrow_raw_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_escrow_raw_check CHECK (escrow_raw >= 0);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_orders_idempotency
 	ON p2p_orders (buyer_id,idempotency_key) WHERE idempotency_key IS NOT NULL;
+DROP INDEX IF EXISTS idx_p2p_orders_idempotency;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_orders_taker_idempotency
+	ON p2p_orders (taker_id,idempotency_key) WHERE taker_id IS NOT NULL AND idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_p2p_orders_expiry
 	ON p2p_orders (expires_at) WHERE status='pending_payment';
 

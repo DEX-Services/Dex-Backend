@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -24,7 +25,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	sellerID := newTestUser(t, pool)
 	buyerID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, sellerID, "USDC", "20000000"); err != nil {
+	if err := ledger.CreditBalance(ctx, sellerID, "USDB", "20000000"); err != nil {
 		t.Fatalf("credit seller main wallet: %v", err)
 	}
 	balance, moved, err := p2p.FundWallet(ctx, sellerID, "20000000", "fund-test-0001")
@@ -32,7 +33,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 		t.Fatalf("fund P2P wallet: moved=%v err=%v", moved, err)
 	}
 	assertWallet(t, balance, "20000000", "0", "20000000")
-	mainBalance, err := ledger.BalanceFor(ctx, sellerID, "USDC")
+	mainBalance, err := ledger.BalanceFor(ctx, sellerID, "USDB")
 	if err != nil || mainBalance != "0" {
 		t.Fatalf("seller main balance = %q err=%v, want 0", mainBalance, err)
 	}
@@ -43,6 +44,9 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 		t.Fatalf("idempotent fund retry: moved=%v err=%v", moved, err)
 	}
 
+	if _, err = p2p.EstablishP2PUsername(ctx, sellerID, "seller_success"); err != nil {
+		t.Fatalf("establish seller username: %v", err)
+	}
 	listing, err := p2p.CreateListing(ctx, sellerID, "20000000", "UPI")
 	if err != nil {
 		t.Fatalf("create listing: %v", err)
@@ -136,10 +140,18 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 func TestP2PWalletUSDBEscrowSuccess(t *testing.T) {
 	pool := p2pTestPool(t)
 	ctx := context.Background()
-	// Reproduce the constraint left by an older USDC-only database, then run
-	// startup migrations again. Existing installations must be upgraded too.
-	if _, err := pool.Exec(ctx, `ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check; ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset = 'USDC')`); err != nil {
-		t.Fatalf("install legacy USDC order constraint: %v", err)
+	// Reproduce constraints left by older database versions, then run startup
+	// migrations again. Existing installations must be upgraded too.
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
+		ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset = 'USDC');
+		ALTER TABLE p2p_orders ADD COLUMN initiator_id TEXT NOT NULL;
+		ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_payment_methods_check;
+		ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_payment_methods_check CHECK (
+			payment_methods <@ ARRAY['UPI','Bank Transfer','NEFT','IMPS']::TEXT[]
+		);
+	`); err != nil {
+		t.Fatalf("install legacy P2P constraints: %v", err)
 	}
 	migratedPool, err := db.New(ctx, pool.Config().ConnString())
 	if err != nil {
@@ -160,7 +172,10 @@ func TestP2PWalletUSDBEscrowSuccess(t *testing.T) {
 	}
 	assertWallet(t, balance, "10000000", "0", "10000000")
 
-	listing, err := p2p.CreateListingForAsset(ctx, sellerID, "USDB", "10000000", "UPI")
+	if _, err = p2p.EstablishP2PUsername(ctx, sellerID, "seller_usdb"); err != nil {
+		t.Fatalf("establish seller username: %v", err)
+	}
+	listing, err := p2p.CreateListingWithDetails(ctx, sellerID, "SELL", "USDB", "10000000", []string{"UPI", "Bank Transfer", "MPESN", "NEFT", "IMPS"}, "")
 	if err != nil {
 		t.Fatalf("create USDB listing: %v", err)
 	}
@@ -191,11 +206,74 @@ func TestP2PWalletUSDBEscrowSuccess(t *testing.T) {
 		t.Fatalf("load buyer USDB wallet: %v", err)
 	}
 	assertWallet(t, buyerUSDB, "10000000", "0", "10000000")
-	buyerUSDC, err := p2p.WalletBalanceForAsset(ctx, buyerID, "USDC")
-	if err != nil {
-		t.Fatalf("load buyer USDC wallet: %v", err)
+}
+
+func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
+	pool := p2pTestPool(t)
+	ctx := context.Background()
+	p2p := NewP2PRepo(pool)
+	ledger := NewLedgerRepo(pool)
+	creatorBuyerID := newTestUser(t, pool)
+	takerSellerID := newTestUser(t, pool)
+
+	if err := ledger.CreditBalance(ctx, takerSellerID, "USDB", "5000000"); err != nil {
+		t.Fatalf("credit taker seller: %v", err)
 	}
-	assertWallet(t, buyerUSDC, "0", "0", "0")
+	if _, moved, err := p2p.FundWalletAsset(ctx, takerSellerID, "USDB", "5000000", "fund-buy-ad-seller"); err != nil || !moved {
+		t.Fatalf("fund taker P2P wallet: moved=%v err=%v", moved, err)
+	}
+	if _, err := p2p.EstablishP2PUsername(ctx, creatorBuyerID, "buyer_ad_creator"); err != nil {
+		t.Fatalf("establish creator username: %v", err)
+	}
+	if _, err := p2p.EstablishP2PUsername(ctx, creatorBuyerID, "different_name"); err == nil {
+		t.Fatal("expected established P2P username to be immutable")
+	}
+
+	listing, err := p2p.CreateListingWithDetails(ctx, creatorBuyerID, "BUY", "USDB", "5000000", []string{"UPI", "Bank Transfer"}, "")
+	if err != nil {
+		t.Fatalf("create buy ad: %v", err)
+	}
+	if _, err = p2p.CreateOrderWithPayment(ctx, creatorBuyerID, listing.ID, "1000000", "UPI", "self-trade"); !errors.Is(err, ErrP2PSelfPurchase) {
+		t.Fatalf("self trade error = %v, want %v", err, ErrP2PSelfPurchase)
+	}
+
+	cancelledOrder, err := p2p.CreateOrderWithPayment(ctx, takerSellerID, listing.ID, "2000000", "UPI", "take-buy-ad-cancel")
+	if err != nil {
+		t.Fatalf("take refundable buy ad: %v", err)
+	}
+	if _, err = p2p.CancelOrder(ctx, creatorBuyerID, cancelledOrder.ID); err != nil {
+		t.Fatalf("cancel buy-ad order: %v", err)
+	}
+	refundedBalance, err := p2p.WalletBalance(ctx, takerSellerID)
+	if err != nil {
+		t.Fatalf("load refunded taker balance: %v", err)
+	}
+	assertWallet(t, refundedBalance, "5000000", "0", "5000000")
+
+	order, err := p2p.CreateOrderWithPayment(ctx, takerSellerID, listing.ID, "5000000", "Bank Transfer", "take-buy-ad")
+	if err != nil {
+		t.Fatalf("take buy ad: %v", err)
+	}
+	if order.SellerID != takerSellerID || order.BuyerID != creatorBuyerID || order.PaymentMethod != "Bank Transfer" {
+		t.Fatalf("buy-ad roles/method = seller %s buyer %s method %s", order.SellerID, order.BuyerID, order.PaymentMethod)
+	}
+	takerBalance, err := p2p.WalletBalance(ctx, takerSellerID)
+	if err != nil {
+		t.Fatalf("load taker balance: %v", err)
+	}
+	assertWallet(t, takerBalance, "0", "0", "0")
+
+	if _, err = p2p.MarkPaid(ctx, creatorBuyerID, order.ID); err != nil {
+		t.Fatalf("creator buyer marks paid: %v", err)
+	}
+	if _, err = p2p.ReleaseOrder(ctx, takerSellerID, order.ID); err != nil {
+		t.Fatalf("taker seller releases: %v", err)
+	}
+	creatorBalance, err := p2p.WalletBalance(ctx, creatorBuyerID)
+	if err != nil {
+		t.Fatalf("load creator buyer balance: %v", err)
+	}
+	assertWallet(t, creatorBalance, "5000000", "0", "5000000")
 }
 
 func assertWallet(t *testing.T, got *models.P2PWalletBalance, available, reserved, total string) {

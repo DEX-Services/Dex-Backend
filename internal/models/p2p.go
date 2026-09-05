@@ -10,18 +10,23 @@ type P2PPrice struct {
 	CreatedAt    time.Time `json:"createdAt"`
 }
 type P2PListing struct {
-	ID            string    `json:"id"`
-	SellerID      string    `json:"sellerId"`
-	SellerAddress string    `json:"sellerAddress"`
-	Asset         string    `json:"asset"`
-	AmountRaw     string    `json:"amountRaw"`
-	RemainingRaw  string    `json:"remainingRaw"`
-	Price         string    `json:"price"`
-	FiatCurrency  string    `json:"fiatCurrency"`
-	PaymentMethod string    `json:"paymentMethod"`
-	Status        string    `json:"status"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	ID             string    `json:"id"`
+	CreatorID      string    `json:"creatorId"`
+	Username       string    `json:"username"`
+	Side           string    `json:"side"`
+	Asset          string    `json:"asset"`
+	AmountRaw      string    `json:"amountRaw"`
+	RemainingRaw   string    `json:"remainingRaw"`
+	Price          string    `json:"price"`
+	FiatCurrency   string    `json:"fiatCurrency"`
+	PaymentMethods []string  `json:"paymentMethods"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+type P2PProfile struct {
+	Username string `json:"username"`
 }
 type P2POrder struct {
 	ID                 string     `json:"id"`

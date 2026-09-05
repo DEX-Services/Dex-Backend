@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ const (
 var (
 	ErrP2PNotFound       = errors.New("p2p listing not found")
 	ErrP2POrderNotFound  = errors.New("p2p order not found")
-	ErrP2PSelfPurchase   = errors.New("seller cannot buy their own listing")
+	ErrP2PSelfPurchase   = errors.New("you cannot trade against your own ad")
 	ErrP2PUnavailable    = errors.New("requested amount is no longer available")
 	ErrP2PInvalidState   = errors.New("order is not in the required state")
 	ErrP2PForbidden      = errors.New("not authorized for this p2p order")
@@ -33,7 +34,8 @@ var (
 	ErrP2PIdempotencyKey = errors.New("idempotency key was already used for another request")
 )
 
-var validP2PPaymentMethods = map[string]bool{"UPI": true, "Bank Transfer": true, "NEFT": true, "IMPS": true}
+var validP2PPaymentMethods = map[string]bool{"UPI": true, "Bank Transfer": true, "MPESN": true, "NEFT": true, "IMPS": true}
+var p2pUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{3,24}$`)
 
 type P2PRepo struct {
 	pool   *pgxpool.Pool
@@ -45,13 +47,13 @@ func NewP2PRepo(pool *pgxpool.Pool) *P2PRepo {
 }
 
 func (r *P2PRepo) TodayPrice(ctx context.Context) (*models.P2PPrice, error) {
-	return r.PriceFor(ctx, "USDC")
+	return r.PriceFor(ctx, "USDB")
 }
 
 func normalizeP2PAsset(asset string) (string, error) {
 	asset = strings.ToUpper(strings.TrimSpace(asset))
-	if asset != "USDC" && asset != "USDB" {
-		return "", fmt.Errorf("P2P asset must be USDC or USDB")
+	if asset != "USDB" {
+		return "", fmt.Errorf("P2P asset must be USDB")
 	}
 	return asset, nil
 }
@@ -73,6 +75,9 @@ func validateP2PAmount(raw string) error {
 	n, ok := new(big.Int).SetString(raw, 10)
 	if !ok || n.Sign() <= 0 {
 		return fmt.Errorf("amount must be a positive raw asset integer")
+	}
+	if new(big.Int).Mod(n, big.NewInt(10_000)).Sign() != 0 {
+		return fmt.Errorf("USDB amounts support exactly two displayed decimal places")
 	}
 	return nil
 }
@@ -116,7 +121,7 @@ func (r *P2PRepo) walletTx(ctx context.Context, tx pgx.Tx, userID, asset string)
 }
 
 func (r *P2PRepo) WalletBalance(ctx context.Context, userID string) (*models.P2PWalletBalance, error) {
-	return r.WalletBalanceForAsset(ctx, userID, "USDC")
+	return r.WalletBalanceForAsset(ctx, userID, "USDB")
 }
 
 func (r *P2PRepo) WalletBalanceForAsset(ctx context.Context, userID, asset string) (*models.P2PWalletBalance, error) {
@@ -132,8 +137,8 @@ func (r *P2PRepo) WalletBalanceForAsset(ctx context.Context, userID, asset strin
 }
 
 func (r *P2PRepo) WalletBalances(ctx context.Context, userID string) ([]models.P2PWalletBalance, error) {
-	out := make([]models.P2PWalletBalance, 0, 2)
-	for _, asset := range []string{"USDC", "USDB"} {
+	out := make([]models.P2PWalletBalance, 0, 1)
+	for _, asset := range []string{"USDB"} {
 		balance, err := r.WalletBalanceForAsset(ctx, userID, asset)
 		if err != nil {
 			return nil, err
@@ -143,10 +148,10 @@ func (r *P2PRepo) WalletBalances(ctx context.Context, userID string) ([]models.P
 	return out, nil
 }
 
-// FundWallet moves available main-wallet USDC into the P2P wallet atomically.
+// FundWallet moves available main-wallet USDB into the P2P wallet atomically.
 // moved=false means an identical idempotent request was already applied.
 func (r *P2PRepo) FundWallet(ctx context.Context, userID, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
-	return r.FundWalletAsset(ctx, userID, "USDC", amountRaw, idempotencyKey)
+	return r.FundWalletAsset(ctx, userID, "USDB", amountRaw, idempotencyKey)
 }
 
 func (r *P2PRepo) FundWalletAsset(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
@@ -222,11 +227,72 @@ func (r *P2PRepo) FundWalletAsset(ctx context.Context, userID, asset, amountRaw,
 	return b, true, nil
 }
 
-func (r *P2PRepo) CreateListing(ctx context.Context, sellerID, amountRaw, method string) (*models.P2PListing, error) {
-	return r.CreateListingForAsset(ctx, sellerID, "USDC", amountRaw, method)
+func normalizeP2PSide(side string) (string, error) {
+	side = strings.ToUpper(strings.TrimSpace(side))
+	if side != "BUY" && side != "SELL" {
+		return "", fmt.Errorf("ad side must be BUY or SELL")
+	}
+	return side, nil
 }
 
-func (r *P2PRepo) CreateListingForAsset(ctx context.Context, sellerID, asset, amountRaw, method string) (*models.P2PListing, error) {
+func normalizePaymentMethods(methods []string) ([]string, error) {
+	seen := make(map[string]bool, len(methods))
+	out := make([]string, 0, len(methods))
+	for _, method := range methods {
+		method = strings.TrimSpace(method)
+		if !validP2PPaymentMethods[method] {
+			return nil, fmt.Errorf("unsupported payment method %q", method)
+		}
+		if !seen[method] {
+			seen[method] = true
+			out = append(out, method)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("select at least one payment method")
+	}
+	return out, nil
+}
+
+func (r *P2PRepo) P2PProfile(ctx context.Context, userID string) (*models.P2PProfile, error) {
+	var username *string
+	if err := r.pool.QueryRow(ctx, `SELECT p2p_username FROM users WHERE id=$1`, userID).Scan(&username); err != nil {
+		return nil, err
+	}
+	profile := &models.P2PProfile{}
+	if username != nil {
+		profile.Username = *username
+	}
+	return profile, nil
+}
+
+func (r *P2PRepo) EstablishP2PUsername(ctx context.Context, userID, username string) (*models.P2PProfile, error) {
+	username = strings.TrimSpace(username)
+	if !p2pUsernamePattern.MatchString(username) {
+		return nil, fmt.Errorf("username must be 3-24 letters, numbers, or underscores")
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE users SET p2p_username=$2 WHERE id=$1 AND (p2p_username IS NULL OR p2p_username=$2)`, userID, username)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return nil, fmt.Errorf("that P2P username is already taken")
+		}
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("P2P username is permanent and cannot be changed")
+	}
+	return &models.P2PProfile{Username: username}, nil
+}
+
+func (r *P2PRepo) CreateListing(ctx context.Context, creatorID, amountRaw, method string) (*models.P2PListing, error) {
+	return r.CreateListingWithDetails(ctx, creatorID, "SELL", "USDB", amountRaw, []string{method}, "")
+}
+
+func (r *P2PRepo) CreateListingForAsset(ctx context.Context, creatorID, asset, amountRaw, method string) (*models.P2PListing, error) {
+	return r.CreateListingWithDetails(ctx, creatorID, "SELL", asset, amountRaw, []string{method}, "")
+}
+
+func (r *P2PRepo) CreateListingWithDetails(ctx context.Context, creatorID, side, asset, amountRaw string, methods []string, username string) (*models.P2PListing, error) {
 	asset, err := normalizeP2PAsset(asset)
 	if err != nil {
 		return nil, err
@@ -234,35 +300,61 @@ func (r *P2PRepo) CreateListingForAsset(ctx context.Context, sellerID, asset, am
 	if err := validateP2PAmount(amountRaw); err != nil {
 		return nil, err
 	}
-	if !validP2PPaymentMethods[method] {
-		return nil, fmt.Errorf("unsupported payment method")
+	side, err = normalizeP2PSide(side)
+	if err != nil {
+		return nil, err
+	}
+	methods, err = normalizePaymentMethods(methods)
+	if err != nil {
+		return nil, err
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var established *string
+	if err = tx.QueryRow(ctx, `SELECT p2p_username FROM users WHERE id=$1 FOR UPDATE`, creatorID).Scan(&established); err != nil {
+		return nil, err
+	}
+	if established == nil {
+		username = strings.TrimSpace(username)
+		if !p2pUsernamePattern.MatchString(username) {
+			return nil, fmt.Errorf("establish a P2P username before posting an ad")
+		}
+		if _, err = tx.Exec(ctx, `UPDATE users SET p2p_username=$2 WHERE id=$1`, creatorID, username); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				return nil, fmt.Errorf("that P2P username is already taken")
+			}
+			return nil, err
+		}
+		established = &username
+	}
 	price, err := r.todayPriceTx(ctx, tx, asset)
 	if err != nil {
 		return nil, err
 	}
-	if err = r.lockWallet(ctx, tx, sellerID, asset); err != nil {
-		return nil, err
-	}
-	tag, err := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET available_raw=available_raw-$3::numeric,reserved_raw=reserved_raw+$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2 AND available_raw >= $3::numeric`, sellerID, asset, amountRaw)
-	if err != nil {
-		return nil, err
-	}
-	if tag.RowsAffected() != 1 {
-		return nil, fmt.Errorf("insufficient available %s in P2P wallet", asset)
+	if side == "SELL" {
+		if err = r.lockWallet(ctx, tx, creatorID, asset); err != nil {
+			return nil, err
+		}
+		tag, updateErr := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET available_raw=available_raw-$3::numeric,reserved_raw=reserved_raw+$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2 AND available_raw >= $3::numeric`, creatorID, asset, amountRaw)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, fmt.Errorf("insufficient available %s in P2P wallet", asset)
+		}
 	}
 	var l models.P2PListing
-	err = tx.QueryRow(ctx, `INSERT INTO p2p_listings(seller_id,asset,amount_raw,remaining_raw,price,fiat_currency,payment_method,funding_source) VALUES($1,$2,$3,$3,$4,'INR',$5,$6) RETURNING id,seller_id,'',asset,amount_raw::text,remaining_raw::text,price::text,fiat_currency,payment_method,status,created_at,updated_at`, sellerID, asset, amountRaw, price, method, p2pFundingWallet).Scan(&l.ID, &l.SellerID, &l.SellerAddress, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.PaymentMethod, &l.Status, &l.CreatedAt, &l.UpdatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO p2p_listings(seller_id,side,asset,amount_raw,remaining_raw,price,fiat_currency,payment_method,payment_methods,funding_source) VALUES($1,$2,$3,$4,$4,$5,'INR',$6,$7,$8) RETURNING id,seller_id,$9,side,asset,amount_raw::text,remaining_raw::text,price::text,fiat_currency,payment_methods,status,created_at,updated_at`, creatorID, side, asset, amountRaw, price, methods[0], methods, p2pFundingWallet, *established).Scan(&l.ID, &l.CreatorID, &l.Username, &l.Side, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.PaymentMethods, &l.Status, &l.CreatedAt, &l.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,listing_id,kind,asset,amount_raw) VALUES($1,$2,'listing_reserve',$3,$4)`, sellerID, l.ID, asset, amountRaw); err != nil {
-		return nil, err
+	if side == "SELL" {
+		if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,listing_id,kind,asset,amount_raw) VALUES($1,$2,'listing_reserve',$3,$4)`, creatorID, l.ID, asset, amountRaw); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
@@ -270,11 +362,11 @@ func (r *P2PRepo) CreateListingForAsset(ctx context.Context, sellerID, asset, am
 	return &l, nil
 }
 
-const listingSelect = `SELECT l.id,l.seller_id,u.wallet_address,l.asset,l.amount_raw::text,l.remaining_raw::text,l.price::text,l.fiat_currency,l.payment_method,l.status,l.created_at,l.updated_at FROM p2p_listings l JOIN users u ON u.id=l.seller_id`
+const listingSelect = `SELECT l.id,l.seller_id,COALESCE(u.p2p_username,''),l.side,l.asset,l.amount_raw::text,l.remaining_raw::text,l.price::text,l.fiat_currency,l.payment_methods,l.status,l.created_at,l.updated_at FROM p2p_listings l JOIN users u ON u.id=l.seller_id`
 
 func scanListing(row pgx.Row) (*models.P2PListing, error) {
 	var l models.P2PListing
-	err := row.Scan(&l.ID, &l.SellerID, &l.SellerAddress, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.PaymentMethod, &l.Status, &l.CreatedAt, &l.UpdatedAt)
+	err := row.Scan(&l.ID, &l.CreatorID, &l.Username, &l.Side, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.PaymentMethods, &l.Status, &l.CreatedAt, &l.UpdatedAt)
 	return &l, err
 }
 
@@ -285,7 +377,7 @@ func (r *P2PRepo) Listings(ctx context.Context, sellerID string, activeOnly bool
 		query += fmt.Sprintf(" AND l.seller_id=$%d", len(args))
 	}
 	if activeOnly {
-		query += ` AND l.status='ACTIVE' AND l.remaining_raw>0`
+		query += ` AND l.status='ACTIVE' AND l.remaining_raw>0 AND u.p2p_username IS NOT NULL`
 	}
 	rows, err := r.pool.Query(ctx, query+` ORDER BY l.created_at DESC`, args...)
 	if err != nil {
@@ -311,7 +403,11 @@ func scanOrder(row pgx.Row) (*models.P2POrder, error) {
 	return &o, err
 }
 
-func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw, idempotencyKey string) (*models.P2POrder, error) {
+func (r *P2PRepo) CreateOrder(ctx context.Context, takerID, listingID, amountRaw, idempotencyKey string) (*models.P2POrder, error) {
+	return r.CreateOrderWithPayment(ctx, takerID, listingID, amountRaw, "", idempotencyKey)
+}
+
+func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID, amountRaw, selectedMethod, idempotencyKey string) (*models.P2POrder, error) {
 	if err := validateP2PAmount(amountRaw); err != nil {
 		return nil, err
 	}
@@ -324,11 +420,11 @@ func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err = r.ledger.lockUser(ctx, tx, buyerID); err != nil {
+	if err = r.ledger.lockUser(ctx, tx, takerID); err != nil {
 		return nil, err
 	}
 	if key != "" {
-		existing, e := scanOrder(tx.QueryRow(ctx, orderSelect+` WHERE buyer_id=$1 AND idempotency_key=$2`, buyerID, key))
+		existing, e := scanOrder(tx.QueryRow(ctx, orderSelect+` WHERE taker_id=$1 AND idempotency_key=$2`, takerID, key))
 		if e == nil {
 			if existing.ListingID != listingID || existing.AmountRaw != amountRaw {
 				return nil, ErrP2PIdempotencyKey
@@ -343,16 +439,30 @@ func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw
 		}
 	}
 
-	var sellerID, asset, remaining, price, fiat, method, status, source string
-	err = tx.QueryRow(ctx, `SELECT seller_id,asset,remaining_raw::text,price::text,fiat_currency,payment_method,status,funding_source FROM p2p_listings WHERE id=$1 FOR UPDATE`, listingID).Scan(&sellerID, &asset, &remaining, &price, &fiat, &method, &status, &source)
+	var creatorID, side, asset, remaining, price, fiat, status, source string
+	var methods []string
+	err = tx.QueryRow(ctx, `SELECT seller_id,side,asset,remaining_raw::text,price::text,fiat_currency,payment_methods,status,funding_source FROM p2p_listings WHERE id=$1 FOR UPDATE`, listingID).Scan(&creatorID, &side, &asset, &remaining, &price, &fiat, &methods, &status, &source)
 	if err == pgx.ErrNoRows {
 		return nil, ErrP2PNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if buyerID == sellerID {
+	if takerID == creatorID {
 		return nil, ErrP2PSelfPurchase
+	}
+	if selectedMethod == "" && len(methods) > 0 {
+		selectedMethod = methods[0]
+	}
+	allowedMethod := false
+	for _, method := range methods {
+		if method == selectedMethod {
+			allowedMethod = true
+			break
+		}
+	}
+	if !allowedMethod {
+		return nil, fmt.Errorf("select one of the ad's payment methods")
 	}
 	have, _ := new(big.Int).SetString(remaining, 10)
 	want, _ := new(big.Int).SetString(amountRaw, 10)
@@ -360,8 +470,23 @@ func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw
 		return nil, ErrP2PUnavailable
 	}
 
+	sellerID, buyerID := creatorID, takerID
+	if side == "BUY" {
+		sellerID, buyerID = takerID, creatorID
+	}
 	legacyDebit := false
-	if source == p2pFundingWallet {
+	if side == "BUY" {
+		if err = r.lockWallet(ctx, tx, sellerID, asset); err != nil {
+			return nil, err
+		}
+		tag, e := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET available_raw=available_raw-$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2 AND available_raw >= $3::numeric`, sellerID, asset, amountRaw)
+		if e != nil {
+			return nil, e
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, fmt.Errorf("insufficient available %s in P2P wallet", asset)
+		}
+	} else if source == p2pFundingWallet {
 		if err = r.lockWallet(ctx, tx, sellerID, asset); err != nil {
 			return nil, err
 		}
@@ -396,7 +521,7 @@ func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw
 	if _, err = tx.Exec(ctx, `UPDATE p2p_listings SET remaining_raw=remaining_raw-$2::numeric,status=CASE WHEN remaining_raw-$2::numeric=0 THEN 'FILLED' ELSE status END,updated_at=now() WHERE id=$1`, listingID, amountRaw); err != nil {
 		return nil, err
 	}
-	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, asset, amountRaw, price, fiat, method, key)
+	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, price, fiat, selectedMethod, key)
 	if err != nil {
 		return nil, err
 	}
@@ -414,16 +539,16 @@ func (r *P2PRepo) CreateOrder(ctx context.Context, buyerID, listingID, amountRaw
 	return order, nil
 }
 
-func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, asset, amountRaw, price, fiat, method, key string) (*models.P2POrder, error) {
+func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, price, fiat, method, key string) (*models.P2POrder, error) {
 	var dbKey any
 	if key != "" {
 		dbKey = key
 	}
-	q := `WITH amounts AS (SELECT round(($5::numeric/1000000)*$6::numeric,8) AS gross)
-	INSERT INTO p2p_orders(listing_id,seller_id,buyer_id,asset,amount_raw,escrow_raw,price,fiat_currency,gross_amount,buyer_fee,seller_fee,buyer_payable,seller_receivable,payment_method,buyer_credit,seller_debit,fiat_amount,buyer_fee_fiat,seller_fee_fiat,buyer_pays_fiat,seller_receives_fiat,status,idempotency_key,expires_at)
-	SELECT $1,$2,$3,$4,$5,$5,$6,$7,gross,round(gross*.01,8),round(gross*.01,8),round(gross*1.01,8),round(gross*.99,8),$8,$5,$5,gross,round(gross*.01,8),round(gross*.01,8),round(gross*1.01,8),round(gross*.99,8),'pending_payment',$9,$10 FROM amounts
+	q := `WITH amounts AS (SELECT round(($6::numeric/1000000)*$7::numeric,8) AS gross)
+	INSERT INTO p2p_orders(listing_id,seller_id,buyer_id,taker_id,asset,amount_raw,escrow_raw,price,fiat_currency,gross_amount,buyer_fee,seller_fee,buyer_payable,seller_receivable,payment_method,buyer_credit,seller_debit,fiat_amount,buyer_fee_fiat,seller_fee_fiat,buyer_pays_fiat,seller_receives_fiat,status,idempotency_key,expires_at)
+	SELECT $1,$2,$3,$4,$5,$6,$6,$7,$8,gross,round(gross*.01,8),round(gross*.01,8),round(gross*1.01,8),round(gross*.99,8),$9,$6,$6,gross,round(gross*.01,8),round(gross*.01,8),round(gross*1.01,8),round(gross*.99,8),'pending_payment',$10,$11 FROM amounts
 	RETURNING id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,payment_method,status,expires_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at`
-	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, asset, amountRaw, price, fiat, method, dbKey, time.Now().Add(15*time.Minute)))
+	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, takerID, asset, amountRaw, price, fiat, method, dbKey, time.Now().Add(15*time.Minute)))
 }
 
 func (r *P2PRepo) Orders(ctx context.Context, userID string) ([]models.P2POrder, error) {
@@ -561,14 +686,14 @@ func (r *P2PRepo) refundTx(ctx context.Context, tx pgx.Tx, o *models.P2POrder, f
 	if o.EscrowRaw == "0" {
 		return nil, ErrP2PInvalidState
 	}
-	var listingStatus, source string
-	if err := tx.QueryRow(ctx, `SELECT status,funding_source FROM p2p_listings WHERE id=$1 FOR UPDATE`, o.ListingID).Scan(&listingStatus, &source); err != nil {
+	var listingStatus, source, side string
+	if err := tx.QueryRow(ctx, `SELECT status,funding_source,side FROM p2p_listings WHERE id=$1 FOR UPDATE`, o.ListingID).Scan(&listingStatus, &source, &side); err != nil {
 		return nil, err
 	}
 	if err := r.lockWallet(ctx, tx, o.SellerID, o.Asset); err != nil {
 		return nil, err
 	}
-	if source == p2pFundingWallet && listingStatus != "CANCELLED" {
+	if side == "SELL" && source == p2pFundingWallet && listingStatus != "CANCELLED" {
 		if _, err := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET reserved_raw=reserved_raw+$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2`, o.SellerID, o.Asset, o.EscrowRaw); err != nil {
 			return nil, err
 		}
@@ -578,6 +703,11 @@ func (r *P2PRepo) refundTx(ctx context.Context, tx pgx.Tx, o *models.P2POrder, f
 	} else {
 		if _, err := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET available_raw=available_raw+$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2`, o.SellerID, o.Asset, o.EscrowRaw); err != nil {
 			return nil, err
+		}
+		if side == "BUY" && listingStatus != "CANCELLED" {
+			if _, err := tx.Exec(ctx, `UPDATE p2p_listings SET remaining_raw=remaining_raw+$2::numeric,status='ACTIVE',updated_at=now() WHERE id=$1`, o.ListingID, o.EscrowRaw); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,listing_id,order_id,kind,asset,amount_raw) VALUES($1,$2,$3,'order_refund',$4,$5)`, o.SellerID, o.ListingID, o.ID, o.Asset, o.EscrowRaw); err != nil {
@@ -618,15 +748,18 @@ func (r *P2PRepo) CancelListing(ctx context.Context, sellerID, listingID string)
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var asset, remaining, source string
-	err = tx.QueryRow(ctx, `SELECT asset,remaining_raw::text,funding_source FROM p2p_listings WHERE id=$1 AND seller_id=$2 AND status='ACTIVE' FOR UPDATE`, listingID, sellerID).Scan(&asset, &remaining, &source)
+	var asset, remaining, source, side string
+	err = tx.QueryRow(ctx, `SELECT asset,remaining_raw::text,funding_source,side FROM p2p_listings WHERE id=$1 AND seller_id=$2 AND status='ACTIVE' FOR UPDATE`, listingID, sellerID).Scan(&asset, &remaining, &source, &side)
 	if err == pgx.ErrNoRows {
 		return ErrP2PNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if source == p2pFundingWallet {
+	if side == "BUY" {
+		// Buy ads do not reserve the creator's USDB. A counterparty seller only
+		// moves funds into escrow when accepting the ad.
+	} else if source == p2pFundingWallet {
 		if err = r.lockWallet(ctx, tx, sellerID, asset); err != nil {
 			return err
 		}

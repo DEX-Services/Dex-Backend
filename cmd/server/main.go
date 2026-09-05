@@ -33,7 +33,7 @@ func main() {
 
 	pool, err := db.New(ctx, os.Getenv("POSTGRES_SERVICE_URI"))
 	if err != nil {
-		slog.Error("failed to connect to postgres", "err", err)
+		slog.Error("postgres initialization failed", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
@@ -155,10 +155,12 @@ func main() {
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)
 	mux.HandleFunc("/p2p/wallet", p2pSrv.Wallet)
+	mux.HandleFunc("/p2p/profile", p2pSrv.Profile)
 	mux.HandleFunc("/p2p/wallet/fund", p2pSrv.FundWallet)
 	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
+	mux.HandleFunc("/p2p/orders/create", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
 	mux.HandleFunc("/p2p/orders/paid", p2pSrv.MarkPaid)
 	mux.HandleFunc("/p2p/orders/release", p2pSrv.ReleaseOrder)

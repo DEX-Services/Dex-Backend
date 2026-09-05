@@ -18,14 +18,20 @@ type P2PServer struct {
 	Engine *engineclient.Client
 }
 type createListingRequest struct {
-	Asset         string `json:"asset"`
-	AmountRaw     string `json:"amountRaw"`
-	PaymentMethod string `json:"paymentMethod"`
+	Asset          string   `json:"asset"`
+	Side           string   `json:"side"`
+	AmountRaw      string   `json:"amountRaw"`
+	PaymentMethods []string `json:"paymentMethods"`
+	Username       string   `json:"username"`
 }
 type buyListingRequest struct {
 	ListingID      string `json:"listingId"`
 	AmountRaw      string `json:"amountRaw"`
+	PaymentMethod  string `json:"paymentMethod"`
 	IdempotencyKey string `json:"idempotencyKey"`
+}
+type p2pProfileRequest struct {
+	Username string `json:"username"`
 }
 type cancelListingRequest struct {
 	ListingID string `json:"listingId"`
@@ -62,7 +68,7 @@ func (s *P2PServer) Price(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
 	if asset == "" {
-		asset = "USDC"
+		asset = "USDB"
 	}
 	price, err := s.P2P.PriceFor(r.Context(), asset)
 	if err != nil {
@@ -72,7 +78,7 @@ func (s *P2PServer) Price(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"price": price})
 }
 
-// Wallet: GET /p2p/wallet returns the dedicated USDC and USDB P2P wallets.
+// Wallet: GET /p2p/wallet returns the dedicated USDB P2P wallet.
 func (s *P2PServer) Wallet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -91,7 +97,7 @@ func (s *P2PServer) Wallet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"balance": balances[0], "balances": balances})
 }
 
-// FundWallet: POST /p2p/wallet/fund moves main-wallet USDC/USDB into P2P.
+// FundWallet: POST /p2p/wallet/fund moves main-wallet USDB into P2P.
 func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) {
 		return
@@ -107,7 +113,7 @@ func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
 	if asset == "" {
-		asset = "USDC"
+		asset = "USDB"
 	}
 	balance, moved, err := s.P2P.FundWalletAsset(r.Context(), userID, asset, req.AmountRaw, req.IdempotencyKey)
 	if err != nil {
@@ -147,9 +153,9 @@ func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
 	if asset == "" {
-		asset = "USDC"
+		asset = "USDB"
 	}
-	listing, err := s.P2P.CreateListingForAsset(r.Context(), userID, asset, req.AmountRaw, req.PaymentMethod)
+	listing, err := s.P2P.CreateListingWithDetails(r.Context(), userID, req.Side, asset, req.AmountRaw, req.PaymentMethods, req.Username)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -187,7 +193,7 @@ func (s *P2PServer) Buy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	order, err := s.P2P.CreateOrder(r.Context(), userID, req.ListingID, req.AmountRaw, req.IdempotencyKey)
+	order, err := s.P2P.CreateOrderWithPayment(r.Context(), userID, req.ListingID, req.AmountRaw, req.PaymentMethod, req.IdempotencyKey)
 	if err != nil {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
@@ -198,6 +204,36 @@ func (s *P2PServer) Buy(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"order": order})
+}
+
+func (s *P2PServer) Profile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		profile, err := s.P2P.P2PProfile(r.Context(), userID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load P2P profile")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"profile": profile})
+		return
+	}
+	if !requirePost(w, r) {
+		return
+	}
+	var req p2pProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	profile, err := s.P2P.EstablishP2PUsername(r.Context(), userID, req.Username)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profile": profile})
 }
 
 func p2pErrorStatus(err error) int {
