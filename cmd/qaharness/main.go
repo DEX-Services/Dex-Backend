@@ -68,8 +68,30 @@ func main() {
 		runSetup()
 	case "matrix":
 		runMatrix()
+	case "verify":
+		runVerify()
 	default:
 		fatal("unknown phase %q", os.Args[1])
+	}
+}
+
+// runVerify dumps fills/positions/pnlHistory for a handful of accounts used
+// in the user-vs-user matching and PnL-sample scenarios, for the QA report's
+// evidence sections (concrete order IDs, account IDs, and arithmetic).
+func runVerify() {
+	ids := []int{1, 95, 96, 40, 50, 60, 70, 90}
+	for _, i := range ids {
+		u := userID(i)
+		tok := jwtFor(u)
+		fmt.Printf("\n===== %s =====\n", u)
+		fmt.Println("-- fills --")
+		fmt.Println(string(getFills(tok, "", "")))
+		fmt.Println("-- positions --")
+		fmt.Println(string(getPositions(tok)))
+		fmt.Println("-- pnlHistory --")
+		fmt.Println(string(getPnlHistory(tok)))
+		bal, _ := getBalance(tok, "USDB")
+		fmt.Println("-- USDB balance --", bal)
 	}
 }
 
@@ -285,7 +307,7 @@ func getBalance(tok, asset string) (string, error) {
 }
 
 func getPnlHistory(tok string) []byte {
-	_, body, _ := doJSON(http.MethodGet, backendURL+"/trade/pnlHistory?limit=200", tok, nil)
+	_, body, _ := doJSON(http.MethodGet, backendURL+"/trade/pnl-history?limit=200", tok, nil)
 	return body
 }
 
