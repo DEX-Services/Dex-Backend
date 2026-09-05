@@ -214,17 +214,27 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if !ok {
 		return fmt.Errorf("unsupported asset %s", asset)
 	}
-	// The engine's mirrored balance represents *available* (spendable)
-	// capital — it's what Reserve/Lock draws down as orders are placed. Bals
-	// above is the raw total column (unlocked + locked). Comparing total
-	// against the engine's available figure and crediting the difference
-	// double-counts any amount already locked behind another open order: the
-	// engine gets re-credited funds it correctly excluded, letting a second
-	// concurrent order over-reserve against capital that isn't actually free.
-	// That mismatch surfaces downstream as a spot-settlement failure
-	// ("insufficient locked USDB for buyer") which halts the whole symbol.
-	// Subtract the locked amount so this reconciles against the same
-	// available balance the engine is supposed to track.
+	// Compare like with like: the engine's own /admin/balance reports THREE
+	// separate figures — Balance (total, including reserved), Reserved, and
+	// Available (Balance - Reserved) — see BalanceResponse and the engine's
+	// ledger.Available/Balance/Reserved. This function's job is to repair
+	// drift between Postgres's available capital and the engine's mirror of
+	// it, so it must read the engine's Available field, not Balance.
+	//
+	// The previous version compared Postgres's available (total - locked)
+	// against the engine's TOTAL (engineBal.Balance, which does NOT subtract
+	// the engine's own in-memory reservations for still-open orders). Any
+	// account with even one resting order made that comparison see a bogus
+	// "deficit" equal to that order's reservation and call Engine.Debit for
+	// it — which does not just adjust balance, it also releases that same
+	// amount from the engine's reserved-for-orders tracking (see
+	// risk.Ledger.Debit: "Release reservation up to the debited amount").
+	// That silently zeroed out a live resting order's reservation on EVERY
+	// subsequent order from the same account, with no concurrency or race
+	// required to trigger it — reproduced with two fully sequential orders
+	// against a fresh account. The account's real Postgres lock was
+	// untouched, so the next trade against that resting order failed
+	// "insufficient locked ..." and halted the whole symbol.
 	lockedBals, err := s.Ledger.LockedBalancesFor(ctx, accountID)
 	if err != nil {
 		return fmt.Errorf("load locked balance: %w", err)
@@ -251,9 +261,9 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if err != nil {
 		return fmt.Errorf("check engine balance: %w", err)
 	}
-	engineAmount, ok := new(big.Rat).SetString(engineBal.Balance)
+	engineAmount, ok := new(big.Rat).SetString(engineBal.Available)
 	if !ok {
-		return fmt.Errorf("invalid engine balance %s", engineBal.Balance)
+		return fmt.Errorf("invalid engine balance %s", engineBal.Available)
 	}
 	delta := new(big.Rat).Sub(dbAmount, engineAmount)
 	if delta.Sign() > 0 {
