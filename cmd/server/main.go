@@ -82,7 +82,7 @@ func main() {
 	if adminSrv.AdminLoginID == "" || adminSrv.AdminPassword == "" {
 		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
-	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo}
+	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo, Engine: engineClient}
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
@@ -154,10 +154,15 @@ func main() {
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)
+	mux.HandleFunc("/p2p/wallet", p2pSrv.Wallet)
+	mux.HandleFunc("/p2p/wallet/fund", p2pSrv.FundWallet)
 	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
+	mux.HandleFunc("/p2p/orders/paid", p2pSrv.MarkPaid)
+	mux.HandleFunc("/p2p/orders/release", p2pSrv.ReleaseOrder)
+	mux.HandleFunc("/p2p/orders/cancel", p2pSrv.CancelOrder)
 	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
 	mux.HandleFunc("/trade/order", tradeSrv.Order)
 	mux.HandleFunc("/trade/attached-order", tradeSrv.AttachedOrder)

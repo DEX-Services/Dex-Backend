@@ -24,20 +24,37 @@ type P2PListing struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 }
 type P2POrder struct {
-	ID               string    `json:"id"`
-	ListingID        string    `json:"listingId"`
-	SellerID         string    `json:"sellerId"`
-	BuyerID          string    `json:"buyerId"`
-	Asset            string    `json:"asset"`
-	AmountRaw        string    `json:"amountRaw"`
-	Price            string    `json:"price"`
-	FiatCurrency     string    `json:"fiatCurrency"`
-	GrossAmount      string    `json:"grossAmount"`
-	BuyerFee         string    `json:"buyerFee"`
-	SellerFee        string    `json:"sellerFee"`
-	BuyerPayable     string    `json:"buyerPayable"`
-	SellerReceivable string    `json:"sellerReceivable"`
-	PaymentMethod    string    `json:"paymentMethod"`
-	Status           string    `json:"status"`
-	CreatedAt        time.Time `json:"createdAt"`
+	ID                 string     `json:"id"`
+	ListingID          string     `json:"listingId"`
+	SellerID           string     `json:"sellerId"`
+	BuyerID            string     `json:"buyerId"`
+	Asset              string     `json:"asset"`
+	AmountRaw          string     `json:"amountRaw"`
+	EscrowRaw          string     `json:"escrowRaw"`
+	Price              string     `json:"price"`
+	FiatCurrency       string     `json:"fiatCurrency"`
+	GrossAmount        string     `json:"grossAmount"`
+	BuyerFee           string     `json:"buyerFee"`
+	SellerFee          string     `json:"sellerFee"`
+	BuyerPayable       string     `json:"buyerPayable"`
+	SellerReceivable   string     `json:"sellerReceivable"`
+	PaymentMethod      string     `json:"paymentMethod"`
+	Status             string     `json:"status"`
+	ExpiresAt          time.Time  `json:"expiresAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
+	CancellationReason string     `json:"cancellationReason,omitempty"`
+	CompletedAt        *time.Time `json:"completedAt,omitempty"`
+	CreatedAt          time.Time  `json:"createdAt"`
+
+	// LegacyMainDebit is internal response metadata used only to keep the
+	// matching-engine mirror consistent when an order consumes a pre-P2P-wallet
+	// listing. It is never serialized to clients.
+	LegacyMainDebit bool `json:"-"`
+}
+
+type P2PWalletBalance struct {
+	Asset        string `json:"asset"`
+	AvailableRaw string `json:"availableRaw"`
+	ReservedRaw  string `json:"reservedRaw"`
+	TotalRaw     string `json:"totalRaw"`
 }

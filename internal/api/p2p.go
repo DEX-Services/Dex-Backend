@@ -1,26 +1,42 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"github.com/dex/dex-backend/internal/repo"
 	"net/http"
+	"strings"
+
+	"github.com/dex/dex-backend/internal/engineclient"
+	"github.com/dex/dex-backend/internal/models"
+	"github.com/dex/dex-backend/internal/repo"
 )
 
 type P2PServer struct {
 	*Server
-	P2P *repo.P2PRepo
+	P2P    *repo.P2PRepo
+	Engine *engineclient.Client
 }
 type createListingRequest struct {
+	Asset         string `json:"asset"`
 	AmountRaw     string `json:"amountRaw"`
 	PaymentMethod string `json:"paymentMethod"`
 }
 type buyListingRequest struct {
-	ListingID string `json:"listingId"`
-	AmountRaw string `json:"amountRaw"`
+	ListingID      string `json:"listingId"`
+	AmountRaw      string `json:"amountRaw"`
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 type cancelListingRequest struct {
 	ListingID string `json:"listingId"`
+}
+type fundP2PWalletRequest struct {
+	Asset          string `json:"asset"`
+	AmountRaw      string `json:"amountRaw"`
+	IdempotencyKey string `json:"idempotencyKey"`
+}
+type orderActionRequest struct {
+	OrderID string `json:"orderId"`
 }
 
 func requirePost(w http.ResponseWriter, r *http.Request) bool {
@@ -44,12 +60,66 @@ func (s *P2PServer) Price(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	price, err := s.P2P.TodayPrice(r.Context())
+	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
+	if asset == "" {
+		asset = "USDC"
+	}
+	price, err := s.P2P.PriceFor(r.Context(), asset)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"price": price})
+}
+
+// Wallet: GET /p2p/wallet returns the dedicated USDC and USDB P2P wallets.
+func (s *P2PServer) Wallet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	balances, err := s.P2P.WalletBalances(r.Context(), userID)
+	if err != nil {
+		s.Log.Error("load p2p wallet failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load P2P wallet")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balances[0], "balances": balances})
+}
+
+// FundWallet: POST /p2p/wallet/fund moves main-wallet USDC/USDB into P2P.
+func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req fundP2PWalletRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	if asset == "" {
+		asset = "USDC"
+	}
+	balance, moved, err := s.P2P.FundWalletAsset(r.Context(), userID, asset, req.AmountRaw, req.IdempotencyKey)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	if moved && s.Engine != nil {
+		engineclient.Async("p2p wallet fund debit", func(ctx context.Context) error {
+			return s.Engine.Debit(ctx, userID, asset, req.AmountRaw)
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
 }
 
 func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +145,11 @@ func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	listing, err := s.P2P.CreateListing(r.Context(), userID, req.AmountRaw, req.PaymentMethod)
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	if asset == "" {
+		asset = "USDC"
+	}
+	listing, err := s.P2P.CreateListingForAsset(r.Context(), userID, asset, req.AmountRaw, req.PaymentMethod)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -113,22 +187,64 @@ func (s *P2PServer) Buy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	order, err := s.P2P.Buy(r.Context(), userID, req.ListingID, req.AmountRaw)
+	order, err := s.P2P.CreateOrder(r.Context(), userID, req.ListingID, req.AmountRaw, req.IdempotencyKey)
 	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, repo.ErrP2PNotFound) {
-			status = http.StatusNotFound
-		}
-		if errors.Is(err, repo.ErrP2PSelfPurchase) {
-			status = http.StatusForbidden
-		}
-		if errors.Is(err, repo.ErrP2PUnavailable) {
-			status = http.StatusConflict
-		}
-		writeError(w, status, err.Error())
+		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	if order.LegacyMainDebit && s.Engine != nil {
+		engineclient.Async("legacy p2p order debit", func(ctx context.Context) error {
+			return s.Engine.Debit(ctx, order.SellerID, order.Asset, order.AmountRaw)
+		})
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"order": order})
+}
+
+func p2pErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, repo.ErrP2PNotFound), errors.Is(err, repo.ErrP2POrderNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, repo.ErrP2PSelfPurchase), errors.Is(err, repo.ErrP2PForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, repo.ErrP2PUnavailable), errors.Is(err, repo.ErrP2PInvalidState),
+		errors.Is(err, repo.ErrP2PExpired), errors.Is(err, repo.ErrP2PIdempotencyKey):
+		return http.StatusConflict
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func (s *P2PServer) orderAction(w http.ResponseWriter, r *http.Request, action func(context.Context, string, string) (*models.P2POrder, error)) {
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req orderActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.OrderID) == "" {
+		writeError(w, http.StatusBadRequest, "orderId is required")
+		return
+	}
+	order, err := action(r.Context(), userID, req.OrderID)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *P2PServer) MarkPaid(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.MarkPaid)
+}
+
+func (s *P2PServer) ReleaseOrder(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.ReleaseOrder)
+}
+
+func (s *P2PServer) CancelOrder(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.CancelOrder)
 }
 
 func (s *P2PServer) Orders(w http.ResponseWriter, r *http.Request) {
