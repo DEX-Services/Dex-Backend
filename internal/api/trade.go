@@ -86,7 +86,7 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "LIMIT"
 	}
-	if err := s.reconcileOrderBalance(r.Context(), accountID, req.Symbol, req.Side); err != nil {
+	if err := s.reconcileOrderBalance(r.Context(), accountID, req.Symbol, req.Market, req.Side); err != nil {
 		s.tradeError(w, err)
 		return
 	}
@@ -106,7 +106,17 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 // reconcileOrderBalance repairs the engine mirror immediately before risk
 // checks. This covers balances deposited before the engine started and engine
 // restarts that occurred after the normal startup backfill.
-func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symbol, side string) error {
+//
+// Which asset to reconcile depends on market, not just side: a SPOT order
+// locks its base asset on SELL and its quote asset on BUY (the two legs the
+// trader actually holds), but a FUTURES order always margins in the quote
+// asset (USDB) regardless of side — shorting a non-crypto-backed future like
+// EURUSD/GOLD/AAPL.us has no base-asset ledger column at all (there is no
+// spot book, so no such balance exists), and even for crypto-backed futures
+// (BTC/ETH/SOL/BNB) a SELL is a margined short, not a spend of held BTC/ETH/
+// SOL/BNB. Reconciling the base leg for a futures SELL either fails outright
+// (non-crypto symbols) or silently checks the wrong balance (crypto symbols).
+func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symbol, market, side string) error {
 	if s.Ledger == nil || s.Engine == nil {
 		return nil
 	}
@@ -115,7 +125,7 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 		return nil
 	}
 	asset := parts[1]
-	if strings.EqualFold(side, "SELL") {
+	if strings.EqualFold(side, "SELL") && !strings.EqualFold(market, "FUTURES") {
 		asset = parts[0]
 	}
 	bals, err := s.Ledger.BalancesFor(ctx, accountID)
@@ -126,14 +136,39 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if !ok {
 		return fmt.Errorf("unsupported asset %s", asset)
 	}
-	dbTotal, err := rawToHumanUnits(raw)
+	// The engine's mirrored balance represents *available* (spendable)
+	// capital — it's what Reserve/Lock draws down as orders are placed. Bals
+	// above is the raw total column (unlocked + locked). Comparing total
+	// against the engine's available figure and crediting the difference
+	// double-counts any amount already locked behind another open order: the
+	// engine gets re-credited funds it correctly excluded, letting a second
+	// concurrent order over-reserve against capital that isn't actually free.
+	// That mismatch surfaces downstream as a spot-settlement failure
+	// ("insufficient locked USDB for buyer") which halts the whole symbol.
+	// Subtract the locked amount so this reconciles against the same
+	// available balance the engine is supposed to track.
+	lockedBals, err := s.Ledger.LockedBalancesFor(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("load locked balance: %w", err)
+	}
+	lockedRaw := lockedBals[strings.ToUpper(asset)]
+	dbTotalStr, err := rawToHumanUnits(raw)
 	if err != nil {
 		return fmt.Errorf("convert balance: %w", err)
 	}
-	dbAmount, ok := new(big.Rat).SetString(dbTotal)
-	if !ok {
-		return fmt.Errorf("invalid balance amount %s", dbTotal)
+	dbLockedStr, err := rawToHumanUnits(lockedRaw)
+	if err != nil {
+		return fmt.Errorf("convert locked balance: %w", err)
 	}
+	dbAmount, ok := new(big.Rat).SetString(dbTotalStr)
+	if !ok {
+		return fmt.Errorf("invalid balance amount %s", dbTotalStr)
+	}
+	dbLocked, ok := new(big.Rat).SetString(dbLockedStr)
+	if !ok {
+		return fmt.Errorf("invalid locked balance amount %s", dbLockedStr)
+	}
+	dbAmount.Sub(dbAmount, dbLocked)
 	engineBal, err := s.Engine.Balance(ctx, accountID, asset)
 	if err != nil {
 		return fmt.Errorf("check engine balance: %w", err)

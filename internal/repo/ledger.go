@@ -872,27 +872,39 @@ type NonzeroBalance struct {
 	Amount string
 }
 
-// AllNonzeroBalances returns every (user, asset) pair with a positive balance,
-// for one-time backfill of the matching-engine's in-memory ledger.
+// AllNonzeroBalances returns every (user, asset) pair with a positive
+// *available* balance (total minus whatever is locked behind still-open
+// orders), for one-time backfill of the matching-engine's in-memory ledger.
+//
+// The engine's ledger represents spendable capital — it's what Reserve/Lock
+// draws down for new orders — so backfilling it with the raw total column
+// double-counts any amount already locked behind an order that survived the
+// restart (a resting limit order, an MM quote, an armed stop). When that
+// order later fills, settlement's debit fails against the real (smaller)
+// locked amount in Postgres with "insufficient locked <asset> for buyer/
+// seller", which the engine treats as a serious integrity fault and halts
+// the whole symbol. Subtracting *_locked here keeps the backfilled figure
+// consistent with what LockBalance/reconcileOrderBalance already treat as
+// "available" everywhere else.
 func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT user_id, 'USDC', "USDC"::text FROM user_balances WHERE "USDC" > 0
+		SELECT user_id, 'USDC', GREATEST("USDC" - "USDC_locked", 0)::text FROM user_balances WHERE "USDC" - "USDC_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BTC', "BTC"::text FROM user_balances WHERE "BTC" > 0
+		SELECT user_id, 'BTC', GREATEST("BTC" - "BTC_locked", 0)::text FROM user_balances WHERE "BTC" - "BTC_locked" > 0
 		UNION ALL
-		SELECT user_id, 'ETH', "ETH"::text FROM user_balances WHERE "ETH" > 0
+		SELECT user_id, 'ETH', GREATEST("ETH" - "ETH_locked", 0)::text FROM user_balances WHERE "ETH" - "ETH_locked" > 0
 		UNION ALL
-		SELECT user_id, 'SOL', "SOL"::text FROM user_balances WHERE "SOL" > 0
+		SELECT user_id, 'SOL', GREATEST("SOL" - "SOL_locked", 0)::text FROM user_balances WHERE "SOL" - "SOL_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BNB', "BNB"::text FROM user_balances WHERE "BNB" > 0
+		SELECT user_id, 'BNB', GREATEST("BNB" - "BNB_locked", 0)::text FROM user_balances WHERE "BNB" - "BNB_locked" > 0
 		UNION ALL
-		SELECT user_id, 'USDT', "USDT"::text FROM user_balances WHERE "USDT" > 0
+		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BUSD', "BUSD"::text FROM user_balances WHERE "BUSD" > 0
+		SELECT user_id, 'BUSD', GREATEST("BUSD" - "BUSD_locked", 0)::text FROM user_balances WHERE "BUSD" - "BUSD_locked" > 0
 		UNION ALL
-		SELECT user_id, 'USDB', "USDB"::text FROM user_balances WHERE "USDB" > 0
+		SELECT user_id, 'USDB', GREATEST("USDB" - "USDB_locked", 0)::text FROM user_balances WHERE "USDB" - "USDB_locked" > 0
 		UNION ALL
-		SELECT user_id, 'OUR_Token', "OUR_Token"::text FROM user_balances WHERE "OUR_Token" > 0`)
+		SELECT user_id, 'OUR_Token', GREATEST("OUR_Token" - "OUR_Token_locked", 0)::text FROM user_balances WHERE "OUR_Token" - "OUR_Token_locked" > 0`)
 	if err != nil {
 		return nil, err
 	}
