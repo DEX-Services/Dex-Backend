@@ -39,7 +39,32 @@ func New() *Client {
 	return &Client{
 		baseURL: base,
 		secret:  secret,
-		http:    &http.Client{Timeout: 5 * time.Second},
+		// 10s (was 5s): /attached-order does strictly more engine-side work
+		// than a plain /order — entry submit, then registry activation, then
+		// up to two leg placements, each touching the shared, deliberately
+		// small Postgres pools (see internal/db/db.go) — and under bursty
+		// concurrent load (many attached orders at once) 5s was tight enough
+		// to produce client-visible 502s even though the engine eventually
+		// completed the work correctly with no incorrect state. This raises
+		// the ceiling for every trade call, not just attached orders, since
+		// they share one client; 10s is still a hard bound, not unbounded.
+		//
+		// This is a ceiling on ONE call, not a queueing budget: TradeServer's
+		// per-account lock (see acctLocks) means a burst of orders from the
+		// SAME account is processed one at a time, so raising this further
+		// would just let a deep same-account queue exceed it anyway — see
+		// TradeServer.Order's queue-depth guard, which is the actual fix for
+		// that case instead of an ever-larger timeout here.
+		//
+		// 20s (was 10s): measured against the live Aiven Postgres instance
+		// this deploys against, a single lock/settle round-trip alone can
+		// take 4-6s (real network RTT to the hosted DB, not application
+		// logic), and one order does several such round-trips in sequence
+		// (reconcileOrderBalance's two reads, the lock, the settle). 10s
+		// produced client-visible "trading service unavailable" errors on
+		// perfectly normal, non-concurrent single orders — a correctness
+		// non-issue turned into a false failure by too tight a ceiling.
+		http: &http.Client{Timeout: 20 * time.Second},
 	}
 }
 

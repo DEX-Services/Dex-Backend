@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/repo"
@@ -21,6 +23,73 @@ type TradeServer struct {
 	*Server
 	Engine *engineclient.Client
 	Ledger *repo.LedgerRepo
+
+	// acctLocks serializes reconcileOrderBalance + order submission per
+	// account. Without this, two orders from the same account placed close
+	// together race: order 1 reserves in the engine's in-memory ledger
+	// (synchronous) and only afterward locks the same amount in Postgres
+	// (a separate HTTP round-trip). If order 2's reconcileOrderBalance reads
+	// Postgres in that gap — after order 1's in-memory reservation but
+	// before its Postgres lock lands — order 1's lock is invisible to
+	// order 2's "total minus locked" read while already reflected in the
+	// engine's mirror, so the delta comes out positive and reconcile
+	// CREDITS the engine with a phantom amount equal to order 1's in-flight
+	// reservation, silently erasing it. Both orders then believe there's
+	// more available than Postgres can actually back, and the second one to
+	// settle fails "insufficient locked ... " — which halts the whole
+	// symbol (see marketMakerReplaceHandler and the engine's settlement
+	// path). Serializing per account closes exactly this window; it does
+	// not serialize across different accounts, so it costs nothing under
+	// normal multi-user load.
+	//
+	// Each entry is a 1-buffered channel used as a try-lock: acquiring means
+	// sending into it, releasing means receiving. A deep same-account burst
+	// (e.g. a client double-click storm, or a broken retry loop) would
+	// otherwise queue silently behind a plain mutex until each request's own
+	// HTTP client timeout fires anyway — acquireAccountSlot instead waits
+	// only up to a short bound and fails fast with a clear, cheap 429 so the
+	// caller can retry deliberately instead of the request hanging for the
+	// full engine-call timeout for no useful reason.
+	acctLocks   map[string]chan struct{}
+	acctLocksMu sync.Mutex
+}
+
+// acctQueueWait bounds how long a request waits for its own account's slot
+// before giving up. Deliberately shorter than the engine client's own 10s
+// call timeout: a request that's still queued this deep in has no realistic
+// chance of also completing the engine round-trip before that timeout, so
+// failing fast here gives a clearer error than a generic gateway timeout.
+// 8s: half of the engine client's 20s call ceiling (see engineclient.New's
+// doc comment on real-world Postgres latency) — a request already waiting
+// this long for its own account's turn has no realistic chance of also
+// completing a full engine round-trip inside that ceiling.
+const acctQueueWait = 8 * time.Second
+
+// acquireAccountSlot waits for accountID's turn (creating its slot on first
+// use) and returns a release func, or ok=false if acctQueueWait elapsed
+// first — the account already has too many orders in flight.
+func (s *TradeServer) acquireAccountSlot(ctx context.Context, accountID string) (release func(), ok bool) {
+	s.acctLocksMu.Lock()
+	ch, exists := s.acctLocks[accountID]
+	if !exists {
+		if s.acctLocks == nil {
+			s.acctLocks = make(map[string]chan struct{})
+		}
+		ch = make(chan struct{}, 1)
+		s.acctLocks[accountID] = ch
+	}
+	s.acctLocksMu.Unlock()
+
+	timer := time.NewTimer(acctQueueWait)
+	defer timer.Stop()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	case <-timer.C:
+		return nil, false
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 type tradeOrderRequest struct {
@@ -86,6 +155,15 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "LIMIT"
 	}
+	// Hold this account's slot across reconcile-then-submit so a second
+	// order from the same account can't read Postgres mid-window and
+	// corrupt the engine mirror — see acctLocks' doc comment on TradeServer.
+	release, ok := s.acquireAccountSlot(r.Context(), accountID)
+	if !ok {
+		writeError(w, http.StatusTooManyRequests, "too many concurrent orders for this account; retry shortly")
+		return
+	}
+	defer release()
 	if err := s.reconcileOrderBalance(r.Context(), accountID, req.Symbol, req.Market, req.Side); err != nil {
 		s.tradeError(w, err)
 		return
@@ -210,6 +288,22 @@ func (s *TradeServer) AttachedOrder(w http.ResponseWriter, r *http.Request) {
 	parent := toOrder(&req.Parent)
 	if parent == nil || parent.Symbol == "" || parent.Qty == "" {
 		writeError(w, http.StatusBadRequest, "parent order is required")
+		return
+	}
+	// Same stale-mirror repair Order() does before every plain order — an
+	// attached order's entry leg is exactly as exposed to the engine-mirror
+	// drift reconcileOrderBalance exists to fix, and skipping it here left
+	// every TP/SL trade able to trigger the same "insufficient locked ..."
+	// settlement halt that plain orders were already protected against.
+	// Same per-account serialization as Order() — see acctLocks' doc comment.
+	release, ok := s.acquireAccountSlot(r.Context(), accountID)
+	if !ok {
+		writeError(w, http.StatusTooManyRequests, "too many concurrent orders for this account; retry shortly")
+		return
+	}
+	defer release()
+	if err := s.reconcileOrderBalance(r.Context(), accountID, parent.Symbol, parent.Market, parent.Side); err != nil {
+		s.tradeError(w, err)
 		return
 	}
 	response, err := s.Engine.SubmitAttachedOrder(r.Context(), engineclient.AttachedOrder{Parent: *parent, TakeProfit: toOrder(req.TakeProfit), StopLoss: toOrder(req.StopLoss)})
