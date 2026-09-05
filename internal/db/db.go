@@ -128,12 +128,16 @@ CREATE TABLE IF NOT EXISTS p2p_price_history (
 INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
 VALUES ('USDC', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
+VALUES ('USDB', 'INR', 100, CURRENT_DATE)
+ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
 CREATE TABLE IF NOT EXISTS p2p_listings (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset = 'USDC'), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	remaining_raw NUMERIC(38,0) NOT NULL CHECK (remaining_raw >= 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
 	fiat_currency TEXT NOT NULL DEFAULT 'INR', payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI', 'Bank Transfer', 'NEFT', 'IMPS')),
 	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
+	funding_source TEXT NOT NULL DEFAULT 'P2P_WALLET' CHECK (funding_source IN ('P2P_WALLET', 'MAIN_WALLET_LEGACY')),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_p2p_listings_active ON p2p_listings (created_at DESC) WHERE status = 'ACTIVE';
@@ -144,8 +148,11 @@ CREATE TABLE IF NOT EXISTS p2p_orders (
 	asset TEXT NOT NULL, amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
 	fiat_currency TEXT NOT NULL, gross_amount NUMERIC(38,8) NOT NULL, buyer_fee NUMERIC(38,8) NOT NULL,
 	seller_fee NUMERIC(38,8) NOT NULL, buyer_payable NUMERIC(38,8) NOT NULL, seller_receivable NUMERIC(38,8) NOT NULL,
-	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status = 'COMPLETED'),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
+	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending_payment',
+	escrow_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (escrow_raw >= 0),
+	idempotency_key TEXT, expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
+	cancellation_reason TEXT, completed_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
 );
 CREATE INDEX IF NOT EXISTS idx_p2p_orders_buyer ON p2p_orders (buyer_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_p2p_orders_seller ON p2p_orders (seller_id, created_at DESC);
@@ -164,6 +171,24 @@ ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_fee_fiat NUMERIC(38,8) NO
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_pays_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_receives_fiat NUMERIC(38,8) NOT NULL DEFAULT 0;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS escrow_raw NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes');
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+-- Listings created before the dedicated P2P wallet existed still reserve
+-- user_balances.USDC_locked. Keep that funding source explicit so they can
+-- finish or cancel safely without silently treating those funds as P2P funds.
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS funding_source TEXT;
+UPDATE p2p_listings SET funding_source='MAIN_WALLET_LEGACY' WHERE funding_source IS NULL;
+ALTER TABLE p2p_listings ALTER COLUMN funding_source SET DEFAULT 'P2P_WALLET';
+ALTER TABLE p2p_listings ALTER COLUMN funding_source SET NOT NULL;
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_funding_source_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_funding_source_check
+	CHECK (funding_source IN ('P2P_WALLET','MAIN_WALLET_LEGACY'));
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_asset_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','USDB'));
 
 UPDATE p2p_orders SET
 	amount_raw = COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount),
@@ -185,10 +210,52 @@ ALTER TABLE p2p_orders ALTER COLUMN amount_raw SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN fiat_currency SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN buyer_payable SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN seller_receivable SET NOT NULL;
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','USDB'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_status_check CHECK (status IN ('COMPLETED','completed','pending_payment','payment_made','cancelled','appeal'));
+UPDATE p2p_orders SET status='completed',completed_at=COALESCE(completed_at,created_at),escrow_raw=0
+	WHERE status='COMPLETED';
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_status_check
+	CHECK (status IN ('completed','pending_payment','payment_made','cancelled','appeal'));
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_escrow_raw_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_escrow_raw_check CHECK (escrow_raw >= 0);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_orders_idempotency
+	ON p2p_orders (buyer_id,idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_p2p_orders_expiry
+	ON p2p_orders (expires_at) WHERE status='pending_payment';
+
+CREATE TABLE IF NOT EXISTS p2p_wallet_balances (
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')),
+	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
+	reserved_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (reserved_raw >= 0),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (user_id,asset)
+);
+
+CREATE TABLE IF NOT EXISTS p2p_wallet_entries (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	listing_id UUID REFERENCES p2p_listings(id) ON DELETE SET NULL,
+	order_id UUID REFERENCES p2p_orders(id) ON DELETE SET NULL,
+	kind TEXT NOT NULL,
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')),
+	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	idempotency_key TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_wallet_entries_user
+	ON p2p_wallet_entries (user_id,created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_wallet_fund_idempotency
+	ON p2p_wallet_entries (user_id,kind,idempotency_key)
+	WHERE kind='main_to_p2p' AND idempotency_key IS NOT NULL;
+ALTER TABLE p2p_wallet_balances DROP CONSTRAINT IF EXISTS p2p_wallet_balances_asset_check;
+ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','USDB'));
+ALTER TABLE p2p_wallet_entries DROP CONSTRAINT IF EXISTS p2p_wallet_entries_asset_check;
+ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','USDB'));
 `
 
 // ensureIDDefault (re)applies the DEXUSER_N default on users.id. Needed because
