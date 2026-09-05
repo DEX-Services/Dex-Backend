@@ -69,7 +69,18 @@ ON CONFLICT (login_id) DO NOTHING;
 
 // New connects to Postgres and ensures the auth schema exists.
 func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, connString)
+	// Explicitly cap pool size: three services share one Aiven Postgres
+	// instance with a hard 100-connection limit. Without an explicit
+	// MaxConns, pgxpool defaults to max(4, NumCPU()) per process, which is
+	// unbounded relative to the shared limit on larger deploy hosts.
+	// matching-engine caps at 20, bots at 10; backend (heaviest HTTP/auth
+	// traffic) gets 25, leaving headroom under the shared limit.
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = 25
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
