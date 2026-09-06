@@ -49,6 +49,20 @@ func main() {
 	adminRepo := repo.NewAdminRepo(pool)
 	p2pRepo := repo.NewP2PRepo(pool)
 	engineClient := engineclient.New()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := p2pRepo.ExpirePendingOrders(ctx, 100); err != nil && ctx.Err() == nil {
+					slog.Error("expire pending P2P orders failed", "err", err)
+				}
+			}
+		}
+	}()
 
 	srv := &api.Server{
 		Nonces:       auth.NewNonceStore(),
@@ -75,6 +89,7 @@ func main() {
 		Admin:         adminRepo,
 		Users:         userRepo,
 		Ledger:        ledgerRepo,
+		P2P:           p2pRepo,
 		EngineClient:  engineClient,
 		AdminLoginID:  os.Getenv("ADMIN_LOGIN_ID"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
@@ -134,6 +149,8 @@ func main() {
 	mux.HandleFunc("/admin/login", adminSrv.Login)
 	mux.HandleFunc("/admin/dashboard", adminSrv.Dashboard)
 	mux.HandleFunc("/admin/profile", adminSrv.Profile)
+	mux.HandleFunc("/admin/p2p/appeals", adminSrv.P2PAppeals)
+	mux.HandleFunc("/admin/p2p/proofs/download", adminSrv.P2PProofDownload)
 	mux.HandleFunc("/admin/users/search", adminSrv.SearchUsers)
 	mux.HandleFunc("/admin/users/balance", adminSrv.AdjustUserBalance)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
@@ -162,9 +179,17 @@ func main() {
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders/create", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
+	mux.HandleFunc("/p2p/order", p2pSrv.OrderDetail)
+	mux.HandleFunc("/p2p/payment-accounts", p2pSrv.PaymentAccounts)
+	mux.HandleFunc("/p2p/order/messages", p2pSrv.OrderMessages)
+	mux.HandleFunc("/p2p/order/proofs", p2pSrv.OrderProofs)
+	mux.HandleFunc("/p2p/order/proofs/download", p2pSrv.OrderProofDownload)
+	mux.HandleFunc("/p2p/order/events", p2pSrv.OrderEvents)
 	mux.HandleFunc("/p2p/orders/paid", p2pSrv.MarkPaid)
 	mux.HandleFunc("/p2p/orders/release", p2pSrv.ReleaseOrder)
 	mux.HandleFunc("/p2p/orders/cancel", p2pSrv.CancelOrder)
+	mux.HandleFunc("/p2p/orders/appeal", p2pSrv.AppealOrder)
+	mux.HandleFunc("/p2p/orders/appeal/cancel", p2pSrv.CancelAppeal)
 	mux.HandleFunc("/p2p/listings/cancel", p2pSrv.CancelListing)
 	mux.HandleFunc("/trade/order", tradeSrv.Order)
 	mux.HandleFunc("/trade/attached-order", tradeSrv.AttachedOrder)

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/engineclient"
@@ -21,6 +24,8 @@ type createListingRequest struct {
 	Asset          string   `json:"asset"`
 	Side           string   `json:"side"`
 	AmountRaw      string   `json:"amountRaw"`
+	MinOrderFiat   string   `json:"minOrderFiat"`
+	MaxOrderFiat   string   `json:"maxOrderFiat"`
 	PaymentMethods []string `json:"paymentMethods"`
 	Username       string   `json:"username"`
 }
@@ -43,6 +48,25 @@ type fundP2PWalletRequest struct {
 }
 type orderActionRequest struct {
 	OrderID string `json:"orderId"`
+	Reason  string `json:"reason"`
+}
+type paymentAccountRequest struct {
+	Method            string `json:"method"`
+	AccountName       string `json:"accountName"`
+	AccountIdentifier string `json:"accountIdentifier"`
+	Instructions      string `json:"instructions"`
+}
+type orderMessageRequest struct {
+	OrderID string `json:"orderId"`
+	Body    string `json:"body"`
+}
+type appealRequest struct {
+	OrderID string `json:"orderId"`
+	Reason  string `json:"reason"`
+}
+type markPaidRequest struct {
+	OrderID            string `json:"orderId"`
+	OwnAccountAttested bool   `json:"ownAccountAttested"`
 }
 
 func requirePost(w http.ResponseWriter, r *http.Request) bool {
@@ -155,7 +179,7 @@ func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 	if asset == "" {
 		asset = "USDB"
 	}
-	listing, err := s.P2P.CreateListingWithDetails(r.Context(), userID, req.Side, asset, req.AmountRaw, req.PaymentMethods, req.Username)
+	listing, err := s.P2P.CreateListingWithLimits(r.Context(), userID, req.Side, asset, req.AmountRaw, req.PaymentMethods, req.Username, req.MinOrderFiat, req.MaxOrderFiat)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -272,7 +296,24 @@ func (s *P2PServer) orderAction(w http.ResponseWriter, r *http.Request, action f
 }
 
 func (s *P2PServer) MarkPaid(w http.ResponseWriter, r *http.Request) {
-	s.orderAction(w, r, s.P2P.MarkPaid)
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req markPaidRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	order, err := s.P2P.MarkPaidWithAttestation(r.Context(), userID, req.OrderID, req.OwnAccountAttested)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
 }
 
 func (s *P2PServer) ReleaseOrder(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +321,214 @@ func (s *P2PServer) ReleaseOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *P2PServer) CancelOrder(w http.ResponseWriter, r *http.Request) {
-	s.orderAction(w, r, s.P2P.CancelOrder)
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req orderActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.OrderID) == "" {
+		writeError(w, http.StatusBadRequest, "orderId is required")
+		return
+	}
+	order, err := s.P2P.CancelOrderWithReason(r.Context(), userID, req.OrderID, req.Reason)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *P2PServer) OrderDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	orderID := strings.TrimSpace(r.URL.Query().Get("orderId"))
+	if orderID == "" {
+		writeError(w, http.StatusBadRequest, "orderId is required")
+		return
+	}
+	order, err := s.P2P.Order(r.Context(), userID, orderID)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *P2PServer) PaymentAccounts(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		accounts, err := s.P2P.PaymentAccounts(r.Context(), userID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load payment accounts")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
+		return
+	}
+	if !requirePost(w, r) {
+		return
+	}
+	var req paymentAccountRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	account, err := s.P2P.UpsertPaymentAccount(r.Context(), userID, req.Method, req.AccountName, req.AccountIdentifier, req.Instructions)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": account})
+}
+
+func (s *P2PServer) OrderMessages(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		orderID := strings.TrimSpace(r.URL.Query().Get("orderId"))
+		items, err := s.P2P.OrderMessages(r.Context(), userID, orderID)
+		if err != nil {
+			writeError(w, p2pErrorStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"messages": items})
+		return
+	}
+	if !requirePost(w, r) {
+		return
+	}
+	var req orderMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	item, err := s.P2P.AddOrderMessage(r.Context(), userID, req.OrderID, req.Body)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"message": item})
+}
+
+func (s *P2PServer) OrderProofs(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		orderID := strings.TrimSpace(r.URL.Query().Get("orderId"))
+		items, err := s.P2P.OrderProofs(r.Context(), userID, orderID)
+		if err != nil {
+			writeError(w, p2pErrorStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"proofs": items})
+		return
+	}
+	if !requirePost(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
+	if err := r.ParseMultipartForm(6 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "proof upload must be at most 5 MB")
+		return
+	}
+	orderID := strings.TrimSpace(r.FormValue("orderId"))
+	file, header, err := r.FormFile("proof")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "proof file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (5<<20)+1))
+	if err != nil || len(data) > 5<<20 {
+		writeError(w, http.StatusBadRequest, "proof upload must be at most 5 MB")
+		return
+	}
+	mimeType := http.DetectContentType(data)
+	proof, err := s.P2P.AddOrderProof(r.Context(), userID, orderID, filepath.Base(header.Filename), mimeType, data)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"proof": proof})
+}
+
+func (s *P2PServer) OrderProofDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	file, err := s.P2P.OrderProofFile(r.Context(), userID, strings.TrimSpace(r.URL.Query().Get("proofId")))
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", file.MimeType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(file.FileName)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(file.Data)
+}
+
+func (s *P2PServer) OrderEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	items, err := s.P2P.OrderEvents(r.Context(), userID, strings.TrimSpace(r.URL.Query().Get("orderId")))
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": items})
+}
+
+func (s *P2PServer) AppealOrder(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req appealRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	order, err := s.P2P.AppealOrder(r.Context(), userID, req.OrderID, req.Reason)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *P2PServer) CancelAppeal(w http.ResponseWriter, r *http.Request) {
+	s.orderAction(w, r, s.P2P.CancelAppeal)
 }
 
 func (s *P2PServer) Orders(w http.ResponseWriter, r *http.Request) {

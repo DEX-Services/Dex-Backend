@@ -151,14 +151,33 @@ CREATE TABLE IF NOT EXISTS p2p_listings (
 	fiat_currency TEXT NOT NULL DEFAULT 'INR', payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI', 'Bank Transfer', 'NEFT', 'IMPS')),
 	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
 	funding_source TEXT NOT NULL DEFAULT 'P2P_WALLET' CHECK (funding_source IN ('P2P_WALLET', 'MAIN_WALLET_LEGACY')),
+	fee_model TEXT NOT NULL DEFAULT 'USDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH')),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT 'SELL';
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS fee_model TEXT;
+UPDATE p2p_listings SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
+ALTER TABLE p2p_listings ALTER COLUMN fee_model SET DEFAULT 'USDB_1PCT_EACH';
+ALTER TABLE p2p_listings ALTER COLUMN fee_model SET NOT NULL;
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_fee_model_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH'));
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_side_check;
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_side_check CHECK (side IN ('BUY','SELL'));
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS payment_methods TEXT[];
 UPDATE p2p_listings SET payment_methods=ARRAY[payment_method] WHERE payment_methods IS NULL OR cardinality(payment_methods)=0;
 ALTER TABLE p2p_listings ALTER COLUMN payment_methods SET NOT NULL;
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS min_order_fiat NUMERIC(38,8);
+ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS max_order_fiat NUMERIC(38,8);
+UPDATE p2p_listings SET
+	min_order_fiat=COALESCE(min_order_fiat,LEAST(0.01,round((amount_raw/1000000)*price,2))),
+	max_order_fiat=COALESCE(max_order_fiat,round((amount_raw/1000000)*price,2));
+ALTER TABLE p2p_listings ALTER COLUMN min_order_fiat SET NOT NULL;
+ALTER TABLE p2p_listings ALTER COLUMN max_order_fiat SET NOT NULL;
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_order_limits_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_order_limits_check CHECK (
+	min_order_fiat > 0 AND max_order_fiat >= min_order_fiat
+	AND max_order_fiat <= round((amount_raw/1000000)*price,2)
+);
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_payment_method_check;
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS'));
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_payment_methods_check;
@@ -176,6 +195,11 @@ CREATE TABLE IF NOT EXISTS p2p_orders (
 	seller_fee NUMERIC(38,8) NOT NULL, buyer_payable NUMERIC(38,8) NOT NULL, seller_receivable NUMERIC(38,8) NOT NULL,
 	payment_method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending_payment',
 	escrow_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (escrow_raw >= 0),
+	buyer_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (buyer_fee_raw >= 0),
+	seller_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (seller_fee_raw >= 0),
+	buyer_credit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (buyer_credit_raw > 0),
+	seller_debit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (seller_debit_raw > 0),
+	fee_model TEXT NOT NULL DEFAULT 'USDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH')),
 	idempotency_key TEXT, expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
 	cancellation_reason TEXT, completed_at TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
@@ -201,7 +225,30 @@ ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS escrow_raw NUMERIC(38,0) NOT NUL
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes');
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancelled_by TEXT REFERENCES users(id) ON DELETE RESTRICT;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_account_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_account_identifier TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_instructions TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_marked_at TIMESTAMPTZ;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_own_account_attested BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS appeal_available_at TIMESTAMPTZ;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS appealed_by TEXT REFERENCES users(id) ON DELETE RESTRICT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS appeal_reason TEXT;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS appealed_at TIMESTAMPTZ;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_credit_raw NUMERIC(38,0);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS seller_debit_raw NUMERIC(38,0);
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS fee_model TEXT;
+UPDATE p2p_orders SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
+UPDATE p2p_orders SET buyer_credit_raw=COALESCE(buyer_credit_raw,amount_raw,buyer_credit),seller_debit_raw=COALESCE(seller_debit_raw,escrow_raw,amount_raw,seller_debit);
+ALTER TABLE p2p_orders ALTER COLUMN buyer_credit_raw SET NOT NULL;
+ALTER TABLE p2p_orders ALTER COLUMN seller_debit_raw SET NOT NULL;
+ALTER TABLE p2p_orders ALTER COLUMN fee_model SET DEFAULT 'USDB_1PCT_EACH';
+ALTER TABLE p2p_orders ALTER COLUMN fee_model SET NOT NULL;
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_fee_model_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH'));
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS taker_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
 UPDATE p2p_orders o SET taker_id=CASE WHEN l.side='BUY' THEN o.seller_id ELSE o.buyer_id END
 	FROM p2p_listings l WHERE o.listing_id=l.id AND o.taker_id IS NULL;
@@ -301,6 +348,70 @@ ALTER TABLE p2p_wallet_balances DROP CONSTRAINT IF EXISTS p2p_wallet_balances_as
 ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','USDB'));
 ALTER TABLE p2p_wallet_entries DROP CONSTRAINT IF EXISTS p2p_wallet_entries_asset_check;
 ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','USDB'));
+
+-- System-owned fee wallet. It deliberately has no user_id: customers cannot
+-- authenticate as or spend from this account through the P2P wallet APIs.
+CREATE TABLE IF NOT EXISTS p2p_admin_wallet_balances (
+	asset TEXT PRIMARY KEY CHECK (asset = 'USDB'),
+	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO p2p_admin_wallet_balances(asset) VALUES('USDB') ON CONFLICT(asset) DO NOTHING;
+CREATE TABLE IF NOT EXISTS p2p_admin_wallet_entries (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
+	asset TEXT NOT NULL CHECK (asset = 'USDB'),
+	buyer_fee_raw NUMERIC(38,0) NOT NULL CHECK (buyer_fee_raw >= 0),
+	seller_fee_raw NUMERIC(38,0) NOT NULL CHECK (seller_fee_raw >= 0),
+	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	UNIQUE(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS p2p_payment_accounts (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	method TEXT NOT NULL CHECK (method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS')),
+	account_name TEXT NOT NULL CHECK (char_length(account_name) BETWEEN 2 AND 100),
+	account_identifier TEXT NOT NULL CHECK (char_length(account_identifier) BETWEEN 2 AND 200),
+	instructions TEXT NOT NULL DEFAULT '' CHECK (char_length(instructions) <= 500),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	UNIQUE(user_id,method)
+);
+
+CREATE TABLE IF NOT EXISTS p2p_order_proofs (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
+	uploader_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+	file_name TEXT NOT NULL,
+	mime_type TEXT NOT NULL CHECK (mime_type IN ('image/jpeg','image/png','image/webp','application/pdf')),
+	file_data BYTEA NOT NULL,
+	size_bytes BIGINT NOT NULL CHECK (size_bytes > 0 AND size_bytes <= 5242880),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_order_proofs_order ON p2p_order_proofs(order_id,created_at);
+
+CREATE TABLE IF NOT EXISTS p2p_order_messages (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
+	sender_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+	body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 1000),
+	is_system BOOLEAN NOT NULL DEFAULT false,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_order_messages_order ON p2p_order_messages(order_id,created_at);
+
+CREATE TABLE IF NOT EXISTS p2p_order_events (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
+	actor_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+	kind TEXT NOT NULL,
+	metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_order_events_order ON p2p_order_events(order_id,created_at);
 `
 
 // ensureIDDefault (re)applies the DEXUSER_N default on users.id. Needed because

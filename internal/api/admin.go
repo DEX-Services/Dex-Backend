@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -66,9 +67,15 @@ type AdminServer struct {
 	Admin         *repo.AdminRepo
 	Users         *repo.UserRepo
 	Ledger        *repo.LedgerRepo
+	P2P           *repo.P2PRepo
 	EngineClient  *engineclient.Client
 	AdminLoginID  string
 	AdminPassword string
+}
+
+type adminP2PResolutionRequest struct {
+	OrderID    string `json:"orderId"`
+	Resolution string `json:"resolution"`
 }
 
 const adminLoginID = "admin"
@@ -129,6 +136,76 @@ func (s *AdminServer) Dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, summary)
+}
+
+func (s *AdminServer) P2PAppeals(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method == http.MethodGet {
+		orderID := strings.TrimSpace(r.URL.Query().Get("orderId"))
+		if orderID == "" {
+			orders, err := s.P2P.AppealedOrders(r.Context())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "could not load P2P appeals")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"orders": orders})
+			return
+		}
+		proofs, err := s.P2P.AdminOrderProofs(r.Context(), orderID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load appeal proofs")
+			return
+		}
+		messages, err := s.P2P.AdminOrderMessages(r.Context(), orderID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load appeal messages")
+			return
+		}
+		events, err := s.P2P.AdminOrderEvents(r.Context(), orderID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load appeal events")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"proofs": proofs, "messages": messages, "events": events})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req adminP2PResolutionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	order, err := s.P2P.ResolveAppeal(r.Context(), req.OrderID, req.Resolution)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+func (s *AdminServer) P2PProofDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	file, err := s.P2P.AdminOrderProofFile(r.Context(), strings.TrimSpace(r.URL.Query().Get("proofId")))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", file.MimeType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(file.FileName)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(file.Data)
 }
 
 func (s *AdminServer) Profile(w http.ResponseWriter, r *http.Request) {

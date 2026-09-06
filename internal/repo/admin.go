@@ -52,8 +52,9 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 			(SELECT COUNT(*) FROM user_sessions WHERE logout_at IS NULL),
 			(SELECT COUNT(*) FROM ledger_entries),
 			(SELECT COALESCE(SUM(amount), 0)::text FROM ledger_entries WHERE status = 'confirmed' AND kind = 'deposit'),
-			(SELECT COUNT(*) FROM ledger_entries WHERE kind = 'withdrawal_request' AND status IN ('pending', 'processing'))`).
-		Scan(&s.TotalUsers, &s.ActiveUsers24h, &s.OpenSessions, &s.TotalLedgerEntries, &s.ConfirmedLedgerRaw, &s.PendingWithdrawals); err != nil {
+			(SELECT COUNT(*) FROM ledger_entries WHERE kind = 'withdrawal_request' AND status IN ('pending', 'processing')),
+			(SELECT COALESCE((SELECT available_raw FROM p2p_admin_wallet_balances WHERE asset='USDB'), 0)::text)`).
+		Scan(&s.TotalUsers, &s.ActiveUsers24h, &s.OpenSessions, &s.TotalLedgerEntries, &s.ConfirmedLedgerRaw, &s.PendingWithdrawals, &s.P2PFeeWalletRaw); err != nil {
 		return s, err
 	}
 

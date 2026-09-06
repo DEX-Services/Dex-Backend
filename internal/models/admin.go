@@ -18,6 +18,7 @@ type AdminSummary struct {
 	TotalLedgerEntries  int64              `json:"totalLedgerEntries"`
 	ConfirmedLedgerRaw  string             `json:"confirmedLedgerRaw"`
 	PendingWithdrawals  int64              `json:"pendingWithdrawals"`
+	P2PFeeWalletRaw     string             `json:"p2pFeeWalletRaw"`
 	TotalBalances       []AdminTokenTotal  `json:"totalBalances"`
 	TopUsers            []AdminTopUser     `json:"topUsers"`
 	RecentLedgerEntries []AdminLedgerEntry `json:"recentLedgerEntries"`
