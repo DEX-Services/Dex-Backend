@@ -146,6 +146,7 @@ func main() {
 	mux.HandleFunc("/internal/balance/unlock", walletSrv.InternalUnlockBalance)
 	mux.HandleFunc("/internal/balance/replace-locks", walletSrv.InternalReplaceLocks)
 	mux.HandleFunc("/internal/balance/release-locks", walletSrv.InternalReleaseLocks)
+	mux.HandleFunc("/internal/balance/available", walletSrv.InternalAvailableBalance)
 	mux.HandleFunc("/internal/balance/reset", walletSrv.InternalResetBalance)
 	mux.HandleFunc("/internal/balance/sync", walletSrv.InternalSyncBalance)
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)

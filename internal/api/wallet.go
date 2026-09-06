@@ -612,6 +612,62 @@ func (s *WalletServer) InternalReleaseLocks(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]string{"status": "locks released"})
 }
 
+// InternalAvailableBalance: GET /internal/balance/available?userId=&asset=
+// returns one account's true Postgres available balance (total minus
+// locked) for one asset, in human units. Used by the bots service's
+// recreditDesk to resync the matching engine's in-memory ledger to what the
+// account can actually spend right now — after ReleaseLocks, that's the
+// account's real total, which is not always the same as a desk's tracked
+// quote_amount/base_amount config (those reflect admin deposits/withdrawals
+// only; they never move when trading P&L consumes or adds to the wallet's
+// real balance, so trusting them instead of asking Postgres directly can
+// resync the engine to a stale/wrong figure — see recreditDesk's comment).
+func (s *WalletServer) InternalAvailableBalance(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	userID := strings.TrimSpace(r.URL.Query().Get("userId"))
+	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
+	if userID == "" || asset == "" {
+		writeError(w, http.StatusBadRequest, "userId and asset are required")
+		return
+	}
+	balances, err := s.Ledger.BalancesFor(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load balance: "+err.Error())
+		return
+	}
+	locked, err := s.Ledger.LockedBalancesFor(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load locked balance: "+err.Error())
+		return
+	}
+	rawTotal, ok := balances[asset]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unsupported asset "+asset)
+		return
+	}
+	total, ok := new(big.Int).SetString(rawTotal, 10)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid balance amount")
+		return
+	}
+	lockedAmt, ok := new(big.Int).SetString(locked[asset], 10)
+	if !ok {
+		lockedAmt = big.NewInt(0)
+	}
+	available := new(big.Int).Sub(total, lockedAmt)
+	if available.Sign() < 0 {
+		available = big.NewInt(0)
+	}
+	humanAvailable, err := rawToHumanUnits(available.String())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "convert balance: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"userId": userID, "asset": asset, "available": humanAvailable})
+}
+
 // InternalResetBalance reclaims an internal desk wallet during desk deletion.
 func (s *WalletServer) InternalResetBalance(w http.ResponseWriter, r *http.Request) {
 	if !s.checkEngineSecret(w, r) {
