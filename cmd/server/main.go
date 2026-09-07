@@ -142,6 +142,18 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			slog.Error("healthz: postgres ping failed", "err", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"unhealthy"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
 	mux.HandleFunc("/auth/nonce", srv.Nonce)
 	mux.HandleFunc("/auth/login", srv.Login)
 	mux.HandleFunc("/auth/logout", srv.Logout)
