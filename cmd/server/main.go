@@ -214,10 +214,6 @@ func main() {
 	mux.HandleFunc("/trade/pnl-history", tradeSrv.PnlHistory)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
 	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
 
 	origin := os.Getenv("CORS_ORIGIN")
 	if origin == "" {
