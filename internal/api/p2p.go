@@ -54,6 +54,8 @@ type paymentAccountRequest struct {
 	Method            string `json:"method"`
 	AccountName       string `json:"accountName"`
 	AccountIdentifier string `json:"accountIdentifier"`
+	BankName          string `json:"bankName"`
+	IFSCCode          string `json:"ifscCode"`
 	Instructions      string `json:"instructions"`
 }
 type orderMessageRequest struct {
@@ -385,7 +387,7 @@ func (s *P2PServer) PaymentAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	account, err := s.P2P.UpsertPaymentAccount(r.Context(), userID, req.Method, req.AccountName, req.AccountIdentifier, req.Instructions)
+	account, err := s.P2P.UpsertPaymentAccount(r.Context(), userID, req.Method, req.AccountName, req.AccountIdentifier, req.Instructions, req.BankName, req.IFSCCode)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

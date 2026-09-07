@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 )
 
 const p2pMaxProofBytes = 5 * 1024 * 1024
+
+var ifscPattern = regexp.MustCompile(`^[A-Z]{4}0[A-Z0-9]{6}$`)
 
 func (r *P2PRepo) Order(ctx context.Context, userID, orderID string) (*models.P2POrder, error) {
 	if err := r.ExpirePendingOrders(ctx, 50); err != nil {
@@ -25,7 +28,7 @@ func (r *P2PRepo) Order(ctx context.Context, userID, orderID string) (*models.P2
 }
 
 func (r *P2PRepo) PaymentAccounts(ctx context.Context, userID string) ([]models.P2PPaymentAccount, error) {
-	rows, err := r.pool.Query(ctx, `SELECT id::text,method,account_name,account_identifier,instructions,created_at,updated_at FROM p2p_payment_accounts WHERE user_id=$1 ORDER BY method`, userID)
+	rows, err := r.pool.Query(ctx, `SELECT id::text,method,account_name,account_identifier,bank_name,ifsc_code,instructions,created_at,updated_at FROM p2p_payment_accounts WHERE user_id=$1 ORDER BY method`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +36,7 @@ func (r *P2PRepo) PaymentAccounts(ctx context.Context, userID string) ([]models.
 	out := []models.P2PPaymentAccount{}
 	for rows.Next() {
 		var account models.P2PPaymentAccount
-		if err = rows.Scan(&account.ID, &account.Method, &account.AccountName, &account.AccountIdentifier, &account.Instructions, &account.CreatedAt, &account.UpdatedAt); err != nil {
+		if err = rows.Scan(&account.ID, &account.Method, &account.AccountName, &account.AccountIdentifier, &account.BankName, &account.IFSCCode, &account.Instructions, &account.CreatedAt, &account.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, account)
@@ -41,12 +44,13 @@ func (r *P2PRepo) PaymentAccounts(ctx context.Context, userID string) ([]models.
 	return out, rows.Err()
 }
 
-func (r *P2PRepo) UpsertPaymentAccount(ctx context.Context, userID, method, name, identifier, instructions string) (*models.P2PPaymentAccount, error) {
+func (r *P2PRepo) UpsertPaymentAccount(ctx context.Context, userID, method, name, identifier, instructions, bankName, ifscCode string) (*models.P2PPaymentAccount, error) {
 	methods, err := normalizePaymentMethods([]string{method})
 	if err != nil {
 		return nil, err
 	}
 	name, identifier, instructions = strings.TrimSpace(name), strings.TrimSpace(identifier), strings.TrimSpace(instructions)
+	bankName, ifscCode = strings.TrimSpace(bankName), strings.ToUpper(strings.TrimSpace(ifscCode))
 	if len(name) < 2 || len(name) > 100 {
 		return nil, fmt.Errorf("account name must be 2-100 characters")
 	}
@@ -56,8 +60,19 @@ func (r *P2PRepo) UpsertPaymentAccount(ctx context.Context, userID, method, name
 	if len(instructions) > 500 {
 		return nil, fmt.Errorf("payment instructions must be at most 500 characters")
 	}
+	bankMethod := methods[0] == "Bank Transfer" || methods[0] == "NEFT" || methods[0] == "IMPS"
+	if bankMethod {
+		if len(bankName) < 2 || len(bankName) > 100 {
+			return nil, fmt.Errorf("bank name must be 2-100 characters")
+		}
+		if !ifscPattern.MatchString(ifscCode) {
+			return nil, fmt.Errorf("enter a valid 11-character IFSC code")
+		}
+	} else {
+		bankName, ifscCode = "", ""
+	}
 	var account models.P2PPaymentAccount
-	err = r.pool.QueryRow(ctx, `INSERT INTO p2p_payment_accounts(user_id,method,account_name,account_identifier,instructions) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id,method) DO UPDATE SET account_name=EXCLUDED.account_name,account_identifier=EXCLUDED.account_identifier,instructions=EXCLUDED.instructions,updated_at=now() RETURNING id::text,method,account_name,account_identifier,instructions,created_at,updated_at`, userID, methods[0], name, identifier, instructions).Scan(&account.ID, &account.Method, &account.AccountName, &account.AccountIdentifier, &account.Instructions, &account.CreatedAt, &account.UpdatedAt)
+	err = r.pool.QueryRow(ctx, `INSERT INTO p2p_payment_accounts(user_id,method,account_name,account_identifier,bank_name,ifsc_code,instructions) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(user_id,method) DO UPDATE SET account_name=EXCLUDED.account_name,account_identifier=EXCLUDED.account_identifier,bank_name=EXCLUDED.bank_name,ifsc_code=EXCLUDED.ifsc_code,instructions=EXCLUDED.instructions,updated_at=now() RETURNING id::text,method,account_name,account_identifier,bank_name,ifsc_code,instructions,created_at,updated_at`, userID, methods[0], name, identifier, bankName, ifscCode, instructions).Scan(&account.ID, &account.Method, &account.AccountName, &account.AccountIdentifier, &account.BankName, &account.IFSCCode, &account.Instructions, &account.CreatedAt, &account.UpdatedAt)
 	return &account, err
 }
 

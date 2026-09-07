@@ -229,6 +229,8 @@ ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS cancelled_by TEXT REFERENCES use
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_account_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_account_identifier TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_bank_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_ifsc_code TEXT NOT NULL DEFAULT '';
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_instructions TEXT NOT NULL DEFAULT '';
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS payment_marked_at TIMESTAMPTZ;
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS buyer_own_account_attested BOOLEAN NOT NULL DEFAULT false;
@@ -375,10 +377,21 @@ CREATE TABLE IF NOT EXISTS p2p_payment_accounts (
 	method TEXT NOT NULL CHECK (method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS')),
 	account_name TEXT NOT NULL CHECK (char_length(account_name) BETWEEN 2 AND 100),
 	account_identifier TEXT NOT NULL CHECK (char_length(account_identifier) BETWEEN 2 AND 200),
+	bank_name TEXT NOT NULL DEFAULT '',
+	ifsc_code TEXT NOT NULL DEFAULT '',
 	instructions TEXT NOT NULL DEFAULT '' CHECK (char_length(instructions) <= 500),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	UNIQUE(user_id,method)
+);
+ALTER TABLE p2p_payment_accounts ADD COLUMN IF NOT EXISTS bank_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_payment_accounts ADD COLUMN IF NOT EXISTS ifsc_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_payment_accounts DROP CONSTRAINT IF EXISTS p2p_payment_accounts_bank_details_check;
+ALTER TABLE p2p_payment_accounts ADD CONSTRAINT p2p_payment_accounts_bank_details_check CHECK (
+	method NOT IN ('Bank Transfer','NEFT','IMPS') OR (
+		char_length(bank_name) BETWEEN 2 AND 100
+		AND ifsc_code ~ '^[A-Z]{4}0[A-Z0-9]{6}$'
+	)
 );
 
 CREATE TABLE IF NOT EXISTS p2p_order_proofs (

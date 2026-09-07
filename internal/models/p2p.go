@@ -57,6 +57,8 @@ type P2POrder struct {
 	PaymentMethod           string     `json:"paymentMethod"`
 	PaymentAccountName      string     `json:"paymentAccountName"`
 	PaymentAccountID        string     `json:"paymentAccountIdentifier"`
+	PaymentBankName         string     `json:"paymentBankName,omitempty"`
+	PaymentIFSCCode         string     `json:"paymentIfscCode,omitempty"`
 	PaymentInstructions     string     `json:"paymentInstructions,omitempty"`
 	Status                  string     `json:"status"`
 	ExpiresAt               time.Time  `json:"expiresAt"`
@@ -82,6 +84,8 @@ type P2PPaymentAccount struct {
 	Method            string    `json:"method"`
 	AccountName       string    `json:"accountName"`
 	AccountIdentifier string    `json:"accountIdentifier"`
+	BankName          string    `json:"bankName,omitempty"`
+	IFSCCode          string    `json:"ifscCode,omitempty"`
 	Instructions      string    `json:"instructions,omitempty"`
 	CreatedAt         time.Time `json:"createdAt"`
 	UpdatedAt         time.Time `json:"updatedAt"`

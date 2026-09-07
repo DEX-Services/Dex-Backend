@@ -47,7 +47,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	if _, err = p2p.EstablishP2PUsername(ctx, sellerID, "seller_success"); err != nil {
 		t.Fatalf("establish seller username: %v", err)
 	}
-	if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Seller Success", "seller@upi", ""); err != nil {
+	if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Seller Success", "seller@upi", "", "", ""); err != nil {
 		t.Fatalf("configure seller payment account: %v", err)
 	}
 	listing, err := p2p.CreateListing(ctx, sellerID, "20000000", "UPI")
@@ -183,8 +183,15 @@ func TestP2PWalletUSDBEscrowSuccess(t *testing.T) {
 	if _, err = p2p.EstablishP2PUsername(ctx, sellerID, "seller_usdb"); err != nil {
 		t.Fatalf("establish seller username: %v", err)
 	}
+	if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, "Bank Transfer", "Seller USDB", "payment-id", "", "", ""); err == nil {
+		t.Fatal("expected bank name and IFSC to be required for Bank Transfer")
+	}
 	for _, method := range []string{"UPI", "Bank Transfer", "MPESN", "NEFT", "IMPS"} {
-		if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, method, "Seller USDB", "payment-id", ""); err != nil {
+		bankName, ifscCode := "", ""
+		if method == "Bank Transfer" || method == "NEFT" || method == "IMPS" {
+			bankName, ifscCode = "Test Bank", "TEST0123456"
+		}
+		if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, method, "Seller USDB", "payment-id", "", bankName, ifscCode); err != nil {
 			t.Fatalf("configure %s account: %v", method, err)
 		}
 	}
@@ -197,12 +204,15 @@ func TestP2PWalletUSDBEscrowSuccess(t *testing.T) {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM p2p_listings WHERE id=$1`, listing.ID)
 	})
 
-	order, err := p2p.CreateOrder(ctx, buyerID, listing.ID, "10000000", "order-usdb-success")
+	order, err := p2p.CreateOrderWithPayment(ctx, buyerID, listing.ID, "10000000", "Bank Transfer", "order-usdb-success")
 	if err != nil {
 		t.Fatalf("create USDB order: %v", err)
 	}
 	if order.Asset != "USDB" || order.EscrowRaw != "10100000" {
 		t.Fatalf("USDB order asset/escrow = %s/%s", order.Asset, order.EscrowRaw)
+	}
+	if order.PaymentBankName != "Test Bank" || order.PaymentIFSCCode != "TEST0123456" {
+		t.Fatalf("bank snapshot = %q/%q", order.PaymentBankName, order.PaymentIFSCCode)
 	}
 	if _, err = p2p.AddOrderProof(ctx, buyerID, order.ID, "proof.png", "image/png", []byte("proof")); err != nil {
 		t.Fatalf("upload USDB payment proof: %v", err)
@@ -243,7 +253,11 @@ func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
 		t.Fatalf("establish creator username: %v", err)
 	}
 	for _, method := range []string{"UPI", "Bank Transfer"} {
-		if _, err := p2p.UpsertPaymentAccount(ctx, takerSellerID, method, "Taker Seller", "payment-id", ""); err != nil {
+		bankName, ifscCode := "", ""
+		if method == "Bank Transfer" || method == "NEFT" || method == "IMPS" {
+			bankName, ifscCode = "Test Bank", "TEST0123456"
+		}
+		if _, err := p2p.UpsertPaymentAccount(ctx, takerSellerID, method, "Taker Seller", "payment-id", "", bankName, ifscCode); err != nil {
 			t.Fatalf("configure taker %s account: %v", method, err)
 		}
 	}
@@ -323,7 +337,7 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	if _, err := p2p.EstablishP2PUsername(ctx, buyerID, "workflow_buyer"); err != nil {
 		t.Fatalf("establish buyer username: %v", err)
 	}
-	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Original Seller", "original@upi", "Pay once"); err != nil {
+	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Original Seller", "original@upi", "Pay once", "", ""); err != nil {
 		t.Fatalf("configure seller payment account: %v", err)
 	}
 
@@ -343,7 +357,7 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	if releaseOrder.PaymentAccountName != "Original Seller" || releaseOrder.PaymentAccountID != "original@upi" {
 		t.Fatalf("payment snapshot = %q/%q", releaseOrder.PaymentAccountName, releaseOrder.PaymentAccountID)
 	}
-	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Updated Seller", "updated@upi", "Updated"); err != nil {
+	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Updated Seller", "updated@upi", "Updated", "", ""); err != nil {
 		t.Fatalf("update seller payment account: %v", err)
 	}
 	snapshot, err := p2p.Order(ctx, buyerID, releaseOrder.ID)
@@ -450,7 +464,7 @@ func TestP2PListingLimitsAndAdvertiserStatistics(t *testing.T) {
 	if _, err := p2p.EstablishP2PUsername(ctx, sellerID, "limits_seller"); err != nil {
 		t.Fatalf("establish seller username: %v", err)
 	}
-	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Limits Seller", "limits@upi", ""); err != nil {
+	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Limits Seller", "limits@upi", "", "", ""); err != nil {
 		t.Fatalf("configure payment account: %v", err)
 	}
 	listing, err := p2p.CreateListingWithLimits(ctx, sellerID, "SELL", "USDB", "10000000", []string{"UPI"}, "", "200.00", "500.00")

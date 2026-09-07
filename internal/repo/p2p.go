@@ -81,9 +81,6 @@ func validateP2PAmount(raw string) error {
 	if !ok || n.Sign() <= 0 {
 		return fmt.Errorf("amount must be a positive raw asset integer")
 	}
-	if new(big.Int).Mod(n, big.NewInt(10_000)).Sign() != 0 {
-		return fmt.Errorf("USDB amounts support exactly two displayed decimal places")
-	}
 	return nil
 }
 
@@ -131,9 +128,8 @@ func validateP2POrderLimits(amountRaw, price, minOrderFiat, maxOrderFiat string)
 	return minOrderFiat, maxOrderFiat, nil
 }
 
-// p2pUSDBSettlement returns the exact raw-unit movements for the 1% fee on
-// each side. P2P amounts are constrained to two displayed decimals, so the
-// division is exact at USDB's six-decimal raw scale.
+// p2pUSDBSettlement returns raw-unit movements for the 1% fee on each side.
+// Any fraction smaller than one raw USDB unit is rounded down.
 func p2pUSDBSettlement(amountRaw string) (feeRaw, buyerCreditRaw, sellerDebitRaw string, err error) {
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok || amount.Sign() <= 0 {
@@ -501,11 +497,11 @@ func (r *P2PRepo) Listings(ctx context.Context, sellerID string, activeOnly bool
 	return out, rows.Err()
 }
 
-const orderSelect = `SELECT id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at FROM p2p_orders`
+const orderSelect = `SELECT id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at FROM p2p_orders`
 
 func scanOrder(row pgx.Row) (*models.P2POrder, error) {
 	var o models.P2POrder
-	err := row.Scan(&o.ID, &o.ListingID, &o.SellerID, &o.BuyerID, &o.Asset, &o.AmountRaw, &o.EscrowRaw, &o.Price, &o.FiatCurrency, &o.GrossAmount, &o.BuyerFee, &o.SellerFee, &o.BuyerPayable, &o.SellerReceivable, &o.BuyerFeeRaw, &o.SellerFeeRaw, &o.BuyerCreditRaw, &o.SellerDebitRaw, &o.PaymentMethod, &o.PaymentAccountName, &o.PaymentAccountID, &o.PaymentInstructions, &o.Status, &o.ExpiresAt, &o.PaymentMarkedAt, &o.BuyerOwnAccountAttested, &o.AppealAvailableAt, &o.AppealedBy, &o.AppealReason, &o.AppealedAt, &o.UpdatedAt, &o.CancellationReason, &o.CompletedAt, &o.CreatedAt)
+	err := row.Scan(&o.ID, &o.ListingID, &o.SellerID, &o.BuyerID, &o.Asset, &o.AmountRaw, &o.EscrowRaw, &o.Price, &o.FiatCurrency, &o.GrossAmount, &o.BuyerFee, &o.SellerFee, &o.BuyerPayable, &o.SellerReceivable, &o.BuyerFeeRaw, &o.SellerFeeRaw, &o.BuyerCreditRaw, &o.SellerDebitRaw, &o.PaymentMethod, &o.PaymentAccountName, &o.PaymentAccountID, &o.PaymentBankName, &o.PaymentIFSCCode, &o.PaymentInstructions, &o.Status, &o.ExpiresAt, &o.PaymentMarkedAt, &o.BuyerOwnAccountAttested, &o.AppealAvailableAt, &o.AppealedBy, &o.AppealReason, &o.AppealedAt, &o.UpdatedAt, &o.CancellationReason, &o.CompletedAt, &o.CreatedAt)
 	return &o, err
 }
 
@@ -601,8 +597,8 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	if side == "BUY" {
 		sellerID, buyerID = takerID, creatorID
 	}
-	var paymentAccountName, paymentAccountID, paymentInstructions string
-	if err = tx.QueryRow(ctx, `SELECT account_name,account_identifier,instructions FROM p2p_payment_accounts WHERE user_id=$1 AND method=$2`, sellerID, selectedMethod).Scan(&paymentAccountName, &paymentAccountID, &paymentInstructions); err == pgx.ErrNoRows {
+	var paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions string
+	if err = tx.QueryRow(ctx, `SELECT account_name,account_identifier,bank_name,ifsc_code,instructions FROM p2p_payment_accounts WHERE user_id=$1 AND method=$2`, sellerID, selectedMethod).Scan(&paymentAccountName, &paymentAccountID, &paymentBankName, &paymentIFSCCode, &paymentInstructions); err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("%w: %s", ErrP2PPaymentAccount, selectedMethod)
 	} else if err != nil {
 		return nil, err
@@ -661,7 +657,7 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	if _, err = tx.Exec(ctx, `UPDATE p2p_listings SET remaining_raw=remaining_raw-$2::numeric,status=CASE WHEN remaining_raw-$2::numeric=0 THEN 'FILLED' ELSE status END,updated_at=now() WHERE id=$1`, listingID, amountRaw); err != nil {
 		return nil, err
 	}
-	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, selectedMethod, paymentAccountName, paymentAccountID, paymentInstructions, key)
+	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, selectedMethod, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key)
 	if err != nil {
 		return nil, err
 	}
@@ -685,16 +681,16 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	return order, nil
 }
 
-func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentInstructions, key string) (*models.P2POrder, error) {
+func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key string) (*models.P2POrder, error) {
 	var dbKey any
 	if key != "" {
 		dbKey = key
 	}
 	q := `WITH amounts AS (SELECT round(($6::numeric/1000000)*$11::numeric,8) AS gross)
-	INSERT INTO p2p_orders(listing_id,seller_id,buyer_id,taker_id,asset,amount_raw,escrow_raw,price,fiat_currency,gross_amount,buyer_fee,seller_fee,buyer_payable,seller_receivable,buyer_fee_raw,seller_fee_raw,buyer_credit_raw,seller_debit_raw,fee_model,payment_method,payment_account_name,payment_account_identifier,payment_instructions,buyer_credit,seller_debit,fiat_amount,buyer_fee_fiat,seller_fee_fiat,buyer_pays_fiat,seller_receives_fiat,status,idempotency_key,expires_at)
-	SELECT $1,$2,$3,$4,$5,$6,$9,$11,$12,gross,0,0,gross,gross,$7,$7,$8,$9,$10,$13,$14,$15,$16,$8,$9,gross,0,0,gross,gross,'pending_payment',$17,$18 FROM amounts
-	RETURNING id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at`
-	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentInstructions, dbKey, time.Now().Add(15*time.Minute)))
+	INSERT INTO p2p_orders(listing_id,seller_id,buyer_id,taker_id,asset,amount_raw,escrow_raw,price,fiat_currency,gross_amount,buyer_fee,seller_fee,buyer_payable,seller_receivable,buyer_fee_raw,seller_fee_raw,buyer_credit_raw,seller_debit_raw,fee_model,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,buyer_credit,seller_debit,fiat_amount,buyer_fee_fiat,seller_fee_fiat,buyer_pays_fiat,seller_receives_fiat,status,idempotency_key,expires_at)
+	SELECT $1,$2,$3,$4,$5,$6,$9,$11,$12,gross,0,0,gross,gross,$7,$7,$8,$9,$10,$13,$14,$15,$16,$17,$18,$8,$9,gross,0,0,gross,gross,'pending_payment',$19,$20 FROM amounts
+	RETURNING id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at`
+	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, dbKey, time.Now().Add(15*time.Minute)))
 }
 
 func (r *P2PRepo) Orders(ctx context.Context, userID string) ([]models.P2POrder, error) {
