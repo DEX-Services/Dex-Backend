@@ -440,7 +440,7 @@ ALTER TABLE users
 	DROP COLUMN IF EXISTS "USDT",
 	DROP COLUMN IF EXISTS "DUSD",
 	DROP COLUMN IF EXISTS "BUSD",
-	DROP COLUMN IF EXISTS "OUR_Token";
+	DROP COLUMN IF EXISTS "BI";
 
 CREATE TABLE IF NOT EXISTS user_balances (
 	balance_id BIGSERIAL PRIMARY KEY,
@@ -448,7 +448,7 @@ CREATE TABLE IF NOT EXISTS user_balances (
 	"USDC" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	"USDT" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	"BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0,
-	"OUR_Token" NUMERIC(38,0) NOT NULL DEFAULT 0,
+	"BI" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -458,12 +458,12 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC" NUMERIC(38,0) NOT NULL
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BTC" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BTC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
@@ -513,7 +513,7 @@ BEGIN
 			SET "USDC" = migrated.usdc,
 				"USDT" = migrated.usdt,
 				"BUSD" = migrated.busd,
-				"OUR_Token" = migrated.our_token,
+				"BI" = migrated.our_token,
 				created_at = migrated.created_at,
 				updated_at = migrated.updated_at
 			FROM migrated
@@ -558,7 +558,7 @@ BEGIN
 		WHERE busd.table_schema = 'public'
 			AND busd.table_name = 'user_balances'
 			AND busd.column_name = 'BUSD'
-			AND own_token.column_name = 'OUR_Token'
+			AND own_token.column_name = 'BI'
 	) THEN
 		DROP TABLE IF EXISTS user_balances_reordered;
 		CREATE TABLE user_balances_reordered (
@@ -568,19 +568,19 @@ BEGIN
 			"USDC" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"USDT" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"OUR_Token" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"BI" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"BTC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			"BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"OUR_Token_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
+			"BI_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 
 		INSERT INTO user_balances_reordered
-			(balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "OUR_Token", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "OUR_Token_locked", created_at, updated_at)
-		SELECT balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "OUR_Token", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "OUR_Token_locked", created_at, updated_at
+			(balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "BI", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "BI_locked", created_at, updated_at)
+		SELECT balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "BI", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "BI_locked", created_at, updated_at
 		FROM user_balances;
 
 		SELECT EXISTS (SELECT 1 FROM user_balances_reordered) INTO has_rows;
