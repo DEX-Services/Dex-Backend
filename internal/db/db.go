@@ -438,8 +438,6 @@ const ensureUserBalancesTable = `
 ALTER TABLE users
 	DROP COLUMN IF EXISTS "USDC",
 	DROP COLUMN IF EXISTS "USDT",
-	DROP COLUMN IF EXISTS "DUSD",
-	DROP COLUMN IF EXISTS "BUSD",
 	DROP COLUMN IF EXISTS "BI";
 
 CREATE TABLE IF NOT EXISTS user_balances (
@@ -515,7 +513,7 @@ BEGIN
 					MIN(balance_id) AS keep_id,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDC' THEN total ELSE 0 END), 0) AS usdc,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDT' THEN total ELSE 0 END), 0) AS usdt,
-					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('BIUSD', 'BUSD', 'DUSD') THEN total ELSE 0 END), 0) AS biusd,
+					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'BIUSD' THEN total ELSE 0 END), 0) AS biusd,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('OUR_TOKEN', 'OURTOKEN') THEN total ELSE 0 END), 0) AS our_token,
 					MIN(updated_at) AS created_at,
 					MAX(updated_at) AS updated_at
@@ -548,19 +546,6 @@ BEGIN
 	END IF;
 END $wallet$;
 
--- Legacy DUSD fold: any pre-BIUSD-era DUSD column is merged into BIUSD (the
--- platform's current stable-quote balance) rather than the now-removed BUSD
--- column.
-DO $asset_rename$
-BEGIN
-	IF EXISTS (
-		SELECT 1 FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'DUSD'
-	) THEN
-		UPDATE user_balances SET "BIUSD" = "BIUSD" + "DUSD";
-		ALTER TABLE user_balances DROP COLUMN "DUSD";
-	END IF;
-END $asset_rename$;
 CREATE UNIQUE INDEX IF NOT EXISTS user_balances_user_id_uidx ON user_balances (user_id);
 
 DO $wallet$
