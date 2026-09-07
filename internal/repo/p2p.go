@@ -23,7 +23,7 @@ const (
 	p2pFundingWallet        = "P2P_WALLET"
 	p2pFundingLegacyMain    = "MAIN_WALLET_LEGACY"
 	p2pFeeModelLegacy       = "LEGACY_FIAT"
-	p2pFeeModelUSDB         = "USDB_1PCT_EACH"
+	p2pFeeModelBIUSD         = "BIUSD_1PCT_EACH"
 )
 
 var (
@@ -52,13 +52,13 @@ func NewP2PRepo(pool *pgxpool.Pool) *P2PRepo {
 }
 
 func (r *P2PRepo) TodayPrice(ctx context.Context) (*models.P2PPrice, error) {
-	return r.PriceFor(ctx, "USDB")
+	return r.PriceFor(ctx, "BIUSD")
 }
 
 func normalizeP2PAsset(asset string) (string, error) {
 	asset = strings.ToUpper(strings.TrimSpace(asset))
-	if asset != "USDB" {
-		return "", fmt.Errorf("P2P asset must be USDB")
+	if asset != "BIUSD" {
+		return "", fmt.Errorf("P2P asset must be BIUSD")
 	}
 	return asset, nil
 }
@@ -128,9 +128,9 @@ func validateP2POrderLimits(amountRaw, price, minOrderFiat, maxOrderFiat string)
 	return minOrderFiat, maxOrderFiat, nil
 }
 
-// p2pUSDBSettlement returns raw-unit movements for the 1% fee on each side.
-// Any fraction smaller than one raw USDB unit is rounded down.
-func p2pUSDBSettlement(amountRaw string) (feeRaw, buyerCreditRaw, sellerDebitRaw string, err error) {
+// p2pBIUSDSettlement returns raw-unit movements for the 1% fee on each side.
+// Any fraction smaller than one raw BIUSD unit is rounded down.
+func p2pBIUSDSettlement(amountRaw string) (feeRaw, buyerCreditRaw, sellerDebitRaw string, err error) {
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok || amount.Sign() <= 0 {
 		return "", "", "", fmt.Errorf("invalid P2P amount")
@@ -183,7 +183,7 @@ func (r *P2PRepo) walletTx(ctx context.Context, tx pgx.Tx, userID, asset string)
 }
 
 func (r *P2PRepo) WalletBalance(ctx context.Context, userID string) (*models.P2PWalletBalance, error) {
-	return r.WalletBalanceForAsset(ctx, userID, "USDB")
+	return r.WalletBalanceForAsset(ctx, userID, "BIUSD")
 }
 
 func (r *P2PRepo) WalletBalanceForAsset(ctx context.Context, userID, asset string) (*models.P2PWalletBalance, error) {
@@ -200,7 +200,7 @@ func (r *P2PRepo) WalletBalanceForAsset(ctx context.Context, userID, asset strin
 
 func (r *P2PRepo) WalletBalances(ctx context.Context, userID string) ([]models.P2PWalletBalance, error) {
 	out := make([]models.P2PWalletBalance, 0, 1)
-	for _, asset := range []string{"USDB"} {
+	for _, asset := range []string{"BIUSD"} {
 		balance, err := r.WalletBalanceForAsset(ctx, userID, asset)
 		if err != nil {
 			return nil, err
@@ -210,10 +210,10 @@ func (r *P2PRepo) WalletBalances(ctx context.Context, userID string) ([]models.P
 	return out, nil
 }
 
-// FundWallet moves available main-wallet USDB into the P2P wallet atomically.
+// FundWallet moves available main-wallet BIUSD into the P2P wallet atomically.
 // moved=false means an identical idempotent request was already applied.
 func (r *P2PRepo) FundWallet(ctx context.Context, userID, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
-	return r.FundWalletAsset(ctx, userID, "USDB", amountRaw, idempotencyKey)
+	return r.FundWalletAsset(ctx, userID, "BIUSD", amountRaw, idempotencyKey)
 }
 
 func (r *P2PRepo) FundWalletAsset(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
@@ -347,7 +347,7 @@ func (r *P2PRepo) EstablishP2PUsername(ctx context.Context, userID, username str
 }
 
 func (r *P2PRepo) CreateListing(ctx context.Context, creatorID, amountRaw, method string) (*models.P2PListing, error) {
-	return r.CreateListingWithLimits(ctx, creatorID, "SELL", "USDB", amountRaw, []string{method}, "", "", "")
+	return r.CreateListingWithLimits(ctx, creatorID, "SELL", "BIUSD", amountRaw, []string{method}, "", "", "")
 }
 
 func (r *P2PRepo) CreateListingForAsset(ctx context.Context, creatorID, asset, amountRaw, method string) (*models.P2PListing, error) {
@@ -404,7 +404,7 @@ func (r *P2PRepo) CreateListingWithLimits(ctx context.Context, creatorID, side, 
 	if err != nil {
 		return nil, err
 	}
-	_, _, reserveRaw, err := p2pUSDBSettlement(amountRaw)
+	_, _, reserveRaw, err := p2pBIUSDSettlement(amountRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +430,7 @@ func (r *P2PRepo) CreateListingWithLimits(ctx context.Context, creatorID, side, 
 		}
 	}
 	var l models.P2PListing
-	err = tx.QueryRow(ctx, `INSERT INTO p2p_listings(seller_id,side,asset,amount_raw,remaining_raw,price,fiat_currency,min_order_fiat,max_order_fiat,payment_method,payment_methods,funding_source,fee_model) VALUES($1,$2,$3,$4,$4,$5,'INR',$6,$7,$8,$9,$10,$11) RETURNING id,seller_id,$12,side,asset,amount_raw::text,remaining_raw::text,price::text,fiat_currency,min_order_fiat::text,max_order_fiat::text,payment_methods,status,0,'0',0,'0',0,created_at,updated_at`, creatorID, side, asset, amountRaw, price, minOrderFiat, maxOrderFiat, methods[0], methods, p2pFundingWallet, p2pFeeModelUSDB, *established).Scan(&l.ID, &l.CreatorID, &l.Username, &l.Side, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.MinOrderFiat, &l.MaxOrderFiat, &l.PaymentMethods, &l.Status, &l.CompletedOrders, &l.CompletedAmountRaw, &l.CompletedOrders30d, &l.CompletionRate30d, &l.RatedOrders30d, &l.CreatedAt, &l.UpdatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO p2p_listings(seller_id,side,asset,amount_raw,remaining_raw,price,fiat_currency,min_order_fiat,max_order_fiat,payment_method,payment_methods,funding_source,fee_model) VALUES($1,$2,$3,$4,$4,$5,'INR',$6,$7,$8,$9,$10,$11) RETURNING id,seller_id,$12,side,asset,amount_raw::text,remaining_raw::text,price::text,fiat_currency,min_order_fiat::text,max_order_fiat::text,payment_methods,status,0,'0',0,'0',0,created_at,updated_at`, creatorID, side, asset, amountRaw, price, minOrderFiat, maxOrderFiat, methods[0], methods, p2pFundingWallet, p2pFeeModelBIUSD, *established).Scan(&l.ID, &l.CreatorID, &l.Username, &l.Side, &l.Asset, &l.AmountRaw, &l.RemainingRaw, &l.Price, &l.FiatCurrency, &l.MinOrderFiat, &l.MaxOrderFiat, &l.PaymentMethods, &l.Status, &l.CompletedOrders, &l.CompletedAmountRaw, &l.CompletedOrders30d, &l.CompletionRate30d, &l.RatedOrders30d, &l.CreatedAt, &l.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -604,8 +604,8 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 		return nil, err
 	}
 	feeRaw, buyerCreditRaw, sellerDebitRaw := "0", amountRaw, amountRaw
-	if feeModel == p2pFeeModelUSDB {
-		feeRaw, buyerCreditRaw, sellerDebitRaw, err = p2pUSDBSettlement(amountRaw)
+	if feeModel == p2pFeeModelBIUSD {
+		feeRaw, buyerCreditRaw, sellerDebitRaw, err = p2pBIUSDSettlement(amountRaw)
 		if err != nil {
 			return nil, err
 		}
@@ -775,7 +775,7 @@ func (r *P2PRepo) MarkPaidWithAttestation(ctx context.Context, buyerID, orderID 
 }
 
 // ReleaseOrder settles the escrow atomically. For new orders, the seller has
-// escrowed 101%, the buyer receives 99%, and both 1% USDB fees go to the
+// escrowed 101%, the buyer receives 99%, and both 1% BIUSD fees go to the
 // system-owned admin P2P wallet.
 func (r *P2PRepo) ReleaseOrder(ctx context.Context, sellerID, orderID string) (*models.P2POrder, error) {
 	return r.releaseOrder(ctx, sellerID, orderID, false)
@@ -838,7 +838,7 @@ func (r *P2PRepo) releaseOrder(ctx context.Context, sellerID, orderID string, ad
 	if _, err = tx.Exec(ctx, `INSERT INTO p2p_order_events(order_id,actor_id,kind,metadata) VALUES($1,$2,'order_released',jsonb_build_object('adminResolution',$3::boolean))`, orderID, actor, admin); err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO p2p_order_messages(order_id,body,is_system) VALUES($1,'USDB was released to the buyer and fees were credited to the admin P2P wallet.',true)`, orderID); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO p2p_order_messages(order_id,body,is_system) VALUES($1,'BIUSD was released to the buyer and fees were credited to the admin P2P wallet.',true)`, orderID); err != nil {
 		return nil, err
 	}
 	o, err = scanOrder(tx.QueryRow(ctx, orderSelect+` WHERE id=$1`, orderID))
@@ -1015,12 +1015,12 @@ func (r *P2PRepo) CancelListing(ctx context.Context, sellerID, listingID string)
 		return err
 	}
 	if side == "BUY" {
-		// Buy ads do not reserve the creator's USDB. A counterparty seller only
+		// Buy ads do not reserve the creator's BIUSD. A counterparty seller only
 		// moves funds into escrow when accepting the ad.
 	} else if source == p2pFundingWallet {
 		releaseRaw := remaining
-		if feeModel == p2pFeeModelUSDB {
-			_, _, releaseRaw, err = p2pUSDBSettlement(remaining)
+		if feeModel == p2pFeeModelBIUSD {
+			_, _, releaseRaw, err = p2pBIUSDSettlement(remaining)
 			if err != nil {
 				return err
 			}

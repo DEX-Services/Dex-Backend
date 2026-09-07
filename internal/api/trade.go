@@ -188,7 +188,7 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 // Which asset to reconcile depends on market, not just side: a SPOT order
 // locks its base asset on SELL and its quote asset on BUY (the two legs the
 // trader actually holds), but a FUTURES order always margins in the quote
-// asset (USDB) regardless of side — shorting a non-crypto-backed future like
+// asset (BIUSD) regardless of side — shorting a non-crypto-backed future like
 // EURUSD/GOLD/AAPL.us has no base-asset ledger column at all (there is no
 // spot book, so no such balance exists), and even for crypto-backed futures
 // (BTC/ETH/SOL/BNB) a SELL is a margined short, not a spend of held BTC/ETH/

@@ -102,7 +102,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"user ID defaults", ensureIDDefault},
 		{"wallet balances", ensureUserBalancesTable},
 		{"P2P tables", ensureP2PTables},
-		{"USDT to USDB", migrateUSDTToUSDB},
+		{"USDT to BIUSD", migrateUSDTToBIUSD},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -142,25 +142,25 @@ INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
 VALUES ('USDC', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
 INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
-VALUES ('USDB', 'INR', 100, CURRENT_DATE)
+VALUES ('BIUSD', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
 CREATE TABLE IF NOT EXISTS p2p_listings (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSD')), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	remaining_raw NUMERIC(38,0) NOT NULL CHECK (remaining_raw >= 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
 	fiat_currency TEXT NOT NULL DEFAULT 'INR', payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI', 'Bank Transfer', 'NEFT', 'IMPS')),
 	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
 	funding_source TEXT NOT NULL DEFAULT 'P2P_WALLET' CHECK (funding_source IN ('P2P_WALLET', 'MAIN_WALLET_LEGACY')),
-	fee_model TEXT NOT NULL DEFAULT 'USDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH')),
+	fee_model TEXT NOT NULL DEFAULT 'BIUSD_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BIUSD_1PCT_EACH')),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT 'SELL';
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS fee_model TEXT;
 UPDATE p2p_listings SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
-ALTER TABLE p2p_listings ALTER COLUMN fee_model SET DEFAULT 'USDB_1PCT_EACH';
+ALTER TABLE p2p_listings ALTER COLUMN fee_model SET DEFAULT 'BIUSD_1PCT_EACH';
 ALTER TABLE p2p_listings ALTER COLUMN fee_model SET NOT NULL;
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_fee_model_check;
-ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH'));
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BIUSD_1PCT_EACH'));
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_side_check;
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_side_check CHECK (side IN ('BUY','SELL'));
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS payment_methods TEXT[];
@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS p2p_orders (
 	seller_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (seller_fee_raw >= 0),
 	buyer_credit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (buyer_credit_raw > 0),
 	seller_debit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (seller_debit_raw > 0),
-	fee_model TEXT NOT NULL DEFAULT 'USDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH')),
+	fee_model TEXT NOT NULL DEFAULT 'BIUSD_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BIUSD_1PCT_EACH')),
 	idempotency_key TEXT, expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
 	cancellation_reason TEXT, completed_at TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
@@ -247,10 +247,10 @@ UPDATE p2p_orders SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
 UPDATE p2p_orders SET buyer_credit_raw=COALESCE(buyer_credit_raw,amount_raw,buyer_credit),seller_debit_raw=COALESCE(seller_debit_raw,escrow_raw,amount_raw,seller_debit);
 ALTER TABLE p2p_orders ALTER COLUMN buyer_credit_raw SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN seller_debit_raw SET NOT NULL;
-ALTER TABLE p2p_orders ALTER COLUMN fee_model SET DEFAULT 'USDB_1PCT_EACH';
+ALTER TABLE p2p_orders ALTER COLUMN fee_model SET DEFAULT 'BIUSD_1PCT_EACH';
 ALTER TABLE p2p_orders ALTER COLUMN fee_model SET NOT NULL;
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_fee_model_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','USDB_1PCT_EACH'));
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BIUSD_1PCT_EACH'));
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS taker_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
 UPDATE p2p_orders o SET taker_id=CASE WHEN l.side='BUY' THEN o.seller_id ELSE o.buyer_id END
 	FROM p2p_listings l WHERE o.listing_id=l.id AND o.taker_id IS NULL;
@@ -279,7 +279,7 @@ ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_funding_source_c
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_funding_source_check
 	CHECK (funding_source IN ('P2P_WALLET','MAIN_WALLET_LEGACY'));
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_asset_check;
-ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','USDB'));
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','BIUSD'));
 
 UPDATE p2p_orders SET
 	amount_raw = COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount),
@@ -302,7 +302,7 @@ ALTER TABLE p2p_orders ALTER COLUMN fiat_currency SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN buyer_payable SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN seller_receivable SET NOT NULL;
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','USDB'));
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','BIUSD'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
@@ -322,7 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_p2p_orders_expiry
 
 CREATE TABLE IF NOT EXISTS p2p_wallet_balances (
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSD')),
 	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
 	reserved_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (reserved_raw >= 0),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -336,7 +336,7 @@ CREATE TABLE IF NOT EXISTS p2p_wallet_entries (
 	listing_id UUID REFERENCES p2p_listings(id) ON DELETE SET NULL,
 	order_id UUID REFERENCES p2p_orders(id) ON DELETE SET NULL,
 	kind TEXT NOT NULL,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','USDB')),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSD')),
 	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	idempotency_key TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -347,23 +347,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_wallet_fund_idempotency
 	ON p2p_wallet_entries (user_id,kind,idempotency_key)
 	WHERE kind='main_to_p2p' AND idempotency_key IS NOT NULL;
 ALTER TABLE p2p_wallet_balances DROP CONSTRAINT IF EXISTS p2p_wallet_balances_asset_check;
-ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','USDB'));
+ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','BIUSD'));
 ALTER TABLE p2p_wallet_entries DROP CONSTRAINT IF EXISTS p2p_wallet_entries_asset_check;
-ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','USDB'));
+ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','BIUSD'));
 
 -- System-owned fee wallet. It deliberately has no user_id: customers cannot
 -- authenticate as or spend from this account through the P2P wallet APIs.
 CREATE TABLE IF NOT EXISTS p2p_admin_wallet_balances (
-	asset TEXT PRIMARY KEY CHECK (asset = 'USDB'),
+	asset TEXT PRIMARY KEY CHECK (asset = 'BIUSD'),
 	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-INSERT INTO p2p_admin_wallet_balances(asset) VALUES('USDB') ON CONFLICT(asset) DO NOTHING;
+INSERT INTO p2p_admin_wallet_balances(asset) VALUES('BIUSD') ON CONFLICT(asset) DO NOTHING;
 CREATE TABLE IF NOT EXISTS p2p_admin_wallet_entries (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
-	asset TEXT NOT NULL CHECK (asset = 'USDB'),
+	asset TEXT NOT NULL CHECK (asset = 'BIUSD'),
 	buyer_fee_raw NUMERIC(38,0) NOT NULL CHECK (buyer_fee_raw >= 0),
 	seller_fee_raw NUMERIC(38,0) NOT NULL CHECK (seller_fee_raw >= 0),
 	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
@@ -467,15 +467,15 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "OUR_Token_locked" NUMERIC(38
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
--- USDB: the platform's internal stable quote currency, pegged 1:1 to USDT.
--- It has no on-chain contract; every market's quote leg trades in USDB. The
+-- BIUSD: the platform's internal stable quote currency, pegged 1:1 to USDT.
+-- It has no on-chain contract; every market's quote leg trades in BIUSD. The
 -- USDT/USDC columns above remain only as the deposit-intake ledger (a real
 -- on-chain deposit lands there first via the chain listener), not as a
 -- tradable balance any more.
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
--- ETH, SOL, and BNB: base assets for the ETH-USDB / SOL-USDB / BNB-USDB spot
+-- ETH, SOL, and BNB: base assets for the ETH-BIUSD / SOL-BIUSD / BNB-BIUSD spot
 -- markets (matching-engine's currentMarkets). These were registered as
 -- tradable markets before a real balance column backed them, so nobody could
 -- ever actually hold or fund the base leg (deposits/MM desk funding failed
@@ -630,20 +630,20 @@ BEGIN
 END $$;
 `
 
-// migrateUSDTToUSDB is the one-time conversion for the USDT→USDB currency
-// switch: every market's quote leg now trades in USDB (pegged 1:1 to USDT,
+// migrateUSDTToBIUSD is the one-time conversion for the USDT→BIUSD currency
+// switch: every market's quote leg now trades in BIUSD (pegged 1:1 to USDT,
 // no on-chain contract of its own), so a balance sitting in the old
-// tradable USDT column must move to USDB or it becomes permanently
+// tradable USDT column must move to BIUSD or it becomes permanently
 // inaccessible to trading. Converts at 1:1 and zeroes the USDT columns.
 //
 // Idempotent by construction, not by a migration-log flag: it only touches
 // rows where USDT (or USDT_locked) is still nonzero, which is false after
 // the first successful run, so re-running on every boot is a no-op. Must
-// run after `schema` has created the USDB columns.
-const migrateUSDTToUSDB = `
+// run after `schema` has created the BIUSD columns.
+const migrateUSDTToBIUSD = `
 UPDATE user_balances SET
-	"USDB" = "USDB" + "USDT",
-	"USDB_locked" = "USDB_locked" + "USDT_locked",
+	"BIUSD" = "BIUSD" + "USDT",
+	"BIUSD_locked" = "BIUSD_locked" + "USDT_locked",
 	"USDT" = 0,
 	"USDT_locked" = 0,
 	updated_at = now()

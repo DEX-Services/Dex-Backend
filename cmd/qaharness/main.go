@@ -1,7 +1,7 @@
 // Command qaharness is a rewritten, expanded version of cmd/loadtest for the
 // full exhaustive QA pass: creates/funds 100 test users, then executes a wide
 // scenario matrix (spot/futures, market/limit, TP/SL, user-vs-user matching,
-// edge cases) against the live 17-market USDB stack. HTTP-only against the
+// edge cases) against the live 17-market BIUSD stack. HTTP-only against the
 // running services — opens no direct DB connections.
 //
 // Usage: go run ./cmd/qaharness <phase>
@@ -52,7 +52,7 @@ func firstNonEmpty(vals ...string) string {
 }
 
 const numUsers = 100
-const usdbPerUser = "100000"
+const biusdPerUser = "100000"
 
 func userID(i int) string { return fmt.Sprintf("LOADTEST_USER_%03d", i) }
 
@@ -90,8 +90,8 @@ func runVerify() {
 		fmt.Println(string(getPositions(tok)))
 		fmt.Println("-- pnlHistory --")
 		fmt.Println(string(getPnlHistory(tok)))
-		bal, _ := getBalance(tok, "USDB")
-		fmt.Println("-- USDB balance --", bal)
+		bal, _ := getBalance(tok, "BIUSD")
+		fmt.Println("-- BIUSD balance --", bal)
 	}
 }
 
@@ -123,7 +123,7 @@ func runSetup() {
 				mu.Unlock()
 				return
 			}
-			if err := creditUSDB(adminTok, uid, usdbPerUser); err != nil {
+			if err := creditBIUSD(adminTok, uid, biusdPerUser); err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Sprintf("credit %s: %v", uid, err))
 				mu.Unlock()
@@ -177,8 +177,8 @@ func ensureUser(userID string) error {
 	return nil
 }
 
-func creditUSDB(adminTok, userID, amount string) error {
-	body, _ := json.Marshal(map[string]string{"userId": userID, "asset": "USDB", "amount": amount, "direction": "credit"})
+func creditBIUSD(adminTok, userID, amount string) error {
+	body, _ := json.Marshal(map[string]string{"userId": userID, "asset": "BIUSD", "amount": amount, "direction": "credit"})
 	req, _ := http.NewRequest(http.MethodPost, backendURL+"/admin/users/balance", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminTok)
@@ -444,7 +444,7 @@ func runMatrix() {
 		tokens[userID(i)] = jwtFor(userID(i))
 	}
 
-	spotSymbols := []string{"BTC-USDB", "ETH-USDB", "SOL-USDB", "BNB-USDB"}
+	spotSymbols := []string{"BTC-BIUSD", "ETH-BIUSD", "SOL-BIUSD", "BNB-BIUSD"}
 	futSymbols := []string{}
 	for _, m := range markets {
 		if m["market"] == "FUTURES" {
@@ -661,10 +661,10 @@ func runMatrix() {
 	runScenario("same_user_multi_asset", 1, func(i int) {
 		u := userID(1)
 		steps := []struct{ sym, mkt, side, typ string }{
-			{"BTC-USDB", "FUTURES", "BUY", "MARKET"},
-			{"GOLD-USDB", "FUTURES", "BUY", "MARKET"},
-			{"AAPL.us-USDB", "FUTURES", "BUY", "MARKET"},
-			{"BTC-USDB", "SPOT", "BUY", "MARKET"},
+			{"BTC-BIUSD", "FUTURES", "BUY", "MARKET"},
+			{"GOLD-BIUSD", "FUTURES", "BUY", "MARKET"},
+			{"AAPL.us-BIUSD", "FUTURES", "BUY", "MARKET"},
+			{"BTC-BIUSD", "SPOT", "BUY", "MARKET"},
 		}
 		allOK := true
 		var log strings.Builder
@@ -694,7 +694,7 @@ func runMatrix() {
 	})
 
 	// ============ 10. User-vs-user matching ============
-	uvuSymbols := []string{"BTC-USDB:FUTURES", "ETH-USDB:FUTURES", "SOL-USDB:FUTURES", "GOLD-USDB:FUTURES", "AAPL.us-USDB:FUTURES"}
+	uvuSymbols := []string{"BTC-BIUSD:FUTURES", "ETH-BIUSD:FUTURES", "SOL-BIUSD:FUTURES", "GOLD-BIUSD:FUTURES", "AAPL.us-BIUSD:FUTURES"}
 	runScenario("user_vs_user_matching", len(uvuSymbols), func(i int) {
 		pair := strings.Split(uvuSymbols[i], ":")
 		sym, mkt := pair[0], pair[1]
@@ -718,51 +718,51 @@ func runMatrix() {
 	// ============ 15. Edge cases ============
 	runScenario("edge_insufficient_balance", 1, func(i int) {
 		u := userID(97)
-		status, or, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1000"}) // way beyond balance
+		status, or, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1000"}) // way beyond balance
 		ok := status >= 400
 		getCounter("edge_insufficient_balance").record(ok, fmt.Sprintf("status=%d err=%s body=%s", status, or.Error, trim(body, 150)))
 	})
 	runScenario("edge_invalid_symbol", 1, func(i int) {
 		u := userID(97)
-		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "FAKE-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1"})
+		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "FAKE-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1"})
 		ok := status >= 400
 		getCounter("edge_invalid_symbol").record(ok, fmt.Sprintf("status=%d body=%s", status, trim(body, 150)))
 	})
 	runScenario("edge_zero_qty", 1, func(i int) {
 		u := userID(97)
-		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0"})
+		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0"})
 		ok := status >= 400
 		getCounter("edge_zero_qty").record(ok, fmt.Sprintf("status=%d body=%s", status, trim(body, 150)))
 	})
 	runScenario("edge_negative_qty", 1, func(i int) {
 		u := userID(97)
-		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "-1"})
+		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "-1"})
 		ok := status >= 400
 		getCounter("edge_negative_qty").record(ok, fmt.Sprintf("status=%d body=%s", status, trim(body, 150)))
 	})
 	runScenario("edge_sell_more_than_held", 1, func(i int) {
 		u := userID(98)
-		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "ETH-USDB", Market: "SPOT", Side: "SELL", Type: "MARKET", Qty: "999999"})
+		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "ETH-BIUSD", Market: "SPOT", Side: "SELL", Type: "MARKET", Qty: "999999"})
 		ok := status >= 400
 		getCounter("edge_sell_more_than_held").record(ok, fmt.Sprintf("status=%d body=%s", status, trim(body, 150)))
 	})
 	runScenario("edge_over_max_leverage", 1, func(i int) {
 		u := userID(98)
 		lev := 500 // absurd, way over any configured max (BTC max is 100)
-		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-USDB", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
+		status, _, body := placeOrder(tokens[u], orderReq{Symbol: "BTC-BIUSD", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
 		ok := status >= 400
 		getCounter("edge_over_max_leverage").record(ok, fmt.Sprintf("status=%d body=%s", status, trim(body, 150)))
 	})
 	runScenario("edge_cancel_already_filled", 1, func(i int) {
 		u := userID(99)
-		_, or, _ := placeOrder(tokens[u], orderReq{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.001"})
-		status, body := cancelOrder(tokens[u], "BTC-USDB", "SPOT", or.OrderID)
+		_, or, _ := placeOrder(tokens[u], orderReq{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.001"})
+		status, body := cancelOrder(tokens[u], "BTC-BIUSD", "SPOT", or.OrderID)
 		ok := status >= 400 // should be rejected since already filled
 		getCounter("edge_cancel_already_filled").record(ok, fmt.Sprintf("orderId=%s status=%d body=%s", or.OrderID, status, trim(body, 150)))
 	})
 	runScenario("edge_double_submission", 1, func(i int) {
 		u := userID(99)
-		body := orderReq{Symbol: "ETH-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.005"}
+		body := orderReq{Symbol: "ETH-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.005"}
 		var wg sync.WaitGroup
 		results := make([]int, 2)
 		for k := 0; k < 2; k++ {

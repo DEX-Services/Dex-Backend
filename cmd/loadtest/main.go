@@ -1,6 +1,6 @@
 // Command loadtest is a throwaway end-to-end simulation/QA tool, NOT part of
 // the production build. It creates a batch of test users, funds them with
-// USDB, then drives a real scenario matrix across all 17 live markets:
+// BIUSD, then drives a real scenario matrix across all 17 live markets:
 // spot market/limit orders, futures market/limit orders with and without
 // TP/SL (via /trade/attached-order), cross-symbol per-user checks, and a
 // direct user-vs-user limit-order match test. It reports every error/result
@@ -64,31 +64,31 @@ type market struct {
 }
 
 var futuresMarkets = []market{
-	{"BTC", "FUTURES", "BTC-USDB"},
-	{"ETH", "FUTURES", "ETH-USDB"},
-	{"SOL", "FUTURES", "SOL-USDB"},
-	{"BNB", "FUTURES", "BNB-USDB"},
-	{"EURUSD", "FUTURES", "EURUSD-USDB"},
-	{"GBPUSD", "FUTURES", "GBPUSD-USDB"},
-	{"AUDUSD", "FUTURES", "AUDUSD-USDB"},
-	{"GOLD", "FUTURES", "GOLD-USDB"},
-	{"SILVER", "FUTURES", "SILVER-USDB"},
-	{"CrudeOIL", "FUTURES", "CrudeOIL-USDB"},
-	{"AAPL.us", "FUTURES", "AAPL.us-USDB"},
-	{"TSLA.us", "FUTURES", "TSLA.us-USDB"},
-	{"NVDA.us", "FUTURES", "NVDA.us-USDB"},
+	{"BTC", "FUTURES", "BTC-BIUSD"},
+	{"ETH", "FUTURES", "ETH-BIUSD"},
+	{"SOL", "FUTURES", "SOL-BIUSD"},
+	{"BNB", "FUTURES", "BNB-BIUSD"},
+	{"EURUSD", "FUTURES", "EURUSD-BIUSD"},
+	{"GBPUSD", "FUTURES", "GBPUSD-BIUSD"},
+	{"AUDUSD", "FUTURES", "AUDUSD-BIUSD"},
+	{"GOLD", "FUTURES", "GOLD-BIUSD"},
+	{"SILVER", "FUTURES", "SILVER-BIUSD"},
+	{"CrudeOIL", "FUTURES", "CrudeOIL-BIUSD"},
+	{"AAPL.us", "FUTURES", "AAPL.us-BIUSD"},
+	{"TSLA.us", "FUTURES", "TSLA.us-BIUSD"},
+	{"NVDA.us", "FUTURES", "NVDA.us-BIUSD"},
 }
 
 var spotMarkets = []market{
-	{"BTC", "SPOT", "BTC-USDB"},
-	{"ETH", "SPOT", "ETH-USDB"},
-	{"SOL", "SPOT", "SOL-USDB"},
-	{"BNB", "SPOT", "BNB-USDB"},
+	{"BTC", "SPOT", "BTC-BIUSD"},
+	{"ETH", "SPOT", "ETH-BIUSD"},
+	{"SOL", "SPOT", "SOL-BIUSD"},
+	{"BNB", "SPOT", "BNB-BIUSD"},
 }
 
 func main() {
 	numUsers := flag.Int("users", 100, "number of LOADTEST_USER_NNN accounts")
-	usdbFund := flag.String("fund", "100000", "USDB credited to each user")
+	biusdFund := flag.String("fund", "100000", "BIUSD credited to each user")
 	phase := flag.String("phase", "all", "all|users|scenarios")
 	flag.Parse()
 
@@ -119,7 +119,7 @@ func main() {
 					fmt.Printf("  ensure %s FAILED: %v\n", uid, err)
 					return
 				}
-				if err := creditUSDB(adminTok, uid, *usdbFund); err != nil {
+				if err := creditBIUSD(adminTok, uid, *biusdFund); err != nil {
 					atomic.AddInt64(&errCount, 1)
 					fmt.Printf("  credit %s FAILED: %v\n", uid, err)
 					return
@@ -187,8 +187,8 @@ func ensureUser(userID string) error {
 	return nil
 }
 
-func creditUSDB(adminTok, userID, amount string) error {
-	body, _ := json.Marshal(map[string]string{"userId": userID, "asset": "USDB", "amount": amount, "direction": "credit"})
+func creditBIUSD(adminTok, userID, amount string) error {
+	body, _ := json.Marshal(map[string]string{"userId": userID, "asset": "BIUSD", "amount": amount, "direction": "credit"})
 	req, _ := http.NewRequest(http.MethodPost, backendURL+"/admin/users/balance", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminTok)
@@ -313,12 +313,12 @@ func runScenarios(users []string, tokens map[string]string) {
 	// 2. Spot limit order BUY/SELL, crossing + resting
 	{
 		status, body, _ := postTrade(t[u[1]], "/trade/order", tradeOrderRequest{
-			Symbol: "ETH-USDB", Market: "SPOT", Side: "BUY", Type: "LIMIT", Price: "100000", Qty: "0.01", // crosses (way above market)
+			Symbol: "ETH-BIUSD", Market: "SPOT", Side: "BUY", Type: "LIMIT", Price: "100000", Qty: "0.01", // crosses (way above market)
 		})
 		record("spot-limit-buy-crossing", status == 200, fmt.Sprintf("status=%d body=%v", status, trimAny(body)))
 
 		status2, body2, _ := postTrade(t[u[1]], "/trade/order", tradeOrderRequest{
-			Symbol: "ETH-USDB", Market: "SPOT", Side: "SELL", Type: "LIMIT", Price: "1", Qty: "0.01", // rests far below
+			Symbol: "ETH-BIUSD", Market: "SPOT", Side: "SELL", Type: "LIMIT", Price: "1", Qty: "0.01", // rests far below
 		})
 		record("spot-limit-sell-resting", status2 == 200, fmt.Sprintf("status=%d body=%v", status2, trimAny(body2)))
 	}
@@ -375,13 +375,13 @@ func runScenarios(users []string, tokens map[string]string) {
 	// 9. Same user, different symbols (cross-asset isolation)
 	{
 		user := u[3]
-		s1, b1, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.005", Leverage: &lev, MarginMode: "ISOLATED"})
+		s1, b1, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.005", Leverage: &lev, MarginMode: "ISOLATED"})
 		record("cross-asset-user-BTCfut", s1 == 200, fmt.Sprintf("body=%v", trimAny(b1)))
-		s2, b2, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "GOLD-USDB", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
+		s2, b2, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "GOLD-BIUSD", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
 		record("cross-asset-user-GOLDfut", s2 == 200, fmt.Sprintf("body=%v", trimAny(b2)))
-		s3, b3, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "AAPL.us-USDB", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
+		s3, b3, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "AAPL.us-BIUSD", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &lev, MarginMode: "ISOLATED"})
 		record("cross-asset-user-AAPLfut", s3 == 200, fmt.Sprintf("body=%v", trimAny(b3)))
-		s4, b4, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.001"})
+		s4, b4, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.001"})
 		record("cross-asset-user-BTCspot", s4 == 200, fmt.Sprintf("body=%v", trimAny(b4)))
 		posStatus, posBody, _ := getTrade(t[user], "/trade/positions")
 		record("cross-asset-user-positions-check", posStatus == 200, fmt.Sprintf("%v", trimAny(posBody)))
@@ -415,30 +415,30 @@ func runScenarios(users []string, tokens map[string]string) {
 	// 15. Error/edge cases
 	{
 		user := u[10]
-		s1, b1, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "999999"})
+		s1, b1, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "999999"})
 		record("edge-insufficient-balance", s1 >= 400, fmt.Sprintf("status=%d body=%v", s1, trimAny(b1)))
 
-		s2, b2, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "FAKE-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1"})
+		s2, b2, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "FAKE-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "1"})
 		record("edge-invalid-symbol", s2 >= 400, fmt.Sprintf("status=%d body=%v", s2, trimAny(b2)))
 
-		s3, b3, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0"})
+		s3, b3, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0"})
 		record("edge-zero-qty", s3 >= 400, fmt.Sprintf("status=%d body=%v", s3, trimAny(b3)))
 
-		s4, b4, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "-1"})
+		s4, b4, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "-1"})
 		record("edge-negative-qty", s4 >= 400, fmt.Sprintf("status=%d body=%v", s4, trimAny(b4)))
 
-		s5, b5, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "SPOT", Side: "SELL", Type: "MARKET", Qty: "50"})
+		s5, b5, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "SPOT", Side: "SELL", Type: "MARKET", Qty: "50"})
 		record("edge-sell-more-than-held", s5 >= 400, fmt.Sprintf("status=%d body=%v", s5, trimAny(b5)))
 
 		badLev := 500
-		s6, b6, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-USDB", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &badLev, MarginMode: "ISOLATED"})
+		s6, b6, _ := postTrade(t[user], "/trade/order", tradeOrderRequest{Symbol: "BTC-BIUSD", Market: "FUTURES", Side: "BUY", Type: "MARKET", Qty: "0.01", Leverage: &badLev, MarginMode: "ISOLATED"})
 		record("edge-over-max-leverage", s6 >= 400, fmt.Sprintf("status=%d body=%v", s6, trimAny(b6)))
 
 		// double submission race
 		var wg sync.WaitGroup
 		var statuses [2]int
 		var bodies [2]map[string]any
-		body := tradeOrderRequest{Symbol: "ETH-USDB", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.002"}
+		body := tradeOrderRequest{Symbol: "ETH-BIUSD", Market: "SPOT", Side: "BUY", Type: "MARKET", Qty: "0.002"}
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
 			go func(i int) {
