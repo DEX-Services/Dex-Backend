@@ -447,7 +447,6 @@ CREATE TABLE IF NOT EXISTS user_balances (
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	"USDC" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	"USDT" NUMERIC(38,0) NOT NULL DEFAULT 0,
-	"BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	"BI" NUMERIC(38,0) NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -457,12 +456,10 @@ ALTER TABLE user_balances ALTER COLUMN user_id TYPE TEXT USING user_id::text;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BTC" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BTC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
@@ -474,6 +471,22 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NU
 -- tradable balance any more.
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+
+-- BUSD removed: it was a dormant deposit-intake balance column never wired
+-- into any market, deposit path, or swap conversion — fully retired. Any
+-- lingering "BUSD"/"BUSD_locked" columns and their balances are folded into
+-- BIUSD (the platform's real stable-quote balance) before being dropped.
+DO $drop_busd$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'BUSD'
+	) THEN
+		UPDATE user_balances SET "BIUSD" = "BIUSD" + "BUSD", "BIUSD_locked" = "BIUSD_locked" + "BUSD_locked";
+		ALTER TABLE user_balances DROP COLUMN "BUSD";
+		ALTER TABLE user_balances DROP COLUMN IF EXISTS "BUSD_locked";
+	END IF;
+END $drop_busd$;
 
 -- ETH, SOL, and BNB: base assets for the ETH-BIUSD / SOL-BIUSD / BNB-BIUSD spot
 -- markets (matching-engine's currentMarkets). These were registered as
@@ -502,7 +515,7 @@ BEGIN
 					MIN(balance_id) AS keep_id,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDC' THEN total ELSE 0 END), 0) AS usdc,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDT' THEN total ELSE 0 END), 0) AS usdt,
-					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('BUSD', 'DUSD') THEN total ELSE 0 END), 0) AS busd,
+					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('BIUSD', 'BUSD', 'DUSD') THEN total ELSE 0 END), 0) AS biusd,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('OUR_TOKEN', 'OURTOKEN') THEN total ELSE 0 END), 0) AS our_token,
 					MIN(updated_at) AS created_at,
 					MAX(updated_at) AS updated_at
@@ -512,7 +525,7 @@ BEGIN
 			UPDATE user_balances ub
 			SET "USDC" = migrated.usdc,
 				"USDT" = migrated.usdt,
-				"BUSD" = migrated.busd,
+				"BIUSD" = migrated.biusd,
 				"BI" = migrated.our_token,
 				created_at = migrated.created_at,
 				updated_at = migrated.updated_at
@@ -535,67 +548,19 @@ BEGIN
 	END IF;
 END $wallet$;
 
+-- Legacy DUSD fold: any pre-BIUSD-era DUSD column is merged into BIUSD (the
+-- platform's current stable-quote balance) rather than the now-removed BUSD
+-- column.
 DO $asset_rename$
 BEGIN
 	IF EXISTS (
 		SELECT 1 FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'DUSD'
 	) THEN
-		UPDATE user_balances SET "BUSD" = "BUSD" + "DUSD";
+		UPDATE user_balances SET "BIUSD" = "BIUSD" + "DUSD";
 		ALTER TABLE user_balances DROP COLUMN "DUSD";
 	END IF;
 END $asset_rename$;
-DO $column_order$
-DECLARE
-	has_rows BOOLEAN;
-BEGIN
-	IF (
-		SELECT busd.ordinal_position > own_token.ordinal_position
-		FROM information_schema.columns busd
-		JOIN information_schema.columns own_token
-			ON own_token.table_schema = busd.table_schema
-			AND own_token.table_name = busd.table_name
-		WHERE busd.table_schema = 'public'
-			AND busd.table_name = 'user_balances'
-			AND busd.column_name = 'BUSD'
-			AND own_token.column_name = 'BI'
-	) THEN
-		DROP TABLE IF EXISTS user_balances_reordered;
-		CREATE TABLE user_balances_reordered (
-			balance_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-			user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-			"BTC" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"USDC" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"USDT" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"BUSD" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"BI" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"USDC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"BTC_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"USDT_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"BUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			"BI_locked" NUMERIC(38,0) NOT NULL DEFAULT 0,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		);
-
-		INSERT INTO user_balances_reordered
-			(balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "BI", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "BI_locked", created_at, updated_at)
-		SELECT balance_id, user_id, "BTC", "USDC", "USDT", "BUSD", "BI", "BTC_locked", "USDC_locked", "USDT_locked", "BUSD_locked", "BI_locked", created_at, updated_at
-		FROM user_balances;
-
-		SELECT EXISTS (SELECT 1 FROM user_balances_reordered) INTO has_rows;
-		IF has_rows THEN
-			PERFORM setval(
-				pg_get_serial_sequence('user_balances_reordered', 'balance_id'),
-				(SELECT MAX(balance_id) FROM user_balances_reordered),
-				true
-			);
-		END IF;
-
-		DROP TABLE user_balances;
-		ALTER TABLE user_balances_reordered RENAME TO user_balances;
-	END IF;
-END $column_order$;
 CREATE UNIQUE INDEX IF NOT EXISTS user_balances_user_id_uidx ON user_balances (user_id);
 
 DO $wallet$

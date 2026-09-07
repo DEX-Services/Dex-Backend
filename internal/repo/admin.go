@@ -68,7 +68,6 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 			UNION ALL SELECT 'ETH', COALESCE(SUM("ETH"), 0), COALESCE(SUM("ETH_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'SOL', COALESCE(SUM("SOL"), 0), COALESCE(SUM("SOL_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BNB', COALESCE(SUM("BNB"), 0), COALESCE(SUM("BNB_locked"), 0) FROM user_balances
-			UNION ALL SELECT 'BUSD', COALESCE(SUM("BUSD"), 0), COALESCE(SUM("BUSD_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BI', COALESCE(SUM("BI"), 0), COALESCE(SUM("BI_locked"), 0) FROM user_balances
 		) totals`)
 	if err != nil {

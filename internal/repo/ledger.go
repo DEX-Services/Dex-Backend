@@ -23,7 +23,6 @@ var assetColumns = map[string]string{
 	"BTC":  `"BTC"`,
 	"USDC": `"USDC"`,
 	"USDT": `"USDT"`,
-	"BUSD": `"BUSD"`,
 	// BI: the platform's own native token (distinct from BIUSD, the stable
 	// quote currency). Wallet/ledger balance column only — not yet wired
 	// into any matching-engine market.
@@ -46,7 +45,6 @@ var lockedColumns = map[string]string{
 	"BTC":   `"BTC_locked"`,
 	"USDC":  `"USDC_locked"`,
 	"USDT":  `"USDT_locked"`,
-	"BUSD":  `"BUSD_locked"`,
 	"BI":    `"BI_locked"`,
 	"BIUSD": `"BIUSD_locked"`,
 	"ETH":   `"ETH_locked"`,
@@ -741,16 +739,16 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BIUSD": "0", "USDC": "0", "USDT": "0", "BUSD": "0", "BI": "0"}
+	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BIUSD": "0", "USDC": "0", "USDT": "0", "BI": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, eth, sol, bnb, biusd, usdc, usdt, busd, bi string
+	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BIUSD"::text, "USDC"::text, "USDT"::text, "BUSD"::text, "BI"::text
+		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BIUSD"::text, "USDC"::text, "USDT"::text, "BI"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &busd, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -764,7 +762,6 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	balances["BIUSD"] = biusd
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
-	balances["BUSD"] = busd
 	balances["BI"] = bi
 	return balances, nil
 }
@@ -772,11 +769,11 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, eth, sol, bnb, biusd, usdc, usdt, busd, bi string
+	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BIUSD_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BUSD_locked"::text, "BI_locked"::text
+		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BIUSD_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &busd, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -790,7 +787,6 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked["BIUSD"] = biusd
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
-	locked["BUSD"] = busd
 	locked["BI"] = bi
 	return locked, nil
 }
@@ -899,8 +895,6 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		SELECT user_id, 'BNB', GREATEST("BNB" - "BNB_locked", 0)::text FROM user_balances WHERE "BNB" - "BNB_locked" > 0
 		UNION ALL
 		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
-		UNION ALL
-		SELECT user_id, 'BUSD', GREATEST("BUSD" - "BUSD_locked", 0)::text FROM user_balances WHERE "BUSD" - "BUSD_locked" > 0
 		UNION ALL
 		SELECT user_id, 'BIUSD', GREATEST("BIUSD" - "BIUSD_locked", 0)::text FROM user_balances WHERE "BIUSD" - "BIUSD_locked" > 0
 		UNION ALL
