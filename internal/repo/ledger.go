@@ -259,33 +259,15 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 // market-maker wallet. targets are raw integer amounts keyed by asset. It is
 // deliberately an absolute replacement rather than unlock-then-lock, so a
 // quote refresh cannot temporarily expose an unfunded or over-locked state.
-// ReplaceLocksFor's Postgres round trips are pipelined via pgx.Batch, not
-// sent one at a time: over Aiven's public-internet latency, N assets used to
-// mean 2 + 2N sequential round trips (Begin, INSERT+SELECT-FOR-UPDATE lock,
-// then a pending-hold SELECT and a locked-balance UPDATE per asset, Commit).
-// A 2-asset spot desk (its usual case — base + quote) measured ~2.8s that
-// way, and every extra desk starting concurrently added queueing behind the
-// same row lock on top of that, which is what pushed some replace-locks
-// calls past the matching engine's downstream 10s client timeout during
-// startup. Batching brings this down to Begin + 2 round trips (one batch
-// for the lock + every asset's pending-hold read, one for every asset's
-// UPDATE) + Commit, regardless of how many assets — fixed cost, not O(assets).
 func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets map[string]string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Validate and resolve every asset up front — a bad asset/amount should
-	// fail before any batch is sent, same as the old per-iteration checks did.
-	type assetPlan struct {
-		normalized   string
-		column       string
-		lockedColumn string
-		amountRaw    string
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
 	}
-	plans := make([]assetPlan, 0, len(targets))
 	for asset, amountRaw := range targets {
 		normalized, column, err := normalizeAsset(asset)
 		if err != nil {
@@ -294,69 +276,20 @@ func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets
 		if err := validateNonNegativeAmount(amountRaw); err != nil {
 			return err
 		}
-		plans = append(plans, assetPlan{normalized: normalized, column: column, lockedColumn: lockedColumns[normalized], amountRaw: amountRaw})
-	}
-
-	// Batch 1: the row lock (INSERT-if-missing + SELECT FOR UPDATE, same as
-	// lockBalance) plus every asset's pending-withdrawal-hold read, all
-	// queued before any of them are read — pgx sends the whole batch as one
-	// round trip and streams results back in submission order.
-	lockBatch := &pgx.Batch{}
-	lockBatch.Queue(`INSERT INTO user_balances (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID)
-	lockBatch.Queue(`SELECT 1 FROM user_balances WHERE user_id = $1 FOR UPDATE`, userID)
-	for _, p := range plans {
-		lockBatch.Queue(`
-			SELECT COALESCE(SUM(amount), 0)::text
-			FROM ledger_entries
-			WHERE user_id = $1 AND token = $2 AND kind = $3 AND status IN ($4, $5)`,
-			userID, p.normalized, models.LedgerKindWithdrawalRequest, models.LedgerStatusPending, models.LedgerStatusProcessing)
-	}
-	lockResults := tx.SendBatch(ctx, lockBatch)
-	if _, err := lockResults.Exec(); err != nil { // INSERT
-		_ = lockResults.Close()
-		return err
-	}
-	var exists int
-	if err := lockResults.QueryRow().Scan(&exists); err != nil { // SELECT FOR UPDATE
-		_ = lockResults.Close()
-		return err
-	}
-	pending := make([]string, len(plans))
-	for i := range plans {
-		if err := lockResults.QueryRow().Scan(&pending[i]); err != nil {
-			_ = lockResults.Close()
+		pending, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+		if err != nil {
 			return err
 		}
-	}
-	if err := lockResults.Close(); err != nil {
-		return err
-	}
-
-	// Batch 2: every asset's locked-balance UPDATE, using the pending-hold
-	// values just read. These don't depend on each other's results, so they
-	// can all be queued and sent together — one more round trip regardless
-	// of asset count.
-	updateBatch := &pgx.Batch{}
-	for i, p := range plans {
-		updateBatch.Queue(`UPDATE user_balances SET `+p.lockedColumn+` = $2::numeric, updated_at = now()
-			WHERE user_id = $1 AND `+p.column+` - $2::numeric - $3::numeric >= 0`, userID, p.amountRaw, pending[i])
-	}
-	updateResults := tx.SendBatch(ctx, updateBatch)
-	for _, p := range plans {
-		ct, err := updateResults.Exec()
+		lockedColumn := lockedColumns[normalized]
+		ct, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = $2::numeric, updated_at = now()
+			WHERE user_id = $1 AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String())
 		if err != nil {
-			_ = updateResults.Close()
 			return err
 		}
 		if ct.RowsAffected() == 0 {
-			_ = updateResults.Close()
-			return fmt.Errorf("insufficient %s balance to lock", p.normalized)
+			return fmt.Errorf("insufficient %s balance to lock", normalized)
 		}
 	}
-	if err := updateResults.Close(); err != nil {
-		return err
-	}
-
 	return tx.Commit(ctx)
 }
 
