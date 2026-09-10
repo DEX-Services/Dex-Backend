@@ -245,6 +245,65 @@ func (c *Client) Balance(ctx context.Context, accountID, asset string) (BalanceR
 	return out, err
 }
 
+// HaltedSymbol is one entry of the engine's current halt state.
+type HaltedSymbol struct {
+	Symbol string `json:"symbol"`
+	Market string `json:"market"`
+	Reason string `json:"reason"`
+	Note   string `json:"note"`
+}
+
+// HaltedSymbolsResponse is the engine's /admin/halted payload.
+type HaltedSymbolsResponse struct {
+	Halted []HaltedSymbol `json:"halted"`
+}
+
+// HaltedSymbols lists every symbol/market the engine is currently refusing
+// orders for. A settlement failure halts a market for EVERY account trading
+// it, so this is what makes an outage visible to an admin instead of only
+// showing up as every order mysteriously rejecting.
+func (c *Client) HaltedSymbols(ctx context.Context) (HaltedSymbolsResponse, error) {
+	var out HaltedSymbolsResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/admin/halted", url.Values{}, &out)
+	return out, err
+}
+
+// ResumeSymbol clears a halt, re-enabling trading. The engine's own endpoint
+// replies in plain text rather than JSON, so this uses tradeCallRaw.
+func (c *Client) ResumeSymbol(ctx context.Context, symbol, market string) error {
+	return c.tradeCallRaw(ctx, http.MethodPost, "/admin/resume", url.Values{
+		"symbol": {symbol},
+		"market": {market},
+	})
+}
+
+// tradeCallRaw is tradeCall for engine endpoints that return plain text
+// instead of JSON. It still surfaces a non-2xx as *Error so the caller can
+// preserve the engine's status code.
+func (c *Client) tradeCallRaw(ctx context.Context, method, path string, q url.Values) error {
+	if !c.Enabled() || c.secret == "" {
+		return fmt.Errorf("matching engine gateway is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Engine-Secret", c.secret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("engine trade request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &Error{Status: resp.StatusCode, Message: string(body)}
+	}
+	return nil
+}
+
 func (c *Client) tradeCall(ctx context.Context, method, path string, q url.Values, out any) error {
 	if !c.Enabled() || c.secret == "" {
 		return fmt.Errorf("matching engine gateway is not configured")

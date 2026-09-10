@@ -353,6 +353,77 @@ func (s *AdminServer) AdjustUserBalance(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"userId": req.UserID, "balances": balances})
 }
 
+// HaltedSymbols lists the markets the engine is currently refusing orders on.
+//
+// A settlement failure halts a symbol for EVERY account trading it, and until
+// this existed there was no way to see that had happened: the halt surfaced
+// only as every order rejecting with "symbol X/Y is halted", and clearing it
+// meant a manual curl carrying the engine's shared secret — which a browser
+// must never hold. This proxies the engine's own endpoint behind the admin
+// session so the admin UI can both show and clear halts.
+func (s *AdminServer) HaltedSymbols(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.EngineClient == nil || !s.EngineClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "matching engine gateway is not configured")
+		return
+	}
+	resp, err := s.EngineClient.HaltedSymbols(r.Context())
+	if err != nil {
+		s.Log.Error("admin halted-symbols lookup failed", "err", err)
+		writeError(w, http.StatusBadGateway, "could not read halt state from the matching engine")
+		return
+	}
+	// Normalize nil to an empty list so the client always gets an array.
+	if resp.Halted == nil {
+		resp.Halted = []engineclient.HaltedSymbol{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"halted": resp.Halted})
+}
+
+type resumeSymbolRequest struct {
+	Symbol string `json:"symbol"`
+	Market string `json:"market"`
+}
+
+// ResumeSymbol clears a halt so trading can continue on that market.
+func (s *AdminServer) ResumeSymbol(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.EngineClient == nil || !s.EngineClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "matching engine gateway is not configured")
+		return
+	}
+	var req resumeSymbolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Symbol = strings.TrimSpace(req.Symbol)
+	req.Market = strings.ToUpper(strings.TrimSpace(req.Market))
+	if req.Symbol == "" || req.Market == "" {
+		writeError(w, http.StatusBadRequest, "symbol and market are required")
+		return
+	}
+	if err := s.EngineClient.ResumeSymbol(r.Context(), req.Symbol, req.Market); err != nil {
+		s.Log.Error("admin resume symbol failed", "symbol", req.Symbol, "market", req.Market, "err", err)
+		writeError(w, http.StatusBadGateway, "could not resume the symbol on the matching engine")
+		return
+	}
+	s.Log.Info("admin resumed halted symbol", "symbol", req.Symbol, "market", req.Market)
+	writeJSON(w, http.StatusOK, map[string]any{"symbol": req.Symbol, "market": req.Market, "status": "resumed"})
+}
+
 func (s *AdminServer) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	claims, ok := s.authenticate(r)
 	if !ok {
