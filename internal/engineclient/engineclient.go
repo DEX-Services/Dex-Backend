@@ -64,7 +64,22 @@ func New() *Client {
 		// produced client-visible "trading service unavailable" errors on
 		// perfectly normal, non-concurrent single orders — a correctness
 		// non-issue turned into a false failure by too tight a ceiling.
-		http: &http.Client{Timeout: 20 * time.Second},
+		// A custom Transport is required here: Go's http.DefaultTransport caps
+		// MaxIdleConnsPerHost at 2, so under concurrent trading (every order,
+		// balance check, and reconcile call goes through this one Client to
+		// the same engine host) most requests were opening a brand-new TCP+TLS
+		// connection instead of reusing an idle one — pure overhead stacked on
+		// top of the already-slow Aiven round trips described below. Raising
+		// the per-host idle pool removes that overhead; it does not change
+		// what each individual call actually waits on.
+		http: &http.Client{
+			Timeout: 20 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 

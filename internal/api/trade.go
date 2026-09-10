@@ -194,17 +194,66 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 // (BTC/ETH/SOL/BNB) a SELL is a margined short, not a spend of held BTC/ETH/
 // SOL/BNB. Reconciling the base leg for a futures SELL either fails outright
 // (non-crypto symbols) or silently checks the wrong balance (crypto symbols).
+// settlementAssetForOrder derives which asset reconcileOrderBalance should
+// check/repair for a given order, mirroring the matching engine's own
+// risk.assetFor logic (matching-engine/internal/risk/checker.go) so the two
+// never disagree about which balance an order actually draws from.
+//
+// Spot/futures symbols are the simple 2-part BASE-QUOTE form: a futures
+// order (either side) and a spot BUY draw quote currency; a spot SELL draws
+// base currency.
+//
+// Option instrument symbols are the 5-part BASE-QUOTE-STRIKE-EXPIRY-TYPE
+// form (e.g. "BTC-BIUSD-55000-20260917-CALL") — naively reusing the 2-part
+// SplitN(symbol, "-", 2) split used for spot/futures took "BIUSD-55000-
+// 20260917-CALL" as the "asset", which is never a real balance column, so
+// EVERY options BUY order (whose parts[1] became that garbage string) was
+// rejected "unsupported asset" and never even reached the engine. A SELL
+// (writer) order happened to still work by accident: SplitN's parts[0]
+// ("BTC") IS a real asset, purely coincidentally, not because the logic was
+// options-aware. Both option sides actually settle in the quote currency
+// (see the engine's assetFor: "Buyer pays premium in quote currency;
+// seller... posts cash-secured collateral in quote currency too") — the
+// buy/sell branch below that spot/futures need does not apply to options at
+// all, which is why this needs its own branch rather than reusing theirs.
+func settlementAssetForOrder(symbol, market, side string) (asset string, ok bool) {
+	if strings.EqualFold(market, "OPTIONS") {
+		parts := strings.Split(symbol, "-")
+		if len(parts) < 5 {
+			return "", false
+		}
+		return parts[1], true
+	}
+	parts := strings.SplitN(symbol, "-", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	asset = parts[1]
+	if strings.EqualFold(side, "SELL") && !strings.EqualFold(market, "FUTURES") {
+		asset = parts[0]
+	}
+	return asset, true
+}
+
+// hasLiveReservation reports whether an engine BalanceResponse.Reserved
+// string represents a positive reservation — i.e. whether
+// reconcileOrderBalance must skip its drift-correcting Debit/Credit call for
+// this account+asset. Extracted as a pure function so this specific guard
+// (the fix for the cross-process settlement race described in
+// reconcileOrderBalance's own comment) is directly unit-testable without
+// standing up a real engine or Postgres.
+func hasLiveReservation(reservedStr string) bool {
+	reserved, ok := new(big.Rat).SetString(reservedStr)
+	return ok && reserved.Sign() > 0
+}
+
 func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symbol, market, side string) error {
 	if s.Ledger == nil || s.Engine == nil {
 		return nil
 	}
-	parts := strings.SplitN(symbol, "-", 2)
-	if len(parts) != 2 {
+	asset, ok := settlementAssetForOrder(symbol, market, side)
+	if !ok {
 		return nil
-	}
-	asset := parts[1]
-	if strings.EqualFold(side, "SELL") && !strings.EqualFold(market, "FUTURES") {
-		asset = parts[0]
 	}
 	bals, err := s.Ledger.BalancesFor(ctx, accountID)
 	if err != nil {
@@ -261,6 +310,41 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if err != nil {
 		return fmt.Errorf("check engine balance: %w", err)
 	}
+
+	// Never correct drift while the engine has ANY live reservation for this
+	// asset — a second, deeper bug behind the same symptom the comment above
+	// already found once (the stale Balance-vs-Available comparison). Even
+	// comparing Available correctly, Engine.Debit/Credit are still unsafe to
+	// call on an account with open reservations: risk.Ledger.Debit both
+	// reduces balance AND releases reservation "up to the debited amount",
+	// with no notion of WHICH order that reservation belongs to. A resting
+	// order can be settling (via the engine's own independent, concurrent
+	// call to /internal/balance/spot-settle, triggered by a DIFFERENT
+	// account's incoming order matching against it) at the exact moment this
+	// request's drift-correction Debit call runs — releasing the engine's
+	// reservation tracking for that in-flight settlement out from under it.
+	// The account's real Postgres lock is untouched by that Debit (it only
+	// mutates the engine's in-memory mirror), so the settlement's own
+	// locked-balance check then sees less than it needs and fails
+	// "insufficient locked ...", which halts the ENTIRE symbol for every
+	// account trading it — reproduced under concurrent multi-account load
+	// with no restart or outage involved, a genuine live race, not merely
+	// stale state.
+	//
+	// Reconciliation's actual job (per this function's own doc comment) is
+	// to catch drift from deposits made before the engine started or
+	// restarts after the startup backfill — both are properties of an
+	// account with NO open orders yet (a fresh deposit, or an account whose
+	// resting orders all predate the engine's last restart and so were
+	// already re-backfilled at boot). An account with a live reservation
+	// right now has already proven the two ledgers agreed on that
+	// reservation at some point; skipping correction here costs nothing
+	// real (any genuine remaining drift for OTHER, unreserved capital on
+	// this asset is still caught in full once the account is fully flat).
+	if hasLiveReservation(engineBal.Reserved) {
+		return nil
+	}
+
 	engineAmount, ok := new(big.Rat).SetString(engineBal.Available)
 	if !ok {
 		return fmt.Errorf("invalid engine balance %s", engineBal.Available)
