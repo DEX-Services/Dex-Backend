@@ -39,17 +39,21 @@ var assetColumns = map[string]string{
 	"ETH": `"ETH"`,
 	"SOL": `"SOL"`,
 	"BNB": `"BNB"`,
+	// BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added
+	// 2026-09-12) — same shape as ETH/SOL/BNB above.
+	"BI2X": `"BI2X"`,
 }
 
 var lockedColumns = map[string]string{
-	"BTC":   `"BTC_locked"`,
-	"USDC":  `"USDC_locked"`,
-	"USDT":  `"USDT_locked"`,
-	"BI":    `"BI_locked"`,
+	"BTC":    `"BTC_locked"`,
+	"USDC":   `"USDC_locked"`,
+	"USDT":   `"USDT_locked"`,
+	"BI":     `"BI_locked"`,
 	"BIUSDB": `"BIUSDB_locked"`,
-	"ETH":   `"ETH_locked"`,
-	"SOL":   `"SOL_locked"`,
-	"BNB":   `"BNB_locked"`,
+	"ETH":    `"ETH_locked"`,
+	"SOL":    `"SOL_locked"`,
+	"BNB":    `"BNB_locked"`,
+	"BI2X":   `"BI2X_locked"`,
 }
 
 func normalizeAsset(asset string) (string, string, error) {
@@ -739,16 +743,16 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
+	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
+	var btc, eth, sol, bnb, bi2x, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
+		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &bi2x, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -759,6 +763,7 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	balances["ETH"] = eth
 	balances["SOL"] = sol
 	balances["BNB"] = bnb
+	balances["BI2X"] = bi2x
 	balances["BIUSDB"] = biusd
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
@@ -769,11 +774,11 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
+	var btc, eth, sol, bnb, bi2x, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
+		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &bi2x, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -784,6 +789,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked["ETH"] = eth
 	locked["SOL"] = sol
 	locked["BNB"] = bnb
+	locked["BI2X"] = bi2x
 	locked["BIUSDB"] = biusd
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
@@ -893,6 +899,8 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		SELECT user_id, 'SOL', GREATEST("SOL" - "SOL_locked", 0)::text FROM user_balances WHERE "SOL" - "SOL_locked" > 0
 		UNION ALL
 		SELECT user_id, 'BNB', GREATEST("BNB" - "BNB_locked", 0)::text FROM user_balances WHERE "BNB" - "BNB_locked" > 0
+		UNION ALL
+		SELECT user_id, 'BI2X', GREATEST("BI2X" - "BI2X_locked", 0)::text FROM user_balances WHERE "BI2X" - "BI2X_locked" > 0
 		UNION ALL
 		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL

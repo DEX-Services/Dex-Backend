@@ -498,6 +498,13 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "SOL_locked" NUMERIC(38,0) NO
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
+-- BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added 2026-09-12,
+-- matching-engine's currentMarkets). Same pattern as ETH/SOL/BNB above —
+-- added alongside the market's own registration this time, not after, so
+-- deposits/MM funding never hit "unsupported asset" the way ETH/SOL/BNB did.
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2X" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2X_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+
 DO $wallet$
 BEGIN
 	IF EXISTS (
