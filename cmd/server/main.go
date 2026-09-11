@@ -204,6 +204,10 @@ func main() {
 	mux.HandleFunc("/trade/pnl-history", tradeSrv.PnlHistory)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
 	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
+	// BI2X chart datafeed proxy: the feed server sends no CORS header, so the
+	// frontend's TradingView UDF adapter points here instead of at the feed's
+	// own domain — see internal/api/bi2xchart.go's package doc for the why.
+	mux.HandleFunc("/bi2x-chart/", api.BI2XChartProxy(slog.Default()))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
