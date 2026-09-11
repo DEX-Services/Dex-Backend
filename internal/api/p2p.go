@@ -94,7 +94,7 @@ func (s *P2PServer) Price(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
 	if asset == "" {
-		asset = "BIUSD"
+		asset = "BIUSDB"
 	}
 	price, err := s.P2P.PriceFor(r.Context(), asset)
 	if err != nil {
@@ -104,7 +104,7 @@ func (s *P2PServer) Price(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"price": price})
 }
 
-// Wallet: GET /p2p/wallet returns the dedicated BIUSD P2P wallet.
+// Wallet: GET /p2p/wallet returns the dedicated BIUSDB P2P wallet.
 func (s *P2PServer) Wallet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -123,7 +123,7 @@ func (s *P2PServer) Wallet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"balance": balances[0], "balances": balances})
 }
 
-// FundWallet: POST /p2p/wallet/fund moves main-wallet BIUSD into P2P.
+// FundWallet: POST /p2p/wallet/fund moves main-wallet BIUSDB into P2P.
 func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) {
 		return
@@ -139,7 +139,7 @@ func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
 	if asset == "" {
-		asset = "BIUSD"
+		asset = "BIUSDB"
 	}
 	balance, moved, err := s.P2P.FundWalletAsset(r.Context(), userID, asset, req.AmountRaw, req.IdempotencyKey)
 	if err != nil {
@@ -179,7 +179,7 @@ func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 	}
 	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
 	if asset == "" {
-		asset = "BIUSD"
+		asset = "BIUSDB"
 	}
 	listing, err := s.P2P.CreateListingWithLimits(r.Context(), userID, req.Side, asset, req.AmountRaw, req.PaymentMethods, req.Username, req.MinOrderFiat, req.MaxOrderFiat)
 	if err != nil {

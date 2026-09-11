@@ -23,8 +23,8 @@ const (
 	tokenLabel = "USDC"
 	// creditTokenLabel is what the deposit actually credits: the platform's
 	// internal stable quote currency, pegged 1:1 to tokenLabel. Every
-	// market's quote leg trades in BIUSD, not the raw deposited asset.
-	creditTokenLabel = "BIUSD"
+	// market's quote leg trades in BIUSDB, not the raw deposited asset.
+	creditTokenLabel = "BIUSDB"
 	// maxBlockRange stays under Fuji's public RPC eth_getLogs cap (2048 blocks per call).
 	maxBlockRange = 2000
 )

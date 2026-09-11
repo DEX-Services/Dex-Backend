@@ -23,17 +23,17 @@ var assetColumns = map[string]string{
 	"BTC":  `"BTC"`,
 	"USDC": `"USDC"`,
 	"USDT": `"USDT"`,
-	// BI: the platform's own native token (distinct from BIUSD, the stable
+	// BI: the platform's own native token (distinct from BIUSDB, the stable
 	// quote currency). Wallet/ledger balance column only — not yet wired
 	// into any matching-engine market.
 	"BI": `"BI"`,
-	// BIUSD is the platform's internal stable quote currency, pegged 1:1 to
+	// BIUSDB is the platform's internal stable quote currency, pegged 1:1 to
 	// USDT — it has no on-chain contract of its own. Every market's quote
-	// leg trades in BIUSD, not USDT; a real USDT/USDC deposit is credited as
-	// BIUSD at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
+	// leg trades in BIUSDB, not USDT; a real USDT/USDC deposit is credited as
+	// BIUSDB at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
 	// kept only as the deposit-intake ledger, not as tradable balances.
-	"BIUSD": `"BIUSD"`,
-	// ETH, SOL, and BNB back the ETH-BIUSD / SOL-BIUSD / BNB-BIUSD spot markets
+	"BIUSDB": `"BIUSDB"`,
+	// ETH, SOL, and BNB back the ETH-BIUSDB / SOL-BIUSDB / BNB-BIUSDB spot markets
 	// (matching-engine's currentMarkets) — base-asset balance columns, same
 	// shape as BTC.
 	"ETH": `"ETH"`,
@@ -46,7 +46,7 @@ var lockedColumns = map[string]string{
 	"USDC":  `"USDC_locked"`,
 	"USDT":  `"USDT_locked"`,
 	"BI":    `"BI_locked"`,
-	"BIUSD": `"BIUSD_locked"`,
+	"BIUSDB": `"BIUSDB_locked"`,
 	"ETH":   `"ETH_locked"`,
 	"SOL":   `"SOL_locked"`,
 	"BNB":   `"BNB_locked"`,
@@ -530,10 +530,10 @@ func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourc
 
 // InsertDeposit records a confirmed on-chain deposit and credits the user's
 // tradable balance in creditToken at 1:1. token (what actually arrived
-// on-chain, e.g. "USDC") and creditToken (what gets credited, e.g. "BIUSD")
-// can differ: every market's quote leg trades in BIUSD, the platform's
+// on-chain, e.g. "USDC") and creditToken (what gets credited, e.g. "BIUSDB")
+// can differ: every market's quote leg trades in BIUSDB, the platform's
 // internal stable unit pegged 1:1 to the real deposited asset, so a real
-// stablecoin deposit converts into BIUSD at credit time while the ledger row
+// stablecoin deposit converts into BIUSDB at credit time while the ledger row
 // still records the true on-chain asset for an honest audit trail. Pass the
 // same value for both to credit the deposited asset directly (no conversion).
 func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, token, creditToken, amountRaw, txHash string) error {
@@ -739,14 +739,14 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BIUSD": "0", "USDC": "0", "USDT": "0", "BI": "0"}
+	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
 	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BIUSD"::text, "USDC"::text, "USDT"::text, "BI"::text
+		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
 		FROM user_balances
 		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
@@ -759,7 +759,7 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	balances["ETH"] = eth
 	balances["SOL"] = sol
 	balances["BNB"] = bnb
-	balances["BIUSD"] = biusd
+	balances["BIUSDB"] = biusd
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
 	balances["BI"] = bi
@@ -771,7 +771,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked := map[string]string{}
 	var btc, eth, sol, bnb, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BIUSD_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
+		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
 		FROM user_balances
 		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
@@ -784,7 +784,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked["ETH"] = eth
 	locked["SOL"] = sol
 	locked["BNB"] = bnb
-	locked["BIUSD"] = biusd
+	locked["BIUSDB"] = biusd
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
 	locked["BI"] = bi
@@ -896,7 +896,7 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		UNION ALL
 		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BIUSD', GREATEST("BIUSD" - "BIUSD_locked", 0)::text FROM user_balances WHERE "BIUSD" - "BIUSD_locked" > 0
+		SELECT user_id, 'BIUSDB', GREATEST("BIUSDB" - "BIUSDB_locked", 0)::text FROM user_balances WHERE "BIUSDB" - "BIUSDB_locked" > 0
 		UNION ALL
 		SELECT user_id, 'BI', GREATEST("BI" - "BI_locked", 0)::text FROM user_balances WHERE "BI" - "BI_locked" > 0`)
 	if err != nil {

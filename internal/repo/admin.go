@@ -53,7 +53,7 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 			(SELECT COUNT(*) FROM ledger_entries),
 			(SELECT COALESCE(SUM(amount), 0)::text FROM ledger_entries WHERE status = 'confirmed' AND kind = 'deposit'),
 			(SELECT COUNT(*) FROM ledger_entries WHERE kind = 'withdrawal_request' AND status IN ('pending', 'processing')),
-			(SELECT COALESCE((SELECT available_raw FROM p2p_admin_wallet_balances WHERE asset='BIUSD'), 0)::text)`).
+			(SELECT COALESCE((SELECT available_raw FROM p2p_admin_wallet_balances WHERE asset='BIUSDB'), 0)::text)`).
 		Scan(&s.TotalUsers, &s.ActiveUsers24h, &s.OpenSessions, &s.TotalLedgerEntries, &s.ConfirmedLedgerRaw, &s.PendingWithdrawals, &s.P2PFeeWalletRaw); err != nil {
 		return s, err
 	}
@@ -61,7 +61,7 @@ func (r *AdminRepo) Summary(ctx context.Context) (models.AdminSummary, error) {
 	tokenRows, err := r.pool.Query(ctx, `
 		SELECT token, amount::text, locked::text
 		FROM (
-			SELECT 'BIUSD' AS token, COALESCE(SUM("BIUSD"), 0) AS amount, COALESCE(SUM("BIUSD_locked"), 0) AS locked FROM user_balances
+			SELECT 'BIUSDB' AS token, COALESCE(SUM("BIUSDB"), 0) AS amount, COALESCE(SUM("BIUSDB_locked"), 0) AS locked FROM user_balances
 			UNION ALL SELECT 'USDC', COALESCE(SUM("USDC"), 0), COALESCE(SUM("USDC_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'USDT', COALESCE(SUM("USDT"), 0), COALESCE(SUM("USDT_locked"), 0) FROM user_balances
 			UNION ALL SELECT 'BTC', COALESCE(SUM("BTC"), 0), COALESCE(SUM("BTC_locked"), 0) FROM user_balances

@@ -188,7 +188,7 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 // Which asset to reconcile depends on market, not just side: a SPOT order
 // locks its base asset on SELL and its quote asset on BUY (the two legs the
 // trader actually holds), but a FUTURES order always margins in the quote
-// asset (BIUSD) regardless of side — shorting a non-crypto-backed future like
+// asset (BIUSDB) regardless of side — shorting a non-crypto-backed future like
 // EURUSD/GOLD/AAPL.us has no base-asset ledger column at all (there is no
 // spot book, so no such balance exists), and even for crypto-backed futures
 // (BTC/ETH/SOL/BNB) a SELL is a margined short, not a spend of held BTC/ETH/
@@ -204,8 +204,8 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 // base currency.
 //
 // Option instrument symbols are the 5-part BASE-QUOTE-STRIKE-EXPIRY-TYPE
-// form (e.g. "BTC-BIUSD-55000-20260917-CALL") — naively reusing the 2-part
-// SplitN(symbol, "-", 2) split used for spot/futures took "BIUSD-55000-
+// form (e.g. "BTC-BIUSDB-55000-20260917-CALL") — naively reusing the 2-part
+// SplitN(symbol, "-", 2) split used for spot/futures took "BIUSDB-55000-
 // 20260917-CALL" as the "asset", which is never a real balance column, so
 // EVERY options BUY order (whose parts[1] became that garbage string) was
 // rejected "unsupported asset" and never even reached the engine. A SELL
