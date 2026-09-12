@@ -441,6 +441,13 @@ ALTER TABLE users
 	DROP COLUMN IF EXISTS "USDT",
 	DROP COLUMN IF EXISTS "BI";
 
+-- Every "BI"/"BI_locked" reference below (CREATE TABLE, ADD COLUMN, and the
+-- legacy $wallet$ migration further down that still writes into it) must
+-- stay intact: the platform's native "BI" token column is finally dropped
+-- for good at the END of this migration (see the DROP COLUMN there), after
+-- that legacy migration has had the chance to run on any database still
+-- upgrading from the old wide-table schema. Removing it earlier here would
+-- break that migration on such a database.
 CREATE TABLE IF NOT EXISTS user_balances (
 	balance_id BIGSERIAL PRIMARY KEY,
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -572,6 +579,16 @@ BEGIN
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 	END IF;
 END $wallet$;
+
+-- BI (the platform's own native token, formerly migrated from an older
+-- "OUR_TOKEN"/"OURTOKEN" naming — see the $wallet$ migration block above,
+-- which still needs this column to exist when it runs) removed 2026-09-13:
+-- never wired into any matching-engine market, a wallet/ledger column with
+-- nothing behind it, same as ETH/SOL/BNB before their removal. This drop
+-- must stay AFTER the migration block above, since that block still writes
+-- into "BI" on databases upgrading from the old wide-table schema.
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "BI";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "BI_locked";
 `
 
 // migrateLegacyIDColumn converts users.id / user_sessions.user_id from UUID to TEXT

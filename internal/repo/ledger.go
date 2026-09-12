@@ -23,10 +23,6 @@ var assetColumns = map[string]string{
 	"BTC":  `"BTC"`,
 	"USDC": `"USDC"`,
 	"USDT": `"USDT"`,
-	// BI: the platform's own native token (distinct from BIUSDB, the stable
-	// quote currency). Wallet/ledger balance column only — not yet wired
-	// into any matching-engine market.
-	"BI": `"BI"`,
 	// BIUSDB is the platform's internal stable quote currency, pegged 1:1 to
 	// USDT — it has no on-chain contract of its own. Every market's quote
 	// leg trades in BIUSDB, not USDT; a real USDT/USDC deposit is credited as
@@ -44,6 +40,11 @@ var assetColumns = map[string]string{
 	// touches a base-asset column (internal/settlement/futures.go debits/
 	// credits quoteAsset only), so these columns became genuinely unused and
 	// were dropped (see migrateDropETHSOLBNBColumns in internal/db/db.go).
+	//
+	// BI (the platform's own native token, distinct from BI2X/BIUSDB) was
+	// also removed (2026-09-13): it was never wired into any
+	// matching-engine market, same as ETH/SOL/BNB were before their
+	// removal — a wallet/ledger column with nothing behind it.
 	"BI2X": `"BI2X"`,
 }
 
@@ -51,7 +52,6 @@ var lockedColumns = map[string]string{
 	"BTC":    `"BTC_locked"`,
 	"USDC":   `"USDC_locked"`,
 	"USDT":   `"USDT_locked"`,
-	"BI":     `"BI_locked"`,
 	"BIUSDB": `"BIUSDB_locked"`,
 	"BI2X":   `"BI2X_locked"`,
 }
@@ -743,16 +743,16 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
+	return map[string]string{"BTC": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, bi2x, biusd, usdc, usdt, bi string
+	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
+		SELECT "BTC"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -764,18 +764,17 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	balances["BIUSDB"] = biusd
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
-	balances["BI"] = bi
 	return balances, nil
 }
 
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, bi2x, biusd, usdc, usdt, bi string
+	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
+		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -787,7 +786,6 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked["BIUSDB"] = biusd
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
-	locked["BI"] = bi
 	return locked, nil
 }
 
@@ -814,7 +812,11 @@ func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID strin
 		}
 		switch token {
 		case "OUR_TOKEN", "BI":
-			holds["BI"] = amount
+			// BI (the platform's native token, formerly "OUR_TOKEN") was
+			// removed 2026-09-13 — never wired into any market. Any
+			// leftover withdrawal-request rows under either legacy name
+			// are skipped rather than surfaced under a key holds no
+			// longer tracks.
 		default:
 			holds[token] = amount
 		}
@@ -892,9 +894,7 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		UNION ALL
 		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BIUSDB', GREATEST("BIUSDB" - "BIUSDB_locked", 0)::text FROM user_balances WHERE "BIUSDB" - "BIUSDB_locked" > 0
-		UNION ALL
-		SELECT user_id, 'BI', GREATEST("BI" - "BI_locked", 0)::text FROM user_balances WHERE "BI" - "BI_locked" > 0`)
+		SELECT user_id, 'BIUSDB', GREATEST("BIUSDB" - "BIUSDB_locked", 0)::text FROM user_balances WHERE "BIUSDB" - "BIUSDB_locked" > 0`)
 	if err != nil {
 		return nil, err
 	}
