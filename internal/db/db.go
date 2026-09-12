@@ -103,6 +103,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"wallet balances", ensureUserBalancesTable},
 		{"P2P tables", ensureP2PTables},
 		{"USDT to BIUSDB", migrateUSDTToBIUSDB},
+		{"fee config tables", ensureFeeConfigTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -605,4 +606,67 @@ UPDATE user_balances SET
 	"USDT_locked" = 0,
 	updated_at = now()
 WHERE "USDT" > 0 OR "USDT_locked" > 0;
+`
+
+// ensureFeeConfigTables creates and seeds fee_config, fee_tiers, and
+// user_fee_subscriptions — the same three tables matching-engine's
+// internal/feeconfig and internal/discounts packages own (see
+// FEE-TIER-SYSTEM-PLAN.md). Both services share one Postgres instance and
+// either may boot first, so this is written identically idempotent
+// (CREATE TABLE IF NOT EXISTS, ON CONFLICT DO NOTHING) — whichever service
+// starts first creates the tables/seeds the defaults, and the other just
+// finds them already there.
+const ensureFeeConfigTables = `
+CREATE TABLE IF NOT EXISTS fee_config (
+    key        TEXT PRIMARY KEY,
+    rate       NUMERIC(10,6) NOT NULL,
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO fee_config (key, rate) VALUES
+    ('spot.maker', '0.0015'),
+    ('spot.taker', '0.0045'),
+    ('futures.maker', '0.00015'),
+    ('futures.taker', '0.00045'),
+    ('p2p.buyer', '0.0025'),
+    ('p2p.seller', '0.0025'),
+    ('swap.in', '0'),
+    ('swap.out', '0.01'),
+    ('liquidation', '0.02')
+ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS fee_tiers (
+    tier         INT PRIMARY KEY,
+    biusdb_value NUMERIC(20,2) NOT NULL,
+    discount_pct NUMERIC(5,2) NOT NULL,
+    active       BOOLEAN NOT NULL DEFAULT true
+);
+
+INSERT INTO fee_tiers (tier, biusdb_value, discount_pct) VALUES
+    (1, '500', '5'),
+    (2, '1000', '10'),
+    (3, '5000', '15'),
+    (4, '10000', '20'),
+    (5, '20000', '25'),
+    (6, '40000', '30'),
+    (7, '60000', '35'),
+    (8, '80000', '40'),
+    (9, '100000', '45'),
+    (10, '200000', '50')
+ON CONFLICT (tier) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS user_fee_subscriptions (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             TEXT NOT NULL,
+    tier                INT NOT NULL REFERENCES fee_tiers(tier),
+    bi2x_price_snapshot NUMERIC(20,8) NOT NULL,
+    bi2x_amount_paid    NUMERIC(38,0) NOT NULL,
+    purchased_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_by_admin    BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_user_fee_subscriptions_lookup
+    ON user_fee_subscriptions (user_id, status, expires_at);
 `

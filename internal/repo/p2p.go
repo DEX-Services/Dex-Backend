@@ -9,9 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 const (
@@ -23,7 +25,7 @@ const (
 	p2pFundingWallet        = "P2P_WALLET"
 	p2pFundingLegacyMain    = "MAIN_WALLET_LEGACY"
 	p2pFeeModelLegacy       = "LEGACY_FIAT"
-	p2pFeeModelBIUSDB         = "BIUSDB_1PCT_EACH"
+	p2pFeeModelBIUSDB       = "BIUSDB_1PCT_EACH"
 )
 
 var (
@@ -45,10 +47,11 @@ var p2pFiatLimitPattern = regexp.MustCompile(`^\d+(?:\.\d{1,2})?$`)
 type P2PRepo struct {
 	pool   *pgxpool.Pool
 	ledger *LedgerRepo
+	fees   *feeconfig.Client
 }
 
 func NewP2PRepo(pool *pgxpool.Pool) *P2PRepo {
-	return &P2PRepo{pool: pool, ledger: NewLedgerRepo(pool)}
+	return &P2PRepo{pool: pool, ledger: NewLedgerRepo(pool), fees: feeconfig.New(pool)}
 }
 
 func (r *P2PRepo) TodayPrice(ctx context.Context) (*models.P2PPrice, error) {
@@ -128,20 +131,42 @@ func validateP2POrderLimits(amountRaw, price, minOrderFiat, maxOrderFiat string)
 	return minOrderFiat, maxOrderFiat, nil
 }
 
-// p2pBIUSDBSettlement returns raw-unit movements for the 1% fee on each side.
-// Any fraction smaller than one raw BIUSDB unit is rounded down.
-func p2pBIUSDBSettlement(amountRaw string) (feeRaw, buyerCreditRaw, sellerDebitRaw string, err error) {
+// p2pRateToBig converts a fee rate (decimal fraction, e.g. 0.0025 for 0.25%)
+// into an integer basis-points value for exact big.Int arithmetic, avoiding
+// float rounding on raw token amounts. Rounded to the nearest basis point —
+// more precision than that is not meaningful at this fee's typical size and
+// keeps the math identical in shape to swapFeeRate's existing bps approach.
+func p2pRateToBig(rate decimal.Decimal) *big.Int {
+	bps := rate.Mul(decimal.NewFromInt(10000)).Round(0)
+	return bps.BigInt()
+}
+
+// p2pBIUSDBSettlement returns raw-unit movements for the platform's P2P fee,
+// applied independently to each side at that side's own (already
+// discount-adjusted) rate — see feeconfig.Client.EffectiveRate. Any fraction
+// smaller than one raw BIUSDB unit is rounded down. The two fees are returned
+// separately (buyerFeeRaw, sellerFeeRaw) since a differing discount per side
+// means they are no longer guaranteed equal, unlike the old flat-1%-each
+// design this replaces.
+func p2pBIUSDBSettlement(amountRaw string, buyerRate, sellerRate decimal.Decimal) (buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw string, err error) {
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok || amount.Sign() <= 0 {
-		return "", "", "", fmt.Errorf("invalid P2P amount")
+		return "", "", "", "", fmt.Errorf("invalid P2P amount")
 	}
-	fee := new(big.Int).Div(new(big.Int).Set(amount), big.NewInt(100))
-	buyerCredit := new(big.Int).Sub(new(big.Int).Set(amount), fee)
-	sellerDebit := new(big.Int).Add(new(big.Int).Set(amount), fee)
+	buyerBps := p2pRateToBig(buyerRate)
+	sellerBps := p2pRateToBig(sellerRate)
+
+	buyerFee := new(big.Int).Mul(amount, buyerBps)
+	buyerFee.Div(buyerFee, big.NewInt(10000))
+	sellerFee := new(big.Int).Mul(amount, sellerBps)
+	sellerFee.Div(sellerFee, big.NewInt(10000))
+
+	buyerCredit := new(big.Int).Sub(new(big.Int).Set(amount), buyerFee)
+	sellerDebit := new(big.Int).Add(new(big.Int).Set(amount), sellerFee)
 	if buyerCredit.Sign() <= 0 {
-		return "", "", "", fmt.Errorf("amount is too small after fees")
+		return "", "", "", "", fmt.Errorf("amount is too small after fees")
 	}
-	return fee.String(), buyerCredit.String(), sellerDebit.String(), nil
+	return buyerFee.String(), sellerFee.String(), buyerCredit.String(), sellerDebit.String(), nil
 }
 
 func validateIdempotencyKey(key string, required bool) (string, error) {
@@ -404,7 +429,12 @@ func (r *P2PRepo) CreateListingWithLimits(ctx context.Context, creatorID, side, 
 	if err != nil {
 		return nil, err
 	}
-	_, _, reserveRaw, err := p2pBIUSDBSettlement(amountRaw)
+	// Reserve at the listing creator's OWN rate — the counterparty isn't known
+	// yet at listing-creation time, and this reservation is later released
+	// verbatim on cancellation (see CancelListing), so it must be computed
+	// the same way in both places for the same creator.
+	sellerRate := r.fees.EffectiveRate(ctx, feeconfig.KeyP2PSeller, creatorID)
+	_, _, _, reserveRaw, err := p2pBIUSDBSettlement(amountRaw, decimal.Zero, sellerRate)
 	if err != nil {
 		return nil, err
 	}
@@ -603,9 +633,11 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	} else if err != nil {
 		return nil, err
 	}
-	feeRaw, buyerCreditRaw, sellerDebitRaw := "0", amountRaw, amountRaw
+	buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw := "0", "0", amountRaw, amountRaw
 	if feeModel == p2pFeeModelBIUSDB {
-		feeRaw, buyerCreditRaw, sellerDebitRaw, err = p2pBIUSDBSettlement(amountRaw)
+		buyerRate := r.fees.EffectiveRate(ctx, feeconfig.KeyP2PBuyer, buyerID)
+		sellerRate := r.fees.EffectiveRate(ctx, feeconfig.KeyP2PSeller, sellerID)
+		buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw, err = p2pBIUSDBSettlement(amountRaw, buyerRate, sellerRate)
 		if err != nil {
 			return nil, err
 		}
@@ -657,7 +689,7 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	if _, err = tx.Exec(ctx, `UPDATE p2p_listings SET remaining_raw=remaining_raw-$2::numeric,status=CASE WHEN remaining_raw-$2::numeric=0 THEN 'FILLED' ELSE status END,updated_at=now() WHERE id=$1`, listingID, amountRaw); err != nil {
 		return nil, err
 	}
-	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, selectedMethod, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key)
+	order, err := r.insertOrder(ctx, tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, selectedMethod, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key)
 	if err != nil {
 		return nil, err
 	}
@@ -681,16 +713,19 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	return order, nil
 }
 
-func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key string) (*models.P2POrder, error) {
+func (r *P2PRepo) insertOrder(ctx context.Context, tx pgx.Tx, listingID, sellerID, buyerID, takerID, asset, amountRaw, buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, key string) (*models.P2POrder, error) {
 	var dbKey any
 	if key != "" {
 		dbKey = key
 	}
-	q := `WITH amounts AS (SELECT round(($6::numeric/1000000)*$11::numeric,8) AS gross)
+	// buyer_fee_raw and seller_fee_raw are bound separately ($7, $8) rather
+	// than sharing one placeholder — a per-side discount means the two fees
+	// are no longer guaranteed equal (see p2pBIUSDBSettlement).
+	q := `WITH amounts AS (SELECT round(($6::numeric/1000000)*$12::numeric,8) AS gross)
 	INSERT INTO p2p_orders(listing_id,seller_id,buyer_id,taker_id,asset,amount_raw,escrow_raw,price,fiat_currency,gross_amount,buyer_fee,seller_fee,buyer_payable,seller_receivable,buyer_fee_raw,seller_fee_raw,buyer_credit_raw,seller_debit_raw,fee_model,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,buyer_credit,seller_debit,fiat_amount,buyer_fee_fiat,seller_fee_fiat,buyer_pays_fiat,seller_receives_fiat,status,idempotency_key,expires_at)
-	SELECT $1,$2,$3,$4,$5,$6,$9,$11,$12,gross,0,0,gross,gross,$7,$7,$8,$9,$10,$13,$14,$15,$16,$17,$18,$8,$9,gross,0,0,gross,gross,'pending_payment',$19,$20 FROM amounts
+	SELECT $1,$2,$3,$4,$5,$6,$10,$12,$13,gross,0,0,gross,gross,$7,$8,$9,$10,$11,$14,$15,$16,$17,$18,$19,$9,$10,gross,0,0,gross,gross,'pending_payment',$20,$21 FROM amounts
 	RETURNING id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at`
-	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, takerID, asset, amountRaw, feeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, dbKey, time.Now().Add(15*time.Minute)))
+	return scanOrder(tx.QueryRow(ctx, q, listingID, sellerID, buyerID, takerID, asset, amountRaw, buyerFeeRaw, sellerFeeRaw, buyerCreditRaw, sellerDebitRaw, feeModel, price, fiat, method, paymentAccountName, paymentAccountID, paymentBankName, paymentIFSCCode, paymentInstructions, dbKey, time.Now().Add(15*time.Minute)))
 }
 
 func (r *P2PRepo) Orders(ctx context.Context, userID string) ([]models.P2POrder, error) {
@@ -1020,7 +1055,12 @@ func (r *P2PRepo) CancelListing(ctx context.Context, sellerID, listingID string)
 	} else if source == p2pFundingWallet {
 		releaseRaw := remaining
 		if feeModel == p2pFeeModelBIUSDB {
-			_, _, releaseRaw, err = p2pBIUSDBSettlement(remaining)
+			// Release exactly what was reserved at listing-creation time: that
+			// reservation used only the seller's OWN rate (buyer unknown at
+			// listing time — see CreateListingWithLimits), so mirror that here
+			// rather than the two-sided rate used once an order actually exists.
+			sellerRate := r.fees.EffectiveRate(ctx, feeconfig.KeyP2PSeller, sellerID)
+			_, _, _, releaseRaw, err = p2pBIUSDBSettlement(remaining, decimal.Zero, sellerRate)
 			if err != nil {
 				return err
 			}

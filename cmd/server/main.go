@@ -14,9 +14,11 @@ import (
 
 	"github.com/dex/dex-backend/internal/api"
 	"github.com/dex/dex-backend/internal/auth"
+	"github.com/dex/dex-backend/internal/bi2xprice"
 	"github.com/dex/dex-backend/internal/chain"
 	"github.com/dex/dex-backend/internal/db"
 	"github.com/dex/dex-backend/internal/engineclient"
+	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/repo"
 	"github.com/joho/godotenv"
 )
@@ -48,6 +50,8 @@ func main() {
 	ledgerRepo := repo.NewLedgerRepo(pool)
 	adminRepo := repo.NewAdminRepo(pool)
 	p2pRepo := repo.NewP2PRepo(pool)
+	feesClient := feeconfig.New(pool)
+	feeTierRepo := repo.NewFeeTierRepo(ledgerRepo, feesClient)
 	engineClient := engineclient.New()
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -80,6 +84,7 @@ func main() {
 		Admins:       parseAdminAddresses(os.Getenv("ADMIN_WALLET_ADDRESSES")),
 		EngineSecret: os.Getenv("ENGINE_SHARED_SECRET"),
 		EngineClient: engineClient,
+		Fees:         feesClient,
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
@@ -99,6 +104,7 @@ func main() {
 	}
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo, Engine: engineClient}
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
+	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -204,6 +210,12 @@ func main() {
 	mux.HandleFunc("/trade/pnl-history", tradeSrv.PnlHistory)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
 	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
+	mux.HandleFunc("/fees/tiers", feeSrv.Tiers)
+	mux.HandleFunc("/fees/my-subscription", feeSrv.MySubscription)
+	mux.HandleFunc("/fees/subscribe", feeSrv.Subscribe)
+	mux.HandleFunc("/admin/fees", feeSrv.AdminFees)
+	mux.HandleFunc("/admin/fees/set", feeSrv.AdminSetFee)
+	mux.HandleFunc("/admin/fees/subscriptions", feeSrv.AdminFeeSubscriptions)
 	// BI2X chart datafeed proxy: the feed server sends no CORS header, so the
 	// frontend's TradingView UDF adapter points here instead of at the feed's
 	// own domain — see internal/api/bi2xchart.go's package doc for the why.

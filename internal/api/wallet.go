@@ -12,7 +12,9 @@ import (
 
 	"github.com/dex/dex-backend/internal/chain"
 	"github.com/dex/dex-backend/internal/engineclient"
+	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/repo"
+	"github.com/shopspring/decimal"
 )
 
 const usdcToken = "USDC"
@@ -27,6 +29,7 @@ type WalletServer struct {
 	Admins       map[string]bool
 	EngineSecret string
 	EngineClient *engineclient.Client
+	Fees         *feeconfig.Client
 }
 
 // Balance: GET /wallet/balance
@@ -167,32 +170,39 @@ type swapRequestBody struct {
 	DestinationAsset string `json:"destinationAsset"`
 }
 
-// swapFeeBpsOut is the one-way fee charged when swapping OUT of the platform's
-// internal stable (BIUSDB → USDT/USDC), in basis points of the source amount.
-// Swapping INTO BIUSDB (USDT→BIUSDB, USDC→BIUSDB) is free — it moves deposit-intake
-// funds into the tradable quote currency. The 1% conversion charge on the way
-// back out is deducted from the credited destination amount.
-const swapFeeBpsOut = 100 // 1%
-
 // swapDestinations maps each allowed source asset to the destinations it may
 // be swapped into. The exchange is deliberately one-directional per asset:
 // USDT/USDC convert only into BIUSDB, and BIUSDB converts only back into
 // USDT/USDC. A direct USDT↔USDC conversion is not offered (route through
 // BIUSDB instead), and no other assets participate in swaps.
 var swapDestinations = map[string]map[string]bool{
-	"USDT": {"BIUSDB": true},
-	"USDC": {"BIUSDB": true},
+	"USDT":   {"BIUSDB": true},
+	"USDC":   {"BIUSDB": true},
 	"BIUSDB": {"USDT": true, "USDC": true},
 }
 
-// swapFeeRate returns the fee in basis points charged when converting source
-// into destination, and whether any fee applies at all. Into BIUSDB is free;
-// out of BIUSDB carries the conversion charge.
-func swapFeeRate(destination string) (feeBps int64, charged bool) {
-	if destination == "BIUSDB" {
+// swapFeeRate returns the (discount-adjusted) fee in basis points charged
+// when userID converts source into destination, and whether any fee applies
+// at all. Into BIUSDB is free; out of BIUSDB carries the conversion charge —
+// read from fee_config (feeconfig.KeySwapIn/KeySwapOut), not a hardcoded
+// constant, so an admin can retune it without a redeploy, and adjusted by
+// userID's active fee-tier discount the same way P2P/spot/futures fees are.
+func (s *WalletServer) swapFeeRate(ctx context.Context, destination, userID string) (feeBps int64, charged bool) {
+	if s.Fees == nil {
+		// No fee-config client wired (e.g. a test harness or a deployment that
+		// hasn't set one up) — behave as "no fee configured" rather than panic.
 		return 0, false
 	}
-	return swapFeeBpsOut, true
+	key := feeconfig.KeySwapIn
+	if destination != "BIUSDB" {
+		key = feeconfig.KeySwapOut
+	}
+	rate := s.Fees.EffectiveRate(ctx, key, userID)
+	if rate.IsZero() {
+		return 0, false
+	}
+	bps := rate.Mul(decimal.NewFromInt(10000)).Round(0).IntPart()
+	return bps, true
 }
 
 // Swap: POST /wallet/swap {amount, sourceAsset, destinationAsset}
@@ -240,7 +250,7 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 	// and deducted from what is credited. Integer arithmetic (no floats) so
 	// raw token amounts stay exact.
 	credited := new(big.Int).Set(amount)
-	feeBps, feeCharged := swapFeeRate(destination)
+	feeBps, feeCharged := s.swapFeeRate(r.Context(), destination, claims.UserID)
 	var feeAmount *big.Int
 	if feeCharged {
 		feeAmount = new(big.Int).Mul(amount, big.NewInt(feeBps))

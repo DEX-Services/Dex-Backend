@@ -62,13 +62,18 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load reserved wallet: %v", err)
 	}
-	assertWallet(t, balance, "0", "20200000", "20200000")
+	// Reserved at listing-creation time using only the seller's own rate
+	// (0.25% of 20,000,000 = 50,000): 20,000,000 + 50,000 = 20,050,000
+	// reserved, leaving 150,000 of the 20,200,000 funded still available.
+	assertWallet(t, balance, "150000", "20050000", "20200000")
 
 	order, err := p2p.CreateOrder(ctx, buyerID, listing.ID, "5000000", "order-test-success")
 	if err != nil {
 		t.Fatalf("create success order: %v", err)
 	}
-	if order.Status != P2PStatusPendingPayment || order.EscrowRaw != "5050000" || order.BuyerFeeRaw != "50000" || order.SellerFeeRaw != "50000" {
+	// 0.25% of 5,000,000 = 12,500 per side (platform default rates, see
+	// FEE-TIER-SYSTEM-PLAN.md — was a flat 1% total before this feature).
+	if order.Status != P2PStatusPendingPayment || order.EscrowRaw != "5012500" || order.BuyerFeeRaw != "12500" || order.SellerFeeRaw != "12500" {
 		t.Fatalf("new order status/escrow = %s/%s", order.Status, order.EscrowRaw)
 	}
 	if _, err = p2p.AddOrderProof(ctx, buyerID, order.ID, "proof.png", "image/png", []byte("proof")); err != nil {
@@ -88,8 +93,8 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load buyer wallet: %v", err)
 	}
-	assertWallet(t, buyerWallet, "4950000", "0", "4950000")
-	assertAdminP2PWallet(t, pool, "100000")
+	assertWallet(t, buyerWallet, "4987500", "0", "4987500")
+	assertAdminP2PWallet(t, pool, "25000")
 
 	// Releasing the same order concurrently/repeatedly remains exactly once.
 	var wg sync.WaitGroup
@@ -104,8 +109,8 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	}
 	wg.Wait()
 	buyerWallet, _ = p2p.WalletBalance(ctx, buyerID)
-	assertWallet(t, buyerWallet, "4950000", "0", "4950000")
-	assertAdminP2PWallet(t, pool, "100000")
+	assertWallet(t, buyerWallet, "4987500", "0", "4987500")
+	assertAdminP2PWallet(t, pool, "25000")
 
 	failedOrder, err := p2p.CreateOrder(ctx, buyerID, listing.ID, "5000000", "order-test-refund")
 	if err != nil {
@@ -122,7 +127,9 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load refunded seller wallet: %v", err)
 	}
-	assertWallet(t, sellerWallet, "0", "15150000", "15150000")
+	// 150,000 untouched + (15,037,500 remaining reserved after order 1's
+	// 5,012,500 came out of the original 20,050,000 listing reservation).
+	assertWallet(t, sellerWallet, "150000", "15037500", "15187500")
 
 	expiring, err := p2p.CreateOrder(ctx, buyerID, listing.ID, "5000000", "order-test-expiry")
 	if err != nil {
@@ -142,7 +149,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 		t.Fatalf("failed order status/escrow = %s/%s", failed.Status, failed.EscrowRaw)
 	}
 	sellerWallet, _ = p2p.WalletBalance(ctx, sellerID)
-	assertWallet(t, sellerWallet, "0", "15150000", "15150000")
+	assertWallet(t, sellerWallet, "150000", "15037500", "15187500")
 }
 
 func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
@@ -208,7 +215,8 @@ func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create BIUSDB order: %v", err)
 	}
-	if order.Asset != "BIUSDB" || order.EscrowRaw != "10100000" {
+	// 0.25% seller fee on 10,000,000 = 25,000 (platform default rate).
+	if order.Asset != "BIUSDB" || order.EscrowRaw != "10025000" {
 		t.Fatalf("BIUSDB order asset/escrow = %s/%s", order.Asset, order.EscrowRaw)
 	}
 	if order.PaymentBankName != "Test Bank" || order.PaymentIFSCCode != "TEST0123456" {
@@ -231,8 +239,8 @@ func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load buyer BIUSDB wallet: %v", err)
 	}
-	assertWallet(t, buyerBIUSDB, "9900000", "0", "9900000")
-	assertAdminP2PWallet(t, pool, "200000")
+	assertWallet(t, buyerBIUSDB, "9975000", "0", "9975000")
+	assertAdminP2PWallet(t, pool, "50000")
 }
 
 func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
@@ -300,7 +308,10 @@ func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load taker balance: %v", err)
 	}
-	assertWallet(t, takerBalance, "0", "0", "0")
+	// Taker was funded 5,050,000 (this test's fixture headroom, unrelated to
+	// the fee rate itself) but this order only debits amount + 0.25% seller
+	// fee = 5,000,000 + 12,500 = 5,012,500, leaving 37,500 available.
+	assertWallet(t, takerBalance, "37500", "0", "37500")
 
 	if _, err = p2p.MarkPaid(ctx, creatorBuyerID, order.ID); err != nil {
 		t.Fatalf("creator buyer marks paid: %v", err)
@@ -312,8 +323,8 @@ func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load creator buyer balance: %v", err)
 	}
-	assertWallet(t, creatorBalance, "4950000", "0", "4950000")
-	assertAdminP2PWallet(t, pool, "100000")
+	assertWallet(t, creatorBalance, "4987500", "0", "4987500")
+	assertAdminP2PWallet(t, pool, "25000")
 }
 
 func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
@@ -419,8 +430,9 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load buyer wallet: %v", err)
 	}
-	assertWallet(t, buyerWallet, "9900000", "0", "9900000")
-	assertAdminP2PWallet(t, pool, "200000")
+	// 0.25% buyer fee on 10,000,000 = 25,000 (platform default rate).
+	assertWallet(t, buyerWallet, "9975000", "0", "9975000")
+	assertAdminP2PWallet(t, pool, "50000")
 
 	refundOrder := createOrder("workflow-refund")
 	if _, err = p2p.AddOrderProof(ctx, buyerID, refundOrder.ID, "refund.png", "image/png", []byte("proof")); err != nil {
@@ -443,8 +455,14 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load refunded seller wallet: %v", err)
 	}
-	assertWallet(t, sellerWallet, "0", "10100000", "10100000")
-	assertAdminP2PWallet(t, pool, "200000")
+	// order2's escrow (its listing's own reserve, 10,000,000 + 0.25% seller
+	// fee = 10,025,000) goes back to RESERVED (its listing reactivates), not
+	// to available — refunding an order returns funds to the listing's own
+	// reservation, not the seller's free balance. 150,000 was already
+	// available (untouched leftover from listing1's smaller-than-funded
+	// reserve).
+	assertWallet(t, sellerWallet, "150000", "10025000", "10175000")
+	assertAdminP2PWallet(t, pool, "50000")
 }
 
 func TestP2PListingLimitsAndAdvertiserStatistics(t *testing.T) {
