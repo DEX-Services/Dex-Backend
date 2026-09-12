@@ -33,14 +33,17 @@ var assetColumns = map[string]string{
 	// BIUSDB at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
 	// kept only as the deposit-intake ledger, not as tradable balances.
 	"BIUSDB": `"BIUSDB"`,
-	// ETH, SOL, and BNB back the ETH-BIUSDB / SOL-BIUSDB / BNB-BIUSDB spot markets
-	// (matching-engine's currentMarkets) — base-asset balance columns, same
-	// shape as BTC.
-	"ETH": `"ETH"`,
-	"SOL": `"SOL"`,
-	"BNB": `"BNB"`,
 	// BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added
-	// 2026-09-12) — same shape as ETH/SOL/BNB above.
+	// 2026-09-12) — same shape as BTC.
+	//
+	// ETH, SOL, and BNB previously had columns here backing the
+	// ETH-BIUSDB/SOL-BIUSDB/BNB-BIUSDB SPOT markets. Those SPOT markets were
+	// removed in the 2026-09-12 restructure (ETH/SOL are now FUTURES-only,
+	// settled entirely in BIUSDB; BNB has no market at all) — see
+	// matching-engine's cmd/engine/markets.go. Futures settlement never
+	// touches a base-asset column (internal/settlement/futures.go debits/
+	// credits quoteAsset only), so these columns became genuinely unused and
+	// were dropped (see migrateDropETHSOLBNBColumns in internal/db/db.go).
 	"BI2X": `"BI2X"`,
 }
 
@@ -50,9 +53,6 @@ var lockedColumns = map[string]string{
 	"USDT":   `"USDT_locked"`,
 	"BI":     `"BI_locked"`,
 	"BIUSDB": `"BIUSDB_locked"`,
-	"ETH":    `"ETH_locked"`,
-	"SOL":    `"SOL_locked"`,
-	"BNB":    `"BNB_locked"`,
 	"BI2X":   `"BI2X_locked"`,
 }
 
@@ -743,16 +743,16 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "ETH": "0", "SOL": "0", "BNB": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
+	return map[string]string{"BTC": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0", "BI": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
-	var btc, eth, sol, bnb, bi2x, biusd, usdc, usdt, bi string
+	var btc, bi2x, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "ETH"::text, "SOL"::text, "BNB"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
+		SELECT "BTC"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text, "BI"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &bi2x, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -760,9 +760,6 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 		return nil, err
 	}
 	balances["BTC"] = btc
-	balances["ETH"] = eth
-	balances["SOL"] = sol
-	balances["BNB"] = bnb
 	balances["BI2X"] = bi2x
 	balances["BIUSDB"] = biusd
 	balances["USDC"] = usdc
@@ -774,11 +771,11 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 // LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
-	var btc, eth, sol, bnb, bi2x, biusd, usdc, usdt, bi string
+	var btc, bi2x, biusd, usdc, usdt, bi string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "ETH_locked"::text, "SOL_locked"::text, "BNB_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
+		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text, "BI_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &eth, &sol, &bnb, &bi2x, &biusd, &usdc, &usdt, &bi)
+		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt, &bi)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -786,9 +783,6 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 		return nil, err
 	}
 	locked["BTC"] = btc
-	locked["ETH"] = eth
-	locked["SOL"] = sol
-	locked["BNB"] = bnb
 	locked["BI2X"] = bi2x
 	locked["BIUSDB"] = biusd
 	locked["USDC"] = usdc
@@ -893,12 +887,6 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		SELECT user_id, 'USDC', GREATEST("USDC" - "USDC_locked", 0)::text FROM user_balances WHERE "USDC" - "USDC_locked" > 0
 		UNION ALL
 		SELECT user_id, 'BTC', GREATEST("BTC" - "BTC_locked", 0)::text FROM user_balances WHERE "BTC" - "BTC_locked" > 0
-		UNION ALL
-		SELECT user_id, 'ETH', GREATEST("ETH" - "ETH_locked", 0)::text FROM user_balances WHERE "ETH" - "ETH_locked" > 0
-		UNION ALL
-		SELECT user_id, 'SOL', GREATEST("SOL" - "SOL_locked", 0)::text FROM user_balances WHERE "SOL" - "SOL_locked" > 0
-		UNION ALL
-		SELECT user_id, 'BNB', GREATEST("BNB" - "BNB_locked", 0)::text FROM user_balances WHERE "BNB" - "BNB_locked" > 0
 		UNION ALL
 		SELECT user_id, 'BI2X', GREATEST("BI2X" - "BI2X_locked", 0)::text FROM user_balances WHERE "BI2X" - "BI2X_locked" > 0
 		UNION ALL

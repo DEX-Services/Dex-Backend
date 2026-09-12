@@ -487,22 +487,28 @@ BEGIN
 	END IF;
 END $drop_busd$;
 
--- ETH, SOL, and BNB: base assets for the ETH-BIUSDB / SOL-BIUSDB / BNB-BIUSDB spot
--- markets (matching-engine's currentMarkets). These were registered as
--- tradable markets before a real balance column backed them, so nobody could
--- ever actually hold or fund the base leg (deposits/MM desk funding failed
--- with "unsupported asset"). Added following the exact same pattern as BTC.
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "ETH" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "ETH_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "SOL" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "SOL_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BNB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+-- ETH, SOL, and BNB columns removed: the SPOT markets they backed
+-- (ETH-BIUSDB/SOL-BIUSDB/BNB-BIUSDB) were removed in the 2026-09-12
+-- restructure — ETH and SOL now trade FUTURES-only (settled entirely in
+-- BIUSDB, never touching a base-asset column; see
+-- matching-engine/internal/settlement/futures.go), and BNB has no market at
+-- all any more. Unlike BUSD above, there is no equivalent asset to fold
+-- these into (ETH/SOL/BNB are not interchangeable with BIUSDB), so this
+-- drops them outright rather than attempting a conversion.
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "ETH";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "ETH_locked";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "SOL";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "SOL_locked";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "BNB";
+ALTER TABLE user_balances DROP COLUMN IF EXISTS "BNB_locked";
 
 -- BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added 2026-09-12,
--- matching-engine's currentMarkets). Same pattern as ETH/SOL/BNB above —
--- added alongside the market's own registration this time, not after, so
--- deposits/MM funding never hit "unsupported asset" the way ETH/SOL/BNB did.
+-- matching-engine's currentMarkets). Added alongside the market's own
+-- registration, so deposits/MM funding never hit "unsupported asset" the way
+-- ETH/SOL/BNB briefly did before their columns existed (see the ETH/SOL/BNB
+-- ADD-then-DROP history below — those columns backed SPOT markets that were
+-- later removed in the 2026-09-12 restructure, so the ADD is gone from here
+-- and only the DROP remains).
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2X" NUMERIC(38,0) NOT NULL DEFAULT 0;
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2X_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
