@@ -163,6 +163,8 @@ func main() {
 	mux.HandleFunc("/admin/p2p/proofs/download", adminSrv.P2PProofDownload)
 	mux.HandleFunc("/admin/users/search", adminSrv.SearchUsers)
 	mux.HandleFunc("/admin/users/balance", adminSrv.AdjustUserBalance)
+	mux.HandleFunc("/admin/users/balance-detail", adminSrv.UserBalanceDetail)
+	mux.HandleFunc("/admin/users/release-locks", adminSrv.ReleaseStuckLocks)
 	mux.HandleFunc("/admin/halted", adminSrv.HaltedSymbols)
 	mux.HandleFunc("/admin/resume", adminSrv.ResumeSymbol)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)

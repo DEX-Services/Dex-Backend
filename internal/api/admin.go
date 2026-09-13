@@ -353,6 +353,114 @@ func (s *AdminServer) AdjustUserBalance(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"userId": req.UserID, "balances": balances})
 }
 
+// UserBalanceDetail: GET /admin/users/balance-detail?userId=...
+//
+// Read-only: total + locked balance per asset, plus available = total -
+// locked. Exists so support/admin can tell "genuinely funded a losing trade"
+// apart from "balance stuck behind an orphaned trading lock" before touching
+// anything — see ReleaseStuckLocks below, which fixes the latter.
+func (s *AdminServer) UserBalanceDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	userID := strings.TrimSpace(r.URL.Query().Get("userId"))
+	if userID == "" {
+		writeError(w, http.StatusBadRequest, "userId is required")
+		return
+	}
+	if _, err := s.Users.FindByID(r.Context(), userID); err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	totals, err := s.Ledger.BalancesFor(r.Context(), userID)
+	if err != nil {
+		s.Log.Error("admin balance detail: totals lookup failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load balances")
+		return
+	}
+	locked, err := s.Ledger.LockedBalancesFor(r.Context(), userID)
+	if err != nil {
+		s.Log.Error("admin balance detail: locked lookup failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not load locked balances")
+		return
+	}
+	detail := map[string]map[string]string{}
+	for asset, totalRaw := range totals {
+		lockedRaw := locked[asset]
+		availableRaw := "0"
+		if t, ok := new(big.Int).SetString(totalRaw, 10); ok {
+			if l, ok := new(big.Int).SetString(lockedRaw, 10); ok {
+				avail := new(big.Int).Sub(t, l)
+				if avail.Sign() < 0 {
+					avail.SetInt64(0)
+				}
+				availableRaw = avail.String()
+			}
+		}
+		detail[asset] = map[string]string{"total": totalRaw, "locked": lockedRaw, "available": availableRaw}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"userId": userID, "balances": detail})
+}
+
+type releaseStuckLocksRequest struct {
+	UserID string `json:"userId"`
+	Asset  string `json:"asset"`
+}
+
+// ReleaseStuckLocks: POST /admin/users/release-locks {userId, asset}
+//
+// Zeroes out a user's trading-lock column for one asset via the same
+// LedgerRepo.ReleaseLocksFor the matching-engine itself calls on restart to
+// clear locks it knows it no longer holds a reservation for (see
+// InternalReleaseLocks). Exposed here, admin-JWT-gated, for the case where a
+// reservation was released engine-side (order cancelled/rejected) but the
+// engine's best-effort POST /internal/balance/unlock callback to this
+// service failed and was never retried — the durable "locked" column is
+// then stuck non-zero forever with nothing that will self-heal it. This does
+// NOT touch the user's real total balance (see UserBalanceDetail above to
+// confirm total is untouched); it only releases a hold, so use it once
+// you've confirmed via the engine's own state (or its logs) that no live
+// order is actually still reserving this amount.
+func (s *AdminServer) ReleaseStuckLocks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	var req releaseStuckLocksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.Asset = strings.TrimSpace(req.Asset)
+	if req.UserID == "" || req.Asset == "" {
+		writeError(w, http.StatusBadRequest, "userId and asset are required")
+		return
+	}
+	if _, err := s.Users.FindByID(r.Context(), req.UserID); err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if err := s.Ledger.ReleaseLocksFor(r.Context(), req.UserID, req.Asset); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	balances, err := s.Ledger.BalancesFor(r.Context(), req.UserID)
+	if err != nil {
+		s.Log.Error("balance lookup after release-locks failed", "err", err)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "locks released"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "locks released", "userId": req.UserID, "balances": balances})
+}
+
 // HaltedSymbols lists the markets the engine is currently refusing orders on.
 //
 // A settlement failure halts a symbol for EVERY account trading it, and until
