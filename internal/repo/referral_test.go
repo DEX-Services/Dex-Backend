@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"testing"
 	"time"
 
@@ -116,7 +117,7 @@ func TestReferralSignup_UnknownCodeLinksNothing(t *testing.T) {
 	// An unrecognized code must not create any user_referral_links row —
 	// verified indirectly: settling a fee for this user should route 100%
 	// to the treasury (no beneficiary found), same as having no code at all.
-	if err := referrals.SettleFee(ctx, user.ID, "BI2XUSD", "1000000", ""); err != nil {
+	if err := referrals.SettleFee(ctx, user.ID, "BI2XUSD", "1000000", "", "spot"); err != nil {
 		t.Fatalf("settle fee: %v", err)
 	}
 	balance, err := ledger.BalanceFor(ctx, user.ID, "BI2XUSD")
@@ -157,7 +158,7 @@ func TestReferralSettleFee_SplitsBetweenReferrerAndTreasury(t *testing.T) {
 	}
 
 	// A $10 (as 10_000_000 raw at 6 decimals) fee, 20% to the referrer.
-	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "10000000", "trade-1"); err != nil {
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "10000000", "trade-1", "spot"); err != nil {
 		t.Fatalf("settle fee: %v", err)
 	}
 
@@ -189,7 +190,7 @@ func TestReferralSettleFee_NoSourceGoesEntirelyToTreasury(t *testing.T) {
 	}
 	cleanupUser(t, pool, trader.ID)
 
-	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "5000000", "trade-2"); err != nil {
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "5000000", "trade-2", "futures"); err != nil {
 		t.Fatalf("settle fee: %v", err)
 	}
 
@@ -227,7 +228,7 @@ func TestAffiliateLink_CreateAndSplit(t *testing.T) {
 	}
 	cleanupUser(t, pool, joined.ID)
 
-	if err := referrals.SettleFee(ctx, joined.ID, "BI2XUSD", "10000000", "trade-3"); err != nil {
+	if err := referrals.SettleFee(ctx, joined.ID, "BI2XUSD", "10000000", "trade-3", "spot"); err != nil {
 		t.Fatalf("settle fee: %v", err)
 	}
 	ownerBalance, err := ledger.BalanceFor(ctx, owner.ID, "BI2XUSD")
@@ -255,4 +256,64 @@ func TestAffiliateLink_CreateAndSplit(t *testing.T) {
 		t.Fatalf("signup after deactivation should still create a user (just unlinked): %v", err)
 	}
 	cleanupUser(t, pool, postDeactivation.ID)
+}
+
+// TestFeeRevenueTotals_BreaksDownByCategory verifies the admin Fee Revenue
+// page's totals: each SettleFee/CreditTreasuryFee call's category is
+// reflected in FeeRevenueTotals as a delta, and TotalRaw sums every
+// category (P2P included, from its own separate table).
+func TestFeeRevenueTotals_BreaksDownByCategory(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	users, referrals, _ := newTestUserRepo(pool)
+
+	trader, err := users.FindOrCreate(ctx, testWallet(), "test", "")
+	if err != nil {
+		t.Fatalf("create trader: %v", err)
+	}
+	cleanupUser(t, pool, trader.ID)
+
+	before, err := referrals.FeeRevenueTotals(ctx)
+	if err != nil {
+		t.Fatalf("load fee revenue totals: %v", err)
+	}
+
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "1000000", "cat-spot", "spot"); err != nil {
+		t.Fatalf("settle spot fee: %v", err)
+	}
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "2000000", "cat-futures", "futures"); err != nil {
+		t.Fatalf("settle futures fee: %v", err)
+	}
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "3000000", "cat-liq", "liquidation"); err != nil {
+		t.Fatalf("settle liquidation fee: %v", err)
+	}
+	if err := referrals.CreditTreasuryFee(ctx, "BI2XUSD", "4000000", trader.ID, "cat-swap", "swap"); err != nil {
+		t.Fatalf("credit swap fee: %v", err)
+	}
+
+	after, err := referrals.FeeRevenueTotals(ctx)
+	if err != nil {
+		t.Fatalf("load fee revenue totals: %v", err)
+	}
+
+	delta := func(afterVal, beforeVal string) string {
+		a, _ := new(big.Int).SetString(afterVal, 10)
+		b, _ := new(big.Int).SetString(beforeVal, 10)
+		return new(big.Int).Sub(a, b).String()
+	}
+	if d := delta(after.SpotRaw, before.SpotRaw); d != "1000000" {
+		t.Fatalf("spot delta = %s, want 1000000", d)
+	}
+	if d := delta(after.FuturesRaw, before.FuturesRaw); d != "2000000" {
+		t.Fatalf("futures delta = %s, want 2000000", d)
+	}
+	if d := delta(after.LiquidationRaw, before.LiquidationRaw); d != "3000000" {
+		t.Fatalf("liquidation delta = %s, want 3000000", d)
+	}
+	if d := delta(after.SwapRaw, before.SwapRaw); d != "4000000" {
+		t.Fatalf("swap delta = %s, want 4000000", d)
+	}
+	if d := delta(after.TotalRaw, before.TotalRaw); d != "10000000" {
+		t.Fatalf("total delta = %s, want 10000000 (sum of all four)", d)
+	}
 }

@@ -272,6 +272,15 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if feeAmount != nil && feeAmount.Sign() > 0 && s.Referrals != nil {
+		// Swap fees go to the treasury in full — no referral/affiliate split
+		// (only spot/futures trading fees split; see
+		// REFERRAL-AFFILIATE-PLAN.md). Logged, not failed, on error: the
+		// swap itself already completed correctly above.
+		if err := s.Referrals.CreditTreasuryFee(r.Context(), destination, feeAmount.String(), claims.UserID, "", "swap"); err != nil {
+			s.Log.Error("credit swap fee to treasury failed", "userId", claims.UserID, "err", err)
+		}
+	}
 	resp := map[string]string{
 		"status":           "swapped",
 		"sourceAsset":      source,
@@ -759,12 +768,12 @@ func (s *WalletServer) InternalSettleSpot(w http.ResponseWriter, r *http.Request
 	// this bridge). See REFERRAL-AFFILIATE-PLAN.md.
 	if s.Referrals != nil {
 		if req.BuyerFee != "" && req.BuyerFee != "0" {
-			if err := s.Referrals.SettleFee(r.Context(), req.BuyerID, req.Quote, req.BuyerFee, ""); err != nil {
+			if err := s.Referrals.SettleFee(r.Context(), req.BuyerID, req.Quote, req.BuyerFee, "", "spot"); err != nil {
 				s.Log.Error("route buyer spot fee failed", "err", err, "userId", req.BuyerID)
 			}
 		}
 		if req.SellerFee != "" && req.SellerFee != "0" {
-			if err := s.Referrals.SettleFee(r.Context(), req.SellerID, req.Quote, req.SellerFee, ""); err != nil {
+			if err := s.Referrals.SettleFee(r.Context(), req.SellerID, req.Quote, req.SellerFee, "", "spot"); err != nil {
 				s.Log.Error("route seller spot fee failed", "err", err, "userId", req.SellerID)
 			}
 		}
@@ -814,17 +823,28 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 // balance, and the remainder to the platform treasury — see
 // REFERRAL-AFFILIATE-PLAN.md. A no-op (200 OK) if Referrals isn't wired or
 // amount is zero.
+type internalSettleFeeBody struct {
+	UserID   string `json:"userId"`
+	Asset    string `json:"asset"`
+	Amount   string `json:"amount"`
+	Category string `json:"category"` // "futures" or "liquidation" — see FuturesSettlement.applyFill
+}
+
 func (s *WalletServer) InternalSettleFee(w http.ResponseWriter, r *http.Request) {
 	if !s.checkEngineSecret(w, r) {
 		return
 	}
-	var req internalLockBody
+	var req internalSettleFeeBody
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	category := req.Category
+	if category != "futures" && category != "liquidation" {
+		category = "futures"
+	}
 	if s.Referrals != nil && req.Amount != "" && req.Amount != "0" {
-		if err := s.Referrals.SettleFee(r.Context(), req.UserID, req.Asset, req.Amount, ""); err != nil {
+		if err := s.Referrals.SettleFee(r.Context(), req.UserID, req.Asset, req.Amount, "", category); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}

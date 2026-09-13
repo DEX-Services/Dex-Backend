@@ -235,6 +235,7 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/admin/affiliate-links/active", referralSrv.AdminSetAffiliateLinkActive)
+	mux.HandleFunc("/admin/fee-revenue", referralSrv.AdminFeeRevenue)
 	mux.HandleFunc("/admin/fees", feeSrv.AdminFees)
 	mux.HandleFunc("/admin/fees/set", feeSrv.AdminSetFee)
 	mux.HandleFunc("/admin/fees/subscriptions", feeSrv.AdminFeeSubscriptions)

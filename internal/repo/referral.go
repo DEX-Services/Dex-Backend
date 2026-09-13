@@ -144,12 +144,14 @@ func (r *ReferralRepo) earningSourceTx(ctx context.Context, tx pgx.Tx, userID st
 // transaction, with an audit-trail entry for each leg. asset is always
 // "BI2XUSD" today (the only fee-denominated asset — see
 // REFERRAL-AFFILIATE-PLAN.md §10.2), tradeRef is an optional order/trade id
-// for the audit trail.
+// for the audit trail. category tags which trading surface this fee came
+// from ("spot", "futures", "liquidation", or "swap") for the admin Fee
+// Revenue breakdown page — it does not affect the split math at all.
 //
 // This does NOT touch the fee-paying account's own balance — the caller
 // (matching-engine, via the engine bridge) already debited that separately;
 // this only decides where the collected fee goes.
-func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amountRaw, tradeRef string) error {
+func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amountRaw, tradeRef, category string) error {
 	if err := validatePositiveAmount(amountRaw); err != nil {
 		return nil // zero/negative fee: nothing to route, not an error
 	}
@@ -180,8 +182,8 @@ func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amount
 			return fmt.Errorf("credit %s beneficiary: %w", source.kind, err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO platform_treasury_entries (kind, asset, amount_raw, account_id, trade_ref) VALUES ($1, $2, $3, $4, $5)`,
-			source.kind, asset, payout.String(), source.beneficiaryID, nullIfEmpty(tradeRef),
+			`INSERT INTO platform_treasury_entries (kind, asset, amount_raw, account_id, trade_ref, category) VALUES ($1, $2, $3, $4, $5, $6)`,
+			source.kind, asset, payout.String(), source.beneficiaryID, nullIfEmpty(tradeRef), nullIfEmpty(category),
 		); err != nil {
 			return fmt.Errorf("log %s entry: %w", source.kind, err)
 		}
@@ -196,13 +198,44 @@ func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amount
 			return fmt.Errorf("credit treasury: %w", err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO platform_treasury_entries (kind, asset, amount_raw, account_id, trade_ref) VALUES ('trading_fee', $1, $2, $3, $4)`,
-			asset, treasuryCut.String(), payerUserID, nullIfEmpty(tradeRef),
+			`INSERT INTO platform_treasury_entries (kind, asset, amount_raw, account_id, trade_ref, category) VALUES ('trading_fee', $1, $2, $3, $4, $5)`,
+			asset, treasuryCut.String(), payerUserID, nullIfEmpty(tradeRef), nullIfEmpty(category),
 		); err != nil {
 			return fmt.Errorf("log trading_fee entry: %w", err)
 		}
 	}
 
+	return tx.Commit(ctx)
+}
+
+// CreditTreasuryFee records a fee that goes to the platform treasury in
+// full, with no referral/affiliate split — used for swap fees, which the
+// product spec explicitly excludes from revenue-sharing (only spot/futures
+// trading fees split; see REFERRAL-AFFILIATE-PLAN.md). category tags it for
+// the admin Fee Revenue breakdown (e.g. "swap").
+func (r *ReferralRepo) CreditTreasuryFee(ctx context.Context, asset, amountRaw, accountID, tradeRef, category string) error {
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO platform_treasury_balances (asset, available_raw) VALUES ($1, $2)
+		 ON CONFLICT (asset) DO UPDATE SET available_raw = platform_treasury_balances.available_raw + $2, updated_at = now()`,
+		asset, amountRaw,
+	); err != nil {
+		return fmt.Errorf("credit treasury: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO platform_treasury_entries (kind, asset, amount_raw, account_id, trade_ref, category) VALUES ('trading_fee', $1, $2, $3, $4, $5)`,
+		asset, amountRaw, nullIfEmpty(accountID), nullIfEmpty(tradeRef), nullIfEmpty(category),
+	); err != nil {
+		return fmt.Errorf("log treasury fee entry: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 
@@ -412,6 +445,80 @@ func (r *ReferralRepo) SetReferralSharePct(ctx context.Context, pct, updatedBy s
 		pct, updatedBy,
 	)
 	return err
+}
+
+// FeeRevenueTotals is the admin Fee Revenue page's breakdown: gross fees
+// collected per trading surface, all-time, in raw BI2XUSD units. "Gross"
+// here means the full fee collected from the paying user, before any
+// referral/affiliate share was carved out of it — i.e. spot+futures totals
+// already include whatever was paid out to a referrer/affiliate owner, not
+// just what the treasury kept. P2P is tracked in a separate table
+// (p2p_admin_wallet_entries) since P2P fees never touch platform_treasury_*
+// at all — see FeeRevenueTotals in the caller for how it's combined.
+type FeeRevenueTotals struct {
+	SpotRaw        string
+	FuturesRaw     string
+	LiquidationRaw string
+	SwapRaw        string
+	P2PRaw         string
+	TotalRaw       string
+}
+
+// FeeRevenueTotals sums platform_treasury_entries by category (the gross
+// fee collected, i.e. treasury cut + any referral/affiliate payout carved
+// out of it, added back together) plus p2p_admin_wallet_entries separately,
+// since P2P fees never flow through the treasury tables at all.
+func (r *ReferralRepo) FeeRevenueTotals(ctx context.Context) (FeeRevenueTotals, error) {
+	var out FeeRevenueTotals
+	rows, err := r.pool.Query(ctx, `
+		SELECT category, COALESCE(SUM(amount_raw), 0)::text
+		FROM platform_treasury_entries
+		WHERE category IS NOT NULL
+		GROUP BY category`)
+	if err != nil {
+		return out, fmt.Errorf("query treasury fee totals: %w", err)
+	}
+	totals := map[string]string{}
+	for rows.Next() {
+		var category, total string
+		if err := rows.Scan(&category, &total); err != nil {
+			rows.Close()
+			return out, err
+		}
+		totals[category] = total
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	rows.Close()
+
+	zero := func(s string) string {
+		if s == "" {
+			return "0"
+		}
+		return s
+	}
+	out.SpotRaw = zero(totals["spot"])
+	out.FuturesRaw = zero(totals["futures"])
+	out.LiquidationRaw = zero(totals["liquidation"])
+	out.SwapRaw = zero(totals["swap"])
+
+	if err := r.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(buyer_fee_raw + seller_fee_raw), 0)::text FROM p2p_admin_wallet_entries`,
+	).Scan(&out.P2PRaw); err != nil {
+		return out, fmt.Errorf("query p2p fee totals: %w", err)
+	}
+
+	sum := new(big.Int)
+	for _, v := range []string{out.SpotRaw, out.FuturesRaw, out.LiquidationRaw, out.SwapRaw, out.P2PRaw} {
+		n, ok := new(big.Int).SetString(v, 10)
+		if !ok {
+			return out, fmt.Errorf("invalid fee total %q", v)
+		}
+		sum.Add(sum, n)
+	}
+	out.TotalRaw = sum.String()
+	return out, nil
 }
 
 func generateAffiliateCode() (string, error) {

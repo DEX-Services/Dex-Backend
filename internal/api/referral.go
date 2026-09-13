@@ -230,6 +230,35 @@ func (s *ReferralServer) AdminSetAffiliateLinkActive(w http.ResponseWriter, r *h
 	writeJSON(w, http.StatusOK, map[string]any{"status": "updated", "linkId": req.LinkID, "active": req.Active})
 }
 
+// AdminFeeRevenue: GET /admin/fee-revenue — all-time gross fee revenue
+// collected per trading surface (spot, futures, liquidation, swap, P2P), for
+// the admin Fee Revenue page. Prop firm and any other fee type not yet
+// backed by a real charge is simply absent from this response; the frontend
+// shows it as zero/not-yet-implemented rather than this endpoint fabricating
+// a number for it.
+func (s *ReferralServer) AdminFeeRevenue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireReferralAdmin(w, r) {
+		return
+	}
+	totals, err := s.Referrals.FeeRevenueTotals(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load fee revenue")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"spotRaw":        totals.SpotRaw,
+		"futuresRaw":     totals.FuturesRaw,
+		"liquidationRaw": totals.LiquidationRaw,
+		"swapRaw":        totals.SwapRaw,
+		"p2pRaw":         totals.P2PRaw,
+		"totalRaw":       totals.TotalRaw,
+	})
+}
+
 // requireReferralAdmin/requireReferralAdminClaims mirror
 // FeeServer.requireFeeAdmin (same admin-login-id check) — duplicated rather
 // than shared across server types, same precedent FeeServer itself set.

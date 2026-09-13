@@ -108,6 +108,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"fee_tiers biusdb_value to bi2xusd_value", migrateFeeTiersBI2XUSDValueColumn},
 		{"user_balances BIUSDB to BI2XUSD", migrateUserBalancesBI2XUSDColumn},
 		{"referral and affiliate tables", ensureReferralTables},
+		{"platform_treasury_entries category column", ensureTreasuryEntryCategory},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -890,4 +891,27 @@ CREATE TABLE IF NOT EXISTS user_referral_links (
 );
 CREATE INDEX IF NOT EXISTS idx_user_referral_links_referrer ON user_referral_links (referrer_id);
 CREATE INDEX IF NOT EXISTS idx_user_referral_links_affiliate ON user_referral_links (affiliate_link_id);
+`
+
+// ensureTreasuryEntryCategory adds the category column the admin Fee Revenue
+// page breaks totals down by (spot/futures/liquidation/swap) — separate from
+// `kind`, which only distinguishes a trading fee from a referral/affiliate
+// payout, not which trading surface the fee came from. NULL for rows written
+// before this column existed (none in practice: this ships in the same
+// release as the referral tables, so platform_treasury_entries is always
+// empty the first time this runs) and for referral_payout/affiliate_payout
+// rows, which aren't a fee-revenue category of their own.
+const ensureTreasuryEntryCategory = `
+DO $add_treasury_entry_category$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'platform_treasury_entries' AND column_name = 'category'
+    ) THEN
+        ALTER TABLE public.platform_treasury_entries ADD COLUMN category TEXT
+            CHECK (category IS NULL OR category IN ('spot', 'futures', 'liquidation', 'swap'));
+        CREATE INDEX IF NOT EXISTS idx_platform_treasury_entries_category
+            ON public.platform_treasury_entries (category, created_at DESC);
+    END IF;
+END $add_treasury_entry_category$;
 `
