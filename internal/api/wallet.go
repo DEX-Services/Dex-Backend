@@ -30,6 +30,7 @@ type WalletServer struct {
 	EngineSecret string
 	EngineClient *engineclient.Client
 	Fees         *feeconfig.Client
+	Referrals    *repo.ReferralRepo
 }
 
 // Balance: GET /wallet/balance
@@ -495,6 +496,8 @@ type internalSpotSettleBody struct {
 	BaseQuantity      string `json:"baseQuantity"`
 	BuyerQuoteDebit   string `json:"buyerQuoteDebit"`
 	SellerQuoteCredit string `json:"sellerQuoteCredit"`
+	BuyerFee          string `json:"buyerFee"`
+	SellerFee         string `json:"sellerFee"`
 }
 
 type internalReplaceLocksBody struct {
@@ -747,6 +750,25 @@ func (s *WalletServer) InternalSettleSpot(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	// Route each side's fee (referral/affiliate beneficiary share, remainder
+	// to the platform treasury) — a separate step from the balance transfer
+	// above since it's a revenue-accounting concern, not a settlement
+	// correctness one: if this fails, the trade itself has already settled
+	// correctly, so this is logged rather than surfaced as a settlement
+	// error (same best-effort spirit as the async credit calls elsewhere in
+	// this bridge). See REFERRAL-AFFILIATE-PLAN.md.
+	if s.Referrals != nil {
+		if req.BuyerFee != "" && req.BuyerFee != "0" {
+			if err := s.Referrals.SettleFee(r.Context(), req.BuyerID, req.Quote, req.BuyerFee, ""); err != nil {
+				s.Log.Error("route buyer spot fee failed", "err", err, "userId", req.BuyerID)
+			}
+		}
+		if req.SellerFee != "" && req.SellerFee != "0" {
+			if err := s.Referrals.SettleFee(r.Context(), req.SellerID, req.Quote, req.SellerFee, ""); err != nil {
+				s.Log.Error("route seller spot fee failed", "err", err, "userId", req.SellerID)
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "settled"})
 }
 
@@ -781,4 +803,31 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
+}
+
+// InternalSettleFee: POST /internal/balance/fee {userId, asset, amount}
+// Called by the matching-engine after a futures maker/taker fee has already
+// been debited from userId's balance (see FuturesSettlement.applyFill).
+// Unlike InternalCreditBalance/InternalSettleBalance (plain debit/credit),
+// this routes the collected fee: a referral/affiliate beneficiary's share
+// (if userId has a permanent earning-source link) to that beneficiary's own
+// balance, and the remainder to the platform treasury — see
+// REFERRAL-AFFILIATE-PLAN.md. A no-op (200 OK) if Referrals isn't wired or
+// amount is zero.
+func (s *WalletServer) InternalSettleFee(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req internalLockBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if s.Referrals != nil && req.Amount != "" && req.Amount != "0" {
+		if err := s.Referrals.SettleFee(r.Context(), req.UserID, req.Asset, req.Amount, ""); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "fee settled"})
 }

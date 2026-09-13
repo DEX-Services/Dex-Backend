@@ -57,6 +57,11 @@ type loginRequest struct {
 	Address    string `json:"address"`
 	Signature  string `json:"signature"`
 	WalletType string `json:"walletType"`
+	// ReferralCode is an optional referral or affiliate code, captured by
+	// the frontend from a "?ref=CODE" URL param on first visit. Only ever
+	// consulted the first time this wallet address logs in (i.e. when the
+	// user is actually created) — see UserRepo.FindOrCreate.
+	ReferralCode string `json:"referralCode"`
 }
 
 // Login: POST /auth/login {address, signature, walletType}
@@ -87,7 +92,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	user, err := s.Users.FindOrCreate(ctx, req.Address, req.WalletType)
+	user, err := s.Users.FindOrCreate(ctx, req.Address, req.WalletType, req.ReferralCode)
 	if err != nil {
 		s.Log.Error("find or create user failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not create user")

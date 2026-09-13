@@ -109,7 +109,10 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 		return err
 	}
 
-	user, err := l.Users.FindOrCreate(ctx, userAddr.Hex(), "metamask")
+	// A deposit event is never a signup flow — an on-chain depositor without
+	// an existing account gets one created here with no referral/affiliate
+	// code, same as before this feature existed.
+	user, err := l.Users.FindOrCreate(ctx, userAddr.Hex(), "metamask", "")
 	if err != nil {
 		return err
 	}

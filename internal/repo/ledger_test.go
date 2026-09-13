@@ -34,7 +34,7 @@ func newTestUser(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
 	users := NewUserRepo(pool)
 	wallet := fmt.Sprintf("0xtest%d", time.Now().UnixNano())
-	user, err := users.FindOrCreate(context.Background(), wallet, "test")
+	user, err := users.FindOrCreate(context.Background(), wallet, "test", "")
 	if err != nil {
 		t.Fatalf("create test user: %v", err)
 	}

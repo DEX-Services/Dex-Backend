@@ -52,6 +52,8 @@ func main() {
 	p2pRepo := repo.NewP2PRepo(pool)
 	feesClient := feeconfig.New(pool)
 	feeTierRepo := repo.NewFeeTierRepo(ledgerRepo, feesClient)
+	referralRepo := repo.NewReferralRepo(pool, ledgerRepo)
+	userRepo.SetReferrals(referralRepo)
 	engineClient := engineclient.New()
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -85,6 +87,7 @@ func main() {
 		EngineSecret: os.Getenv("ENGINE_SHARED_SECRET"),
 		EngineClient: engineClient,
 		Fees:         feesClient,
+		Referrals:    referralRepo,
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
@@ -105,6 +108,7 @@ func main() {
 	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo, Engine: engineClient}
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
+	referralSrv := &api.ReferralServer{Server: srv, Referrals: referralRepo}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -177,6 +181,7 @@ func main() {
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
 	mux.HandleFunc("/internal/balance/spot-settle", walletSrv.InternalSettleSpot)
 	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
+	mux.HandleFunc("/internal/balance/fee", walletSrv.InternalSettleFee)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)
@@ -213,6 +218,23 @@ func main() {
 	mux.HandleFunc("/fees/tiers", feeSrv.Tiers)
 	mux.HandleFunc("/fees/my-subscription", feeSrv.MySubscription)
 	mux.HandleFunc("/fees/subscribe", feeSrv.Subscribe)
+	mux.HandleFunc("/referral/me", referralSrv.MyReferral)
+	mux.HandleFunc("/affiliate/me", referralSrv.MyAffiliateLinks)
+	mux.HandleFunc("/admin/referral-config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			referralSrv.AdminReferralConfig(w, r)
+		} else {
+			referralSrv.AdminSetReferralConfig(w, r)
+		}
+	})
+	mux.HandleFunc("/admin/affiliate-links", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			referralSrv.AdminAffiliateLinks(w, r)
+		} else {
+			referralSrv.AdminCreateAffiliateLink(w, r)
+		}
+	})
+	mux.HandleFunc("/admin/affiliate-links/active", referralSrv.AdminSetAffiliateLinkActive)
 	mux.HandleFunc("/admin/fees", feeSrv.AdminFees)
 	mux.HandleFunc("/admin/fees/set", feeSrv.AdminSetFee)
 	mux.HandleFunc("/admin/fees/subscriptions", feeSrv.AdminFeeSubscriptions)

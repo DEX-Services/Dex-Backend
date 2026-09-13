@@ -107,6 +107,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"fee_model BIUSDB to BI2XUSD", migrateFeeModelBI2XUSD},
 		{"fee_tiers biusdb_value to bi2xusd_value", migrateFeeTiersBI2XUSDValueColumn},
 		{"user_balances BIUSDB to BI2XUSD", migrateUserBalancesBI2XUSDColumn},
+		{"referral and affiliate tables", ensureReferralTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -804,4 +805,89 @@ BEGIN
 		ALTER TABLE public.user_balances RENAME COLUMN "BIUSDB_locked" TO "BI2XUSD_locked";
 	END IF;
 END $rename_user_balances_bi2xusd$;
+`
+
+// ensureReferralTables creates the schema for the referral/affiliate
+// revenue-share feature (see REFERRAL-AFFILIATE-PLAN.md) and the platform
+// treasury tables that make it possible: spot/futures trading fees
+// previously had nowhere to go once debited from the paying user (a pure
+// burn) — platform_treasury_balances/entries is the first real destination
+// for that revenue, and referral_codes/affiliate_links/user_referral_links/
+// referral_config layer the revenue-split on top of it.
+const ensureReferralTables = `
+-- The platform's own fee-revenue account. All spot/futures trading fees
+-- land here (minus any referral/affiliate share carved out at the same
+-- moment) instead of vanishing. Mirrors p2p_admin_wallet_balances'
+-- existing shape/role for P2P fees.
+CREATE TABLE IF NOT EXISTS platform_treasury_balances (
+    asset         TEXT PRIMARY KEY,
+    available_raw NUMERIC(38,0) NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO platform_treasury_balances (asset) VALUES ('BI2XUSD') ON CONFLICT (asset) DO NOTHING;
+
+-- Audit trail: every fee collected and every referral/affiliate payout, so
+-- "why does the treasury balance say X" and "why did this user's balance
+-- just go up" both have a real record, not just an opaque balance change.
+CREATE TABLE IF NOT EXISTS platform_treasury_entries (
+    id         BIGSERIAL PRIMARY KEY,
+    kind       TEXT NOT NULL CHECK (kind IN ('trading_fee', 'referral_payout', 'affiliate_payout')),
+    asset      TEXT NOT NULL,
+    amount_raw NUMERIC(38,0) NOT NULL,
+    account_id TEXT REFERENCES users(id),
+    trade_ref  TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_platform_treasury_entries_account
+    ON platform_treasury_entries (account_id, created_at DESC);
+
+-- The one global referral percentage (fixed 20% by default, admin-editable
+-- for FUTURE referrals only -- see user_referral_links.share_pct, which
+-- snapshots this value at signup so a later change never rewrites an
+-- existing referral's terms).
+CREATE TABLE IF NOT EXISTS referral_config (
+    key        TEXT PRIMARY KEY,
+    value      NUMERIC(5,2) NOT NULL,
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO referral_config (key, value) VALUES ('referral_share_pct', 20) ON CONFLICT (key) DO NOTHING;
+
+-- One personal referral code per user, generated lazily on first request
+-- (most users never share their link) rather than for every signup.
+CREATE TABLE IF NOT EXISTS referral_codes (
+    user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code       TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Admin-created affiliate links, each with its own admin-chosen percentage.
+-- One owner may hold multiple links (nothing in the requirements makes it
+-- one-per-user, and admin-created is naturally many-to-one).
+CREATE TABLE IF NOT EXISTS affiliate_links (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code          TEXT NOT NULL UNIQUE,
+    owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    share_pct     NUMERIC(5,2) NOT NULL CHECK (share_pct >= 0 AND share_pct <= 100),
+    active        BOOLEAN NOT NULL DEFAULT true,
+    created_by    TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The permanent, exclusive signup-time link: at most one earning source per
+-- user, set once (during FindOrCreate's user-creation branch), never
+-- updated afterward. share_pct is snapshotted at signup for the same reason
+-- user_fee_subscriptions.bi2x_price_snapshot freezes a value at purchase --
+-- a later admin change to referral_config or an affiliate_links.share_pct
+-- must not retroactively rewrite an existing user's terms.
+CREATE TABLE IF NOT EXISTS user_referral_links (
+    user_id           TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    source_type       TEXT NOT NULL CHECK (source_type IN ('referral', 'affiliate')),
+    referrer_id       TEXT REFERENCES users(id),
+    affiliate_link_id UUID REFERENCES affiliate_links(id),
+    share_pct         NUMERIC(5,2) NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_user_referral_links_referrer ON user_referral_links (referrer_id);
+CREATE INDEX IF NOT EXISTS idx_user_referral_links_affiliate ON user_referral_links (affiliate_link_id);
 `

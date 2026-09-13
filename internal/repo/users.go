@@ -12,15 +12,28 @@ import (
 )
 
 type UserRepo struct {
-	pool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	referrals *ReferralRepo
 }
 
 func NewUserRepo(pool *pgxpool.Pool) *UserRepo {
 	return &UserRepo{pool: pool}
 }
 
-// FindOrCreate returns the user for walletAddress, creating one if it doesn't exist yet.
-func (r *UserRepo) FindOrCreate(ctx context.Context, walletAddress, walletType string) (models.User, error) {
+// SetReferrals wires the referral repo used to resolve/link a signup code.
+// Optional — a nil referrals means FindOrCreate simply never links new
+// users to anything, e.g. in tests that don't care about this feature.
+func (r *UserRepo) SetReferrals(referrals *ReferralRepo) {
+	r.referrals = referrals
+}
+
+// FindOrCreate returns the user for walletAddress, creating one if it
+// doesn't exist yet. signupCode (a referral or affiliate code, or empty) is
+// only ever consulted when a NEW user is actually created — a returning
+// user is never linked or re-linked, since a user's earning-source link is
+// permanent and set exactly once, at signup (see
+// REFERRAL-AFFILIATE-PLAN.md).
+func (r *UserRepo) FindOrCreate(ctx context.Context, walletAddress, walletType string, signupCode string) (models.User, error) {
 	address := strings.ToLower(walletAddress)
 
 	var u models.User
@@ -35,12 +48,39 @@ func (r *UserRepo) FindOrCreate(ctx context.Context, walletAddress, walletType s
 		return models.User{}, err
 	}
 
-	err = r.pool.QueryRow(ctx,
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return models.User{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var source *ReferralSource
+	if r.referrals != nil && signupCode != "" {
+		source, err = r.referrals.ResolveSignupCode(ctx, tx, signupCode)
+		if err != nil {
+			return models.User{}, err
+		}
+	}
+
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (wallet_address, wallet_type) VALUES ($1, $2)
 		 RETURNING id, wallet_address, wallet_type, created_at, last_login_at`,
 		address, walletType,
 	).Scan(&u.ID, &u.WalletAddress, &u.WalletType, &u.CreatedAt, &u.LastLoginAt)
-	return u, err
+	if err != nil {
+		return models.User{}, err
+	}
+
+	if r.referrals != nil && source != nil {
+		if err := r.referrals.LinkNewUserTx(ctx, tx, u.ID, source); err != nil {
+			return models.User{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return models.User{}, err
+	}
+	return u, nil
 }
 
 // EnsureByID upserts a users row with an explicit, caller-supplied id rather
