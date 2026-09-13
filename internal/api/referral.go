@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dex/dex-backend/internal/repo"
 	"github.com/jackc/pgx/v5"
@@ -230,12 +231,26 @@ func (s *ReferralServer) AdminSetAffiliateLinkActive(w http.ResponseWriter, r *h
 	writeJSON(w, http.StatusOK, map[string]any{"status": "updated", "linkId": req.LinkID, "active": req.Active})
 }
 
-// AdminFeeRevenue: GET /admin/fee-revenue — all-time gross fee revenue
-// collected per trading surface (spot, futures, liquidation, swap, P2P), for
-// the admin Fee Revenue page. Prop firm and any other fee type not yet
-// backed by a real charge is simply absent from this response; the frontend
-// shows it as zero/not-yet-implemented rather than this endpoint fabricating
-// a number for it.
+// feeRevenueRanges maps the admin page's range selector to a lookback
+// duration; "all" (and anything unrecognized) means no lower bound at all.
+// Kept as a duration table rather than truncating to calendar boundaries
+// (e.g. "today" from midnight) since the ask was rolling windows (last
+// hour/day/week/month), not calendar-aligned ones.
+var feeRevenueRanges = map[string]time.Duration{
+	"1h": time.Hour,
+	"1d": 24 * time.Hour,
+	"1w": 7 * 24 * time.Hour,
+	"1m": 30 * 24 * time.Hour,
+}
+
+// AdminFeeRevenue: GET /admin/fee-revenue?range=1h|1d|1w|1m|all — gross fee
+// revenue collected per trading surface (spot, futures, liquidation, swap,
+// P2P), for the admin Fee Revenue page, restricted to the given rolling
+// window (default/fallback "all" = all-time, same as before this param
+// existed). Prop firm and any other fee type not yet backed by a real
+// charge is simply absent from this response; the frontend shows it as
+// zero/not-yet-implemented rather than this endpoint fabricating a number
+// for it.
 func (s *ReferralServer) AdminFeeRevenue(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -244,7 +259,13 @@ func (s *ReferralServer) AdminFeeRevenue(w http.ResponseWriter, r *http.Request)
 	if !s.requireReferralAdmin(w, r) {
 		return
 	}
-	totals, err := s.Referrals.FeeRevenueTotals(r.Context())
+	rangeParam := strings.TrimSpace(r.URL.Query().Get("range"))
+	var since *time.Time
+	if d, ok := feeRevenueRanges[rangeParam]; ok {
+		t := time.Now().Add(-d)
+		since = &t
+	}
+	totals, err := s.Referrals.FeeRevenueTotals(r.Context(), since)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load fee revenue")
 		return

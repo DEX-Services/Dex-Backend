@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -467,14 +468,16 @@ type FeeRevenueTotals struct {
 // FeeRevenueTotals sums platform_treasury_entries by category (the gross
 // fee collected, i.e. treasury cut + any referral/affiliate payout carved
 // out of it, added back together) plus p2p_admin_wallet_entries separately,
-// since P2P fees never flow through the treasury tables at all.
-func (r *ReferralRepo) FeeRevenueTotals(ctx context.Context) (FeeRevenueTotals, error) {
+// since P2P fees never flow through the treasury tables at all. since, if
+// non-nil, restricts both sums to entries created at or after that instant
+// (the admin page's 1h/1d/1w/1m windows); nil means all-time.
+func (r *ReferralRepo) FeeRevenueTotals(ctx context.Context, since *time.Time) (FeeRevenueTotals, error) {
 	var out FeeRevenueTotals
 	rows, err := r.pool.Query(ctx, `
 		SELECT category, COALESCE(SUM(amount_raw), 0)::text
 		FROM platform_treasury_entries
-		WHERE category IS NOT NULL
-		GROUP BY category`)
+		WHERE category IS NOT NULL AND ($1::timestamptz IS NULL OR created_at >= $1)
+		GROUP BY category`, since)
 	if err != nil {
 		return out, fmt.Errorf("query treasury fee totals: %w", err)
 	}
@@ -504,7 +507,8 @@ func (r *ReferralRepo) FeeRevenueTotals(ctx context.Context) (FeeRevenueTotals, 
 	out.SwapRaw = zero(totals["swap"])
 
 	if err := r.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(buyer_fee_raw + seller_fee_raw), 0)::text FROM p2p_admin_wallet_entries`,
+		`SELECT COALESCE(SUM(buyer_fee_raw + seller_fee_raw), 0)::text FROM p2p_admin_wallet_entries
+		 WHERE $1::timestamptz IS NULL OR created_at >= $1`, since,
 	).Scan(&out.P2PRaw); err != nil {
 		return out, fmt.Errorf("query p2p fee totals: %w", err)
 	}

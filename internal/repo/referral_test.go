@@ -273,7 +273,7 @@ func TestFeeRevenueTotals_BreaksDownByCategory(t *testing.T) {
 	}
 	cleanupUser(t, pool, trader.ID)
 
-	before, err := referrals.FeeRevenueTotals(ctx)
+	before, err := referrals.FeeRevenueTotals(ctx, nil)
 	if err != nil {
 		t.Fatalf("load fee revenue totals: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestFeeRevenueTotals_BreaksDownByCategory(t *testing.T) {
 		t.Fatalf("credit swap fee: %v", err)
 	}
 
-	after, err := referrals.FeeRevenueTotals(ctx)
+	after, err := referrals.FeeRevenueTotals(ctx, nil)
 	if err != nil {
 		t.Fatalf("load fee revenue totals: %v", err)
 	}
@@ -315,5 +315,53 @@ func TestFeeRevenueTotals_BreaksDownByCategory(t *testing.T) {
 	}
 	if d := delta(after.TotalRaw, before.TotalRaw); d != "10000000" {
 		t.Fatalf("total delta = %s, want 10000000 (sum of all four)", d)
+	}
+}
+
+// TestFeeRevenueTotals_SinceFiltersOlderEntries verifies the admin page's
+// range selector: with `since` set to just before this test's own fee is
+// settled, the totals must include it; with `since` set to just after
+// (before it's written) they must not — bracketing the one write with two
+// timestamps taken around it, rather than comparing against the table's
+// full history (which other tests/runs also populate).
+func TestFeeRevenueTotals_SinceFiltersOlderEntries(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	users, referrals, _ := newTestUserRepo(pool)
+
+	trader, err := users.FindOrCreate(ctx, testWallet(), "test", "")
+	if err != nil {
+		t.Fatalf("create trader: %v", err)
+	}
+	cleanupUser(t, pool, trader.ID)
+
+	justBefore := time.Now()
+	time.Sleep(10 * time.Millisecond) // ensure created_at strictly follows justBefore
+	if err := referrals.SettleFee(ctx, trader.ID, "BI2XUSD", "7000000", "cat-since", "spot"); err != nil {
+		t.Fatalf("settle spot fee: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	justAfter := time.Now()
+
+	includedTotals, err := referrals.FeeRevenueTotals(ctx, &justBefore)
+	if err != nil {
+		t.Fatalf("load fee revenue totals (since=justBefore): %v", err)
+	}
+	excludedTotals, err := referrals.FeeRevenueTotals(ctx, &justAfter)
+	if err != nil {
+		t.Fatalf("load fee revenue totals (since=justAfter): %v", err)
+	}
+
+	// since=justBefore includes every entry from justBefore onward, i.e. at
+	// least our one fee; since=justAfter includes only entries from
+	// justAfter onward, i.e. none of them (our fee was written strictly
+	// before justAfter). So included - excluded must be exactly our fee.
+	included, _ := new(big.Int).SetString(includedTotals.SpotRaw, 10)
+	excluded, _ := new(big.Int).SetString(excludedTotals.SpotRaw, 10)
+	if diff := new(big.Int).Sub(included, excluded); diff.String() != "7000000" {
+		t.Fatalf("spot total (since=justBefore) - (since=justAfter) = %s, want 7000000", diff.String())
+	}
+	if excludedTotals.SpotRaw != "0" {
+		t.Fatalf("spot total with since=justAfter = %s, want 0 (fee was written before, not after, justAfter)", excludedTotals.SpotRaw)
 	}
 }
