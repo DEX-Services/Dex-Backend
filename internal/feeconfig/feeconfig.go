@@ -98,10 +98,10 @@ var ErrNoActivePrice = fmt.Errorf("no live BI2X price available")
 
 // TierInfo describes one row of fee_tiers.
 type TierInfo struct {
-	Tier        int
-	BIUSDBValue decimal.Decimal
-	DiscountPct decimal.Decimal
-	Active      bool
+	Tier         int
+	BI2XUSDValue decimal.Decimal
+	DiscountPct  decimal.Decimal
+	Active       bool
 }
 
 // Tier returns the fee_tiers row for the given tier number, or
@@ -110,12 +110,12 @@ func (c *Client) Tier(ctx context.Context, tier int) (TierInfo, bool) {
 	var t TierInfo
 	var valueStr, pctStr string
 	err := c.pool.QueryRow(ctx,
-		`SELECT tier, biusdb_value, discount_pct, active FROM fee_tiers WHERE tier = $1`, tier,
+		`SELECT tier, bi2xusd_value, discount_pct, active FROM fee_tiers WHERE tier = $1`, tier,
 	).Scan(&t.Tier, &valueStr, &pctStr, &t.Active)
 	if err != nil || !t.Active {
 		return TierInfo{}, false
 	}
-	t.BIUSDBValue, _ = decimal.NewFromString(valueStr)
+	t.BI2XUSDValue, _ = decimal.NewFromString(valueStr)
 	t.DiscountPct, _ = decimal.NewFromString(pctStr)
 	return t, true
 }
@@ -123,7 +123,7 @@ func (c *Client) Tier(ctx context.Context, tier int) (TierInfo, bool) {
 // AllTiers returns every fee_tiers row (including inactive ones), ordered by
 // tier ascending. Used by the tier-selection UI and the admin listing.
 func (c *Client) AllTiers(ctx context.Context) ([]TierInfo, error) {
-	rows, err := c.pool.Query(ctx, `SELECT tier, biusdb_value, discount_pct, active FROM fee_tiers ORDER BY tier ASC`)
+	rows, err := c.pool.Query(ctx, `SELECT tier, bi2xusd_value, discount_pct, active FROM fee_tiers ORDER BY tier ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query fee_tiers: %w", err)
 	}
@@ -136,7 +136,7 @@ func (c *Client) AllTiers(ctx context.Context) ([]TierInfo, error) {
 		if err := rows.Scan(&t.Tier, &valueStr, &pctStr, &t.Active); err != nil {
 			return nil, fmt.Errorf("scan fee_tiers row: %w", err)
 		}
-		t.BIUSDBValue, _ = decimal.NewFromString(valueStr)
+		t.BI2XUSDValue, _ = decimal.NewFromString(valueStr)
 		t.DiscountPct, _ = decimal.NewFromString(pctStr)
 		out = append(out, t)
 	}

@@ -23,25 +23,25 @@ var assetColumns = map[string]string{
 	"BTC":  `"BTC"`,
 	"USDC": `"USDC"`,
 	"USDT": `"USDT"`,
-	// BIUSDB is the platform's internal stable quote currency, pegged 1:1 to
+	// BI2XUSD is the platform's internal stable quote currency, pegged 1:1 to
 	// USDT — it has no on-chain contract of its own. Every market's quote
-	// leg trades in BIUSDB, not USDT; a real USDT/USDC deposit is credited as
-	// BIUSDB at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
+	// leg trades in BI2XUSD, not USDT; a real USDT/USDC deposit is credited as
+	// BI2XUSD at 1:1 (see chain.Listener.handleDeposit). USDT/USDC columns are
 	// kept only as the deposit-intake ledger, not as tradable balances.
-	"BIUSDB": `"BIUSDB"`,
-	// BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added
+	"BI2XUSD": `"BI2XUSD"`,
+	// BI2X: base asset for the BI2X-BI2XUSD spot/futures pair (added
 	// 2026-09-12) — same shape as BTC.
 	//
 	// ETH, SOL, and BNB previously had columns here backing the
-	// ETH-BIUSDB/SOL-BIUSDB/BNB-BIUSDB SPOT markets. Those SPOT markets were
+	// ETH-BI2XUSD/SOL-BI2XUSD/BNB-BI2XUSD SPOT markets. Those SPOT markets were
 	// removed in the 2026-09-12 restructure (ETH/SOL are now FUTURES-only,
-	// settled entirely in BIUSDB; BNB has no market at all) — see
+	// settled entirely in BI2XUSD; BNB has no market at all) — see
 	// matching-engine's cmd/engine/markets.go. Futures settlement never
 	// touches a base-asset column (internal/settlement/futures.go debits/
 	// credits quoteAsset only), so these columns became genuinely unused and
 	// were dropped (see migrateDropETHSOLBNBColumns in internal/db/db.go).
 	//
-	// BI (the platform's own native token, distinct from BI2X/BIUSDB) was
+	// BI (the platform's own native token, distinct from BI2X/BI2XUSD) was
 	// also removed (2026-09-13): it was never wired into any
 	// matching-engine market, same as ETH/SOL/BNB were before their
 	// removal — a wallet/ledger column with nothing behind it.
@@ -49,11 +49,11 @@ var assetColumns = map[string]string{
 }
 
 var lockedColumns = map[string]string{
-	"BTC":    `"BTC_locked"`,
-	"USDC":   `"USDC_locked"`,
-	"USDT":   `"USDT_locked"`,
-	"BIUSDB": `"BIUSDB_locked"`,
-	"BI2X":   `"BI2X_locked"`,
+	"BTC":     `"BTC_locked"`,
+	"USDC":    `"USDC_locked"`,
+	"USDT":    `"USDT_locked"`,
+	"BI2XUSD": `"BI2XUSD_locked"`,
+	"BI2X":    `"BI2X_locked"`,
 }
 
 func normalizeAsset(asset string) (string, string, error) {
@@ -534,10 +534,10 @@ func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourc
 
 // InsertDeposit records a confirmed on-chain deposit and credits the user's
 // tradable balance in creditToken at 1:1. token (what actually arrived
-// on-chain, e.g. "USDC") and creditToken (what gets credited, e.g. "BIUSDB")
-// can differ: every market's quote leg trades in BIUSDB, the platform's
+// on-chain, e.g. "USDC") and creditToken (what gets credited, e.g. "BI2XUSD")
+// can differ: every market's quote leg trades in BI2XUSD, the platform's
 // internal stable unit pegged 1:1 to the real deposited asset, so a real
-// stablecoin deposit converts into BIUSDB at credit time while the ledger row
+// stablecoin deposit converts into BI2XUSD at credit time while the ledger row
 // still records the true on-chain asset for an honest audit trail. Pass the
 // same value for both to credit the deposited asset directly (no conversion).
 func (r *LedgerRepo) InsertDeposit(ctx context.Context, userID, walletAddress, token, creditToken, amountRaw, txHash string) error {
@@ -743,14 +743,14 @@ func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (stri
 // LockedBalancesFor, and PendingWithdrawalHoldsFor so their zero-value
 // results always list the same complete asset set as assetColumns.
 func zeroBalanceMap() map[string]string {
-	return map[string]string{"BTC": "0", "BI2X": "0", "BIUSDB": "0", "USDC": "0", "USDT": "0"}
+	return map[string]string{"BTC": "0", "BI2X": "0", "BI2XUSD": "0", "USDC": "0", "USDT": "0"}
 }
 
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
 	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC"::text, "BI2X"::text, "BIUSDB"::text, "USDC"::text, "USDT"::text
+		SELECT "BTC"::text, "BI2X"::text, "BI2XUSD"::text, "USDC"::text, "USDT"::text
 		FROM user_balances
 		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
@@ -761,7 +761,7 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	}
 	balances["BTC"] = btc
 	balances["BI2X"] = bi2x
-	balances["BIUSDB"] = biusd
+	balances["BI2XUSD"] = biusd
 	balances["USDC"] = usdc
 	balances["USDT"] = usdt
 	return balances, nil
@@ -772,7 +772,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	locked := map[string]string{}
 	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
-		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BIUSDB_locked"::text, "USDC_locked"::text, "USDT_locked"::text
+		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BI2XUSD_locked"::text, "USDC_locked"::text, "USDT_locked"::text
 		FROM user_balances
 		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
@@ -783,7 +783,7 @@ func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[
 	}
 	locked["BTC"] = btc
 	locked["BI2X"] = bi2x
-	locked["BIUSDB"] = biusd
+	locked["BI2XUSD"] = biusd
 	locked["USDC"] = usdc
 	locked["USDT"] = usdt
 	return locked, nil
@@ -894,7 +894,7 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 		UNION ALL
 		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BIUSDB', GREATEST("BIUSDB" - "BIUSDB_locked", 0)::text FROM user_balances WHERE "BIUSDB" - "BIUSDB_locked" > 0`)
+		SELECT user_id, 'BI2XUSD', GREATEST("BI2XUSD" - "BI2XUSD_locked", 0)::text FROM user_balances WHERE "BI2XUSD" - "BI2XUSD_locked" > 0`)
 	if err != nil {
 		return nil, err
 	}

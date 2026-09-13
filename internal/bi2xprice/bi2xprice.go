@@ -1,7 +1,7 @@
-// Package bi2xprice reads BI2X's current BIUSDB price for the fee-tier
-// purchase flow (see FEE-TIER-SYSTEM-PLAN.md). BI2X floats against BIUSDB —
+// Package bi2xprice reads BI2X's current BI2XUSD price for the fee-tier
+// purchase flow (see FEE-TIER-SYSTEM-PLAN.md). BI2X floats against BI2XUSD —
 // confirmed live (currently ~3.75, moving continuously) — so a tier's fixed
-// BIUSDB value must be converted to a BI2X quantity using a fresh price at
+// BI2XUSD value must be converted to a BI2X quantity using a fresh price at
 // purchase time, never a hardcoded or cached-indefinitely number.
 //
 // This calls the BI2X feed's own plain tick endpoint directly (the same
@@ -57,7 +57,7 @@ func NewHTTPReader() *HTTPReader {
 	return &HTTPReader{Client: &http.Client{Timeout: 5 * time.Second}}
 }
 
-// CurrentPrice fetches BI2X's current BIUSDB price. Returns an error if the
+// CurrentPrice fetches BI2X's current BI2XUSD price. Returns an error if the
 // feed is unreachable, returns a malformed response, or the reading is
 // older than maxAge — a purchase must never be computed against a stale or
 // missing price.

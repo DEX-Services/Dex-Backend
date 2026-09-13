@@ -39,11 +39,11 @@ type Subscription struct {
 	Status            string
 }
 
-// Subscribe purchases tier for userID at currentBI2XPrice (the live BIUSDB
+// Subscribe purchases tier for userID at currentBI2XPrice (the live BI2XUSD
 // price of one BI2X, read by the caller from bi2xprice.Reader immediately
 // before calling this — never a cached or hardcoded number, since BI2X
 // floats). The required BI2X quantity is computed as
-// tier.biusdb_value / currentBI2XPrice, debited from the user's BI2X
+// tier.bi2xusd_value / currentBI2XPrice, debited from the user's BI2X
 // balance, and both the debit and the new subscription row are committed in
 // one transaction: either both happen or neither does.
 //
@@ -61,16 +61,16 @@ func (r *FeeTierRepo) Subscribe(ctx context.Context, userID string, tier int, cu
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var biusdbValueStr, discountPctStr string
+	var bi2xusdValueStr, discountPctStr string
 	var active bool
-	if err := tx.QueryRow(ctx, `SELECT biusdb_value, discount_pct, active FROM fee_tiers WHERE tier = $1 FOR UPDATE`, tier).
-		Scan(&biusdbValueStr, &discountPctStr, &active); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT bi2xusd_value, discount_pct, active FROM fee_tiers WHERE tier = $1 FOR UPDATE`, tier).
+		Scan(&bi2xusdValueStr, &discountPctStr, &active); err != nil {
 		return nil, ErrTierNotFound
 	}
 	if !active {
 		return nil, ErrTierNotFound
 	}
-	biusdbValue, err := decimal.NewFromString(biusdbValueStr)
+	bi2xusdValue, err := decimal.NewFromString(bi2xusdValueStr)
 	if err != nil {
 		return nil, fmt.Errorf("corrupt fee_tiers row for tier %d", tier)
 	}
@@ -79,9 +79,9 @@ func (r *FeeTierRepo) Subscribe(ctx context.Context, userID string, tier int, cu
 		return nil, fmt.Errorf("corrupt fee_tiers row for tier %d", tier)
 	}
 
-	// bi2xAmount = biusdbValue / currentBI2XPrice, rounded down to whole raw
+	// bi2xAmount = bi2xusdValue / currentBI2XPrice, rounded down to whole raw
 	// units (never round up what we ask the user to pay).
-	bi2xAmount := biusdbValue.Div(currentBI2XPrice)
+	bi2xAmount := bi2xusdValue.Div(currentBI2XPrice)
 	bi2xAmountRaw := toRawUnitsDecimal(bi2xAmount)
 	if bi2xAmountRaw == "0" {
 		return nil, fmt.Errorf("computed BI2X amount rounds to zero")
@@ -171,7 +171,7 @@ func (r *FeeTierRepo) SubscriptionHistory(ctx context.Context, userID string) ([
 // toRawUnitsDecimal truncates a decimal BI2X amount down to a whole raw-unit
 // integer string. BI2X uses the same 6-decimal raw-unit scale as every other
 // asset in user_balances (see assetColumns) — truncating (not rounding) means
-// a purchase never asks for fractionally more than the computed BIUSDB value.
+// a purchase never asks for fractionally more than the computed BI2XUSD value.
 func toRawUnitsDecimal(amount decimal.Decimal) string {
 	raw := amount.Mul(decimal.New(1, 6)).Truncate(0)
 	if raw.IsNegative() {

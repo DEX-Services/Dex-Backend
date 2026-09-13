@@ -16,7 +16,7 @@ func TestFeeTierSubscribe_DebitsExactBI2XAmountAndRecordsSubscription(t *testing
 	tiers := NewFeeTierRepo(ledger, fees)
 	userID := newTestUser(t, pool)
 
-	// Tier 1 costs 500 BIUSDB worth of BI2X. At a price of 5 BIUSDB per BI2X,
+	// Tier 1 costs 500 BI2XUSD worth of BI2X. At a price of 5 BI2XUSD per BI2X,
 	// that's exactly 100 BI2X. Credit 1000 raw units (BI2X uses the same
 	// 6-decimal raw scale as every other asset, so amounts here are in whole
 	// BI2X, not raw units — CreditBalance's amountRaw param is misleadingly

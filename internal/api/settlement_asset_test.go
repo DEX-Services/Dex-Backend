@@ -6,8 +6,8 @@ import "testing"
 // reconcileOrderBalance used to derive the settlement asset with a 2-part
 // SplitN(symbol, "-", 2) split, which only works for spot/futures'
 // BASE-QUOTE symbols. An option instrument's 5-part
-// BASE-QUOTE-STRIKE-EXPIRY-TYPE symbol (e.g. "BTC-BIUSDB-55000-20260917-CALL")
-// split that way took "BIUSDB-55000-20260917-CALL" as the asset — never a
+// BASE-QUOTE-STRIKE-EXPIRY-TYPE symbol (e.g. "BTC-BI2XUSD-55000-20260917-CALL")
+// split that way took "BI2XUSD-55000-20260917-CALL" as the asset — never a
 // real balance column — so every options BUY order failed "unsupported
 // asset" before ever reaching the engine. A SELL order happened to work by
 // accident (parts[0], "BTC", is a real asset) which is why the bug wasn't
@@ -20,10 +20,10 @@ func TestSettlementAssetForOrder_Options(t *testing.T) {
 		side   string
 		want   string
 	}{
-		{"call buy", "BTC-BIUSDB-55000-20260917-CALL", "OPTIONS", "BUY", "BIUSDB"},
-		{"call sell (writer)", "BTC-BIUSDB-55000-20260917-CALL", "OPTIONS", "SELL", "BIUSDB"},
-		{"put buy", "BTC-BIUSDB-60000-20260917-PUT", "OPTIONS", "BUY", "BIUSDB"},
-		{"put sell (writer)", "BTC-BIUSDB-60000-20260917-PUT", "OPTIONS", "SELL", "BIUSDB"},
+		{"call buy", "BTC-BI2XUSD-55000-20260917-CALL", "OPTIONS", "BUY", "BI2XUSD"},
+		{"call sell (writer)", "BTC-BI2XUSD-55000-20260917-CALL", "OPTIONS", "SELL", "BI2XUSD"},
+		{"put buy", "BTC-BI2XUSD-60000-20260917-PUT", "OPTIONS", "BUY", "BI2XUSD"},
+		{"put sell (writer)", "BTC-BI2XUSD-60000-20260917-PUT", "OPTIONS", "SELL", "BI2XUSD"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,10 +46,10 @@ func TestSettlementAssetForOrder_SpotAndFutures(t *testing.T) {
 		side   string
 		want   string
 	}{
-		{"spot buy draws quote", "BTC-BIUSDB", "SPOT", "BUY", "BIUSDB"},
-		{"spot sell draws base", "BTC-BIUSDB", "SPOT", "SELL", "BTC"},
-		{"futures buy draws quote", "BTC-BIUSDB", "FUTURES", "BUY", "BIUSDB"},
-		{"futures sell ALSO draws quote (margin, not base)", "BTC-BIUSDB", "FUTURES", "SELL", "BIUSDB"},
+		{"spot buy draws quote", "BTC-BI2XUSD", "SPOT", "BUY", "BI2XUSD"},
+		{"spot sell draws base", "BTC-BI2XUSD", "SPOT", "SELL", "BTC"},
+		{"futures buy draws quote", "BTC-BI2XUSD", "FUTURES", "BUY", "BI2XUSD"},
+		{"futures sell ALSO draws quote (margin, not base)", "BTC-BI2XUSD", "FUTURES", "SELL", "BI2XUSD"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestSettlementAssetForOrder_MalformedSymbolFailsClosed(t *testing.T) {
 	if _, ok := settlementAssetForOrder("notasymbol", "SPOT", "BUY"); ok {
 		t.Fatal("expected ok=false for a symbol with no separator")
 	}
-	if _, ok := settlementAssetForOrder("BTC-BIUSDB-1", "OPTIONS", "BUY"); ok {
+	if _, ok := settlementAssetForOrder("BTC-BI2XUSD-1", "OPTIONS", "BUY"); ok {
 		t.Fatal("expected ok=false for a too-short options symbol (fewer than 5 parts)")
 	}
 }

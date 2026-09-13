@@ -172,18 +172,18 @@ type swapRequestBody struct {
 
 // swapDestinations maps each allowed source asset to the destinations it may
 // be swapped into. The exchange is deliberately one-directional per asset:
-// USDT/USDC convert only into BIUSDB, and BIUSDB converts only back into
+// USDT/USDC convert only into BI2XUSD, and BI2XUSD converts only back into
 // USDT/USDC. A direct USDT↔USDC conversion is not offered (route through
-// BIUSDB instead), and no other assets participate in swaps.
+// BI2XUSD instead), and no other assets participate in swaps.
 var swapDestinations = map[string]map[string]bool{
-	"USDT":   {"BIUSDB": true},
-	"USDC":   {"BIUSDB": true},
-	"BIUSDB": {"USDT": true, "USDC": true},
+	"USDT":    {"BI2XUSD": true},
+	"USDC":    {"BI2XUSD": true},
+	"BI2XUSD": {"USDT": true, "USDC": true},
 }
 
 // swapFeeRate returns the (discount-adjusted) fee in basis points charged
 // when userID converts source into destination, and whether any fee applies
-// at all. Into BIUSDB is free; out of BIUSDB carries the conversion charge —
+// at all. Into BI2XUSD is free; out of BI2XUSD carries the conversion charge —
 // read from fee_config (feeconfig.KeySwapIn/KeySwapOut), not a hardcoded
 // constant, so an admin can retune it without a redeploy, and adjusted by
 // userID's active fee-tier discount the same way P2P/spot/futures fees are.
@@ -194,7 +194,7 @@ func (s *WalletServer) swapFeeRate(ctx context.Context, destination, userID stri
 		return 0, false
 	}
 	key := feeconfig.KeySwapIn
-	if destination != "BIUSDB" {
+	if destination != "BI2XUSD" {
 		key = feeconfig.KeySwapOut
 	}
 	rate := s.Fees.EffectiveRate(ctx, key, userID)
@@ -207,8 +207,8 @@ func (s *WalletServer) swapFeeRate(ctx context.Context, destination, userID stri
 
 // Swap: POST /wallet/swap {amount, sourceAsset, destinationAsset}
 // Converts deposit-intake stables and the platform's internal stable:
-//   - USDT → BIUSDB and USDC → BIUSDB: 1:1, no fee.
-//   - BIUSDB → USDT and BIUSDB → USDC: 1:1 with a 1% conversion charge,
+//   - USDT → BI2XUSD and USDC → BI2XUSD: 1:1, no fee.
+//   - BI2XUSD → USDT and BI2XUSD → USDC: 1:1 with a 1% conversion charge,
 //     deducted from the credited destination amount.
 //
 // All three assets are raw integer token balances at the same 6-decimal
@@ -236,7 +236,7 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !swapDestinations[source][destination] {
-		writeError(w, http.StatusBadRequest, "swap is only available from USDT or USDC into BIUSDB (no fee), or from BIUSDB into USDT or USDC (1% fee)")
+		writeError(w, http.StatusBadRequest, "swap is only available from USDT or USDC into BI2XUSD (no fee), or from BI2XUSD into USDT or USDC (1% fee)")
 		return
 	}
 

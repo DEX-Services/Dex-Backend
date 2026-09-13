@@ -25,7 +25,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	sellerID := newTestUser(t, pool)
 	buyerID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, sellerID, "BIUSDB", "20200000"); err != nil {
+	if err := ledger.CreditBalance(ctx, sellerID, "BI2XUSD", "20200000"); err != nil {
 		t.Fatalf("credit seller main wallet: %v", err)
 	}
 	balance, moved, err := p2p.FundWallet(ctx, sellerID, "20200000", "fund-test-0001")
@@ -33,7 +33,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 		t.Fatalf("fund P2P wallet: moved=%v err=%v", moved, err)
 	}
 	assertWallet(t, balance, "20200000", "0", "20200000")
-	mainBalance, err := ledger.BalanceFor(ctx, sellerID, "BIUSDB")
+	mainBalance, err := ledger.BalanceFor(ctx, sellerID, "BI2XUSD")
 	if err != nil || mainBalance != "0" {
 		t.Fatalf("seller main balance = %q err=%v, want 0", mainBalance, err)
 	}
@@ -152,7 +152,7 @@ func TestP2PWalletEscrowSuccessAndRefund(t *testing.T) {
 	assertWallet(t, sellerWallet, "150000", "15037500", "15187500")
 }
 
-func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
+func TestP2PWalletBI2XUSDEscrowSuccess(t *testing.T) {
 	pool := p2pTestPool(t)
 	ctx := context.Background()
 	// Reproduce constraints left by older database versions, then run startup
@@ -178,19 +178,19 @@ func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
 	sellerID := newTestUser(t, pool)
 	buyerID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, sellerID, "BIUSDB", "10100000"); err != nil {
-		t.Fatalf("credit seller BIUSDB: %v", err)
+	if err := ledger.CreditBalance(ctx, sellerID, "BI2XUSD", "10100000"); err != nil {
+		t.Fatalf("credit seller BI2XUSD: %v", err)
 	}
-	balance, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BIUSDB", "10100000", "fund-biusd-test-0001")
+	balance, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BI2XUSD", "10100000", "fund-biusd-test-0001")
 	if err != nil || !moved {
-		t.Fatalf("fund BIUSDB P2P wallet: moved=%v err=%v", moved, err)
+		t.Fatalf("fund BI2XUSD P2P wallet: moved=%v err=%v", moved, err)
 	}
 	assertWallet(t, balance, "10100000", "0", "10100000")
 
 	if _, err = p2p.EstablishP2PUsername(ctx, sellerID, "seller_biusd"); err != nil {
 		t.Fatalf("establish seller username: %v", err)
 	}
-	if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, "Bank Transfer", "Seller BIUSDB", "payment-id", "", "", ""); err == nil {
+	if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, "Bank Transfer", "Seller BI2XUSD", "payment-id", "", "", ""); err == nil {
 		t.Fatal("expected bank name and IFSC to be required for Bank Transfer")
 	}
 	for _, method := range []string{"UPI", "Bank Transfer", "MPESN", "NEFT", "IMPS"} {
@@ -198,13 +198,13 @@ func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
 		if method == "Bank Transfer" || method == "NEFT" || method == "IMPS" {
 			bankName, ifscCode = "Test Bank", "TEST0123456"
 		}
-		if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, method, "Seller BIUSDB", "payment-id", "", bankName, ifscCode); err != nil {
+		if _, err = p2p.UpsertPaymentAccount(ctx, sellerID, method, "Seller BI2XUSD", "payment-id", "", bankName, ifscCode); err != nil {
 			t.Fatalf("configure %s account: %v", method, err)
 		}
 	}
-	listing, err := p2p.CreateListingWithDetails(ctx, sellerID, "SELL", "BIUSDB", "10000000", []string{"UPI", "Bank Transfer", "MPESN", "NEFT", "IMPS"}, "")
+	listing, err := p2p.CreateListingWithDetails(ctx, sellerID, "SELL", "BI2XUSD", "10000000", []string{"UPI", "Bank Transfer", "MPESN", "NEFT", "IMPS"}, "")
 	if err != nil {
-		t.Fatalf("create BIUSDB listing: %v", err)
+		t.Fatalf("create BI2XUSD listing: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM p2p_orders WHERE listing_id=$1`, listing.ID)
@@ -213,33 +213,33 @@ func TestP2PWalletBIUSDBEscrowSuccess(t *testing.T) {
 
 	order, err := p2p.CreateOrderWithPayment(ctx, buyerID, listing.ID, "10000000", "Bank Transfer", "order-biusd-success")
 	if err != nil {
-		t.Fatalf("create BIUSDB order: %v", err)
+		t.Fatalf("create BI2XUSD order: %v", err)
 	}
 	// 0.25% seller fee on 10,000,000 = 25,000 (platform default rate).
-	if order.Asset != "BIUSDB" || order.EscrowRaw != "10025000" {
-		t.Fatalf("BIUSDB order asset/escrow = %s/%s", order.Asset, order.EscrowRaw)
+	if order.Asset != "BI2XUSD" || order.EscrowRaw != "10025000" {
+		t.Fatalf("BI2XUSD order asset/escrow = %s/%s", order.Asset, order.EscrowRaw)
 	}
 	if order.PaymentBankName != "Test Bank" || order.PaymentIFSCCode != "TEST0123456" {
 		t.Fatalf("bank snapshot = %q/%q", order.PaymentBankName, order.PaymentIFSCCode)
 	}
 	if _, err = p2p.AddOrderProof(ctx, buyerID, order.ID, "proof.png", "image/png", []byte("proof")); err != nil {
-		t.Fatalf("upload BIUSDB payment proof: %v", err)
+		t.Fatalf("upload BI2XUSD payment proof: %v", err)
 	}
 	if _, err = p2p.MarkPaid(ctx, buyerID, order.ID); err != nil {
-		t.Fatalf("mark BIUSDB order paid: %v", err)
+		t.Fatalf("mark BI2XUSD order paid: %v", err)
 	}
 	completed, err := p2p.ReleaseOrder(ctx, sellerID, order.ID)
 	if err != nil {
-		t.Fatalf("release BIUSDB order: %v", err)
+		t.Fatalf("release BI2XUSD order: %v", err)
 	}
-	if completed.Asset != "BIUSDB" || completed.EscrowRaw != "0" {
-		t.Fatalf("completed BIUSDB order asset/escrow = %s/%s", completed.Asset, completed.EscrowRaw)
+	if completed.Asset != "BI2XUSD" || completed.EscrowRaw != "0" {
+		t.Fatalf("completed BI2XUSD order asset/escrow = %s/%s", completed.Asset, completed.EscrowRaw)
 	}
-	buyerBIUSDB, err := p2p.WalletBalanceForAsset(ctx, buyerID, "BIUSDB")
+	buyerBI2XUSD, err := p2p.WalletBalanceForAsset(ctx, buyerID, "BI2XUSD")
 	if err != nil {
-		t.Fatalf("load buyer BIUSDB wallet: %v", err)
+		t.Fatalf("load buyer BI2XUSD wallet: %v", err)
 	}
-	assertWallet(t, buyerBIUSDB, "9975000", "0", "9975000")
+	assertWallet(t, buyerBI2XUSD, "9975000", "0", "9975000")
 	assertAdminP2PWallet(t, pool, "50000")
 }
 
@@ -251,10 +251,10 @@ func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
 	creatorBuyerID := newTestUser(t, pool)
 	takerSellerID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, takerSellerID, "BIUSDB", "5050000"); err != nil {
+	if err := ledger.CreditBalance(ctx, takerSellerID, "BI2XUSD", "5050000"); err != nil {
 		t.Fatalf("credit taker seller: %v", err)
 	}
-	if _, moved, err := p2p.FundWalletAsset(ctx, takerSellerID, "BIUSDB", "5050000", "fund-buy-ad-seller"); err != nil || !moved {
+	if _, moved, err := p2p.FundWalletAsset(ctx, takerSellerID, "BI2XUSD", "5050000", "fund-buy-ad-seller"); err != nil || !moved {
 		t.Fatalf("fund taker P2P wallet: moved=%v err=%v", moved, err)
 	}
 	if _, err := p2p.EstablishP2PUsername(ctx, creatorBuyerID, "buyer_ad_creator"); err != nil {
@@ -273,7 +273,7 @@ func TestP2PBuyAdUsesTakerAsSeller(t *testing.T) {
 		t.Fatal("expected established P2P username to be immutable")
 	}
 
-	listing, err := p2p.CreateListingWithDetails(ctx, creatorBuyerID, "BUY", "BIUSDB", "5000000", []string{"UPI", "Bank Transfer"}, "")
+	listing, err := p2p.CreateListingWithDetails(ctx, creatorBuyerID, "BUY", "BI2XUSD", "5000000", []string{"UPI", "Bank Transfer"}, "")
 	if err != nil {
 		t.Fatalf("create buy ad: %v", err)
 	}
@@ -336,10 +336,10 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	buyerID := newTestUser(t, pool)
 	outsiderID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, sellerID, "BIUSDB", "20200000"); err != nil {
+	if err := ledger.CreditBalance(ctx, sellerID, "BI2XUSD", "20200000"); err != nil {
 		t.Fatalf("credit seller: %v", err)
 	}
-	if _, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BIUSDB", "20200000", "workflow-fund"); err != nil || !moved {
+	if _, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BI2XUSD", "20200000", "workflow-fund"); err != nil || !moved {
 		t.Fatalf("fund seller P2P wallet: moved=%v err=%v", moved, err)
 	}
 	if _, err := p2p.EstablishP2PUsername(ctx, sellerID, "workflow_seller"); err != nil {
@@ -353,7 +353,7 @@ func TestP2POrderEvidenceChatAndAppealResolution(t *testing.T) {
 	}
 
 	createOrder := func(key string) *models.P2POrder {
-		listing, err := p2p.CreateListingWithDetails(ctx, sellerID, "SELL", "BIUSDB", "10000000", []string{"UPI"}, "")
+		listing, err := p2p.CreateListingWithDetails(ctx, sellerID, "SELL", "BI2XUSD", "10000000", []string{"UPI"}, "")
 		if err != nil {
 			t.Fatalf("create listing: %v", err)
 		}
@@ -473,10 +473,10 @@ func TestP2PListingLimitsAndAdvertiserStatistics(t *testing.T) {
 	sellerID := newTestUser(t, pool)
 	buyerID := newTestUser(t, pool)
 
-	if err := ledger.CreditBalance(ctx, sellerID, "BIUSDB", "10100000"); err != nil {
+	if err := ledger.CreditBalance(ctx, sellerID, "BI2XUSD", "10100000"); err != nil {
 		t.Fatalf("credit seller: %v", err)
 	}
-	if _, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BIUSDB", "10100000", "limits-fund"); err != nil || !moved {
+	if _, moved, err := p2p.FundWalletAsset(ctx, sellerID, "BI2XUSD", "10100000", "limits-fund"); err != nil || !moved {
 		t.Fatalf("fund seller P2P wallet: moved=%v err=%v", moved, err)
 	}
 	if _, err := p2p.EstablishP2PUsername(ctx, sellerID, "limits_seller"); err != nil {
@@ -485,7 +485,7 @@ func TestP2PListingLimitsAndAdvertiserStatistics(t *testing.T) {
 	if _, err := p2p.UpsertPaymentAccount(ctx, sellerID, "UPI", "Limits Seller", "limits@upi", "", "", ""); err != nil {
 		t.Fatalf("configure payment account: %v", err)
 	}
-	listing, err := p2p.CreateListingWithLimits(ctx, sellerID, "SELL", "BIUSDB", "10000000", []string{"UPI"}, "", "200.00", "500.00")
+	listing, err := p2p.CreateListingWithLimits(ctx, sellerID, "SELL", "BI2XUSD", "10000000", []string{"UPI"}, "", "200.00", "500.00")
 	if err != nil {
 		t.Fatalf("create limited listing: %v", err)
 	}
@@ -544,7 +544,7 @@ func TestP2PListingLimitsAndAdvertiserStatistics(t *testing.T) {
 func assertAdminP2PWallet(t *testing.T, pool *pgxpool.Pool, want string) {
 	t.Helper()
 	var got string
-	if err := pool.QueryRow(context.Background(), `SELECT available_raw::text FROM p2p_admin_wallet_balances WHERE asset='BIUSDB'`).Scan(&got); err != nil {
+	if err := pool.QueryRow(context.Background(), `SELECT available_raw::text FROM p2p_admin_wallet_balances WHERE asset='BI2XUSD'`).Scan(&got); err != nil {
 		t.Fatalf("load admin P2P wallet: %v", err)
 	}
 	if got != want {

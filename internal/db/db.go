@@ -102,8 +102,11 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"user ID defaults", ensureIDDefault},
 		{"wallet balances", ensureUserBalancesTable},
 		{"P2P tables", ensureP2PTables},
-		{"USDT to BIUSDB", migrateUSDTToBIUSDB},
+		{"USDT to BI2XUSD", migrateUSDTToBI2XUSD},
 		{"fee config tables", ensureFeeConfigTables},
+		{"fee_model BIUSDB to BI2XUSD", migrateFeeModelBI2XUSD},
+		{"fee_tiers biusdb_value to bi2xusd_value", migrateFeeTiersBI2XUSDValueColumn},
+		{"user_balances BIUSDB to BI2XUSD", migrateUserBalancesBI2XUSDColumn},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -143,25 +146,35 @@ INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
 VALUES ('USDC', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
 INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
-VALUES ('BIUSDB', 'INR', 100, CURRENT_DATE)
+VALUES ('BI2XUSD', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+-- Historical price rows recorded under the pre-rename asset name. No CHECK
+-- constraint here to violate (this table has none on asset), so this is a
+-- data-consistency cleanup rather than a required fix — old rows would
+-- otherwise just sit under the old name forever.
+UPDATE p2p_price_history SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
 CREATE TABLE IF NOT EXISTS p2p_listings (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(), seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSDB')), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BI2XUSD')), amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	remaining_raw NUMERIC(38,0) NOT NULL CHECK (remaining_raw >= 0), price NUMERIC(38,8) NOT NULL CHECK (price > 0),
 	fiat_currency TEXT NOT NULL DEFAULT 'INR', payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI', 'Bank Transfer', 'NEFT', 'IMPS')),
 	status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'FILLED', 'CANCELLED')),
 	funding_source TEXT NOT NULL DEFAULT 'P2P_WALLET' CHECK (funding_source IN ('P2P_WALLET', 'MAIN_WALLET_LEGACY')),
-	fee_model TEXT NOT NULL DEFAULT 'BIUSDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BIUSDB_1PCT_EACH')),
+	fee_model TEXT NOT NULL DEFAULT 'BI2XUSD_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BI2XUSD_1PCT_EACH')),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT 'SELL';
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS fee_model TEXT;
 UPDATE p2p_listings SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
-ALTER TABLE p2p_listings ALTER COLUMN fee_model SET DEFAULT 'BIUSDB_1PCT_EACH';
+ALTER TABLE p2p_listings ALTER COLUMN fee_model SET DEFAULT 'BI2XUSD_1PCT_EACH';
 ALTER TABLE p2p_listings ALTER COLUMN fee_model SET NOT NULL;
+-- Must run before the CHECK constraint below is (re)added: any row still
+-- holding the pre-rename 'BIUSDB_1PCT_EACH' value would fail validation
+-- against a constraint that only allows the new value. This makes the data
+-- fix a prerequisite of the constraint, not a follow-up migration.
+UPDATE p2p_listings SET fee_model = 'BI2XUSD_1PCT_EACH' WHERE fee_model = 'BIUSDB_1PCT_EACH';
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_fee_model_check;
-ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BIUSDB_1PCT_EACH'));
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BI2XUSD_1PCT_EACH'));
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_side_check;
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_side_check CHECK (side IN ('BUY','SELL'));
 ALTER TABLE p2p_listings ADD COLUMN IF NOT EXISTS payment_methods TEXT[];
@@ -200,7 +213,7 @@ CREATE TABLE IF NOT EXISTS p2p_orders (
 	seller_fee_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (seller_fee_raw >= 0),
 	buyer_credit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (buyer_credit_raw > 0),
 	seller_debit_raw NUMERIC(38,0) NOT NULL DEFAULT 1 CHECK (seller_debit_raw > 0),
-	fee_model TEXT NOT NULL DEFAULT 'BIUSDB_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BIUSDB_1PCT_EACH')),
+	fee_model TEXT NOT NULL DEFAULT 'BI2XUSD_1PCT_EACH' CHECK (fee_model IN ('LEGACY_FIAT','BI2XUSD_1PCT_EACH')),
 	idempotency_key TEXT, expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
 	cancellation_reason TEXT, completed_at TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (buyer_id <> seller_id)
@@ -248,10 +261,13 @@ UPDATE p2p_orders SET fee_model='LEGACY_FIAT' WHERE fee_model IS NULL;
 UPDATE p2p_orders SET buyer_credit_raw=COALESCE(buyer_credit_raw,amount_raw,buyer_credit),seller_debit_raw=COALESCE(seller_debit_raw,escrow_raw,amount_raw,seller_debit);
 ALTER TABLE p2p_orders ALTER COLUMN buyer_credit_raw SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN seller_debit_raw SET NOT NULL;
-ALTER TABLE p2p_orders ALTER COLUMN fee_model SET DEFAULT 'BIUSDB_1PCT_EACH';
+ALTER TABLE p2p_orders ALTER COLUMN fee_model SET DEFAULT 'BI2XUSD_1PCT_EACH';
 ALTER TABLE p2p_orders ALTER COLUMN fee_model SET NOT NULL;
+-- Must run before the CHECK constraint below is (re)added — see the
+-- identical comment on p2p_listings above.
+UPDATE p2p_orders SET fee_model = 'BI2XUSD_1PCT_EACH' WHERE fee_model = 'BIUSDB_1PCT_EACH';
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_fee_model_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BIUSDB_1PCT_EACH'));
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_fee_model_check CHECK (fee_model IN ('LEGACY_FIAT','BI2XUSD_1PCT_EACH'));
 ALTER TABLE p2p_orders ADD COLUMN IF NOT EXISTS taker_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
 UPDATE p2p_orders o SET taker_id=CASE WHEN l.side='BUY' THEN o.seller_id ELSE o.buyer_id END
 	FROM p2p_listings l WHERE o.listing_id=l.id AND o.taker_id IS NULL;
@@ -279,8 +295,12 @@ ALTER TABLE p2p_listings ALTER COLUMN funding_source SET NOT NULL;
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_funding_source_check;
 ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_funding_source_check
 	CHECK (funding_source IN ('P2P_WALLET','MAIN_WALLET_LEGACY'));
+-- Must run before the CHECK constraint below: any row still holding the raw
+-- pre-rename literal 'BIUSDB' in its asset column would fail validation
+-- against a constraint that only allows 'BI2XUSD'.
+UPDATE p2p_listings SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
 ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_asset_check;
-ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','BIUSDB'));
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','BI2XUSD'));
 
 UPDATE p2p_orders SET
 	amount_raw = COALESCE(amount_raw, buyer_credit, seller_debit, gross_amount),
@@ -302,8 +322,11 @@ ALTER TABLE p2p_orders ALTER COLUMN amount_raw SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN fiat_currency SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN buyer_payable SET NOT NULL;
 ALTER TABLE p2p_orders ALTER COLUMN seller_receivable SET NOT NULL;
+-- Must run before the CHECK constraint below — see the identical comment on
+-- p2p_listings above.
+UPDATE p2p_orders SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
-ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','BIUSDB'));
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','BI2XUSD'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_payment_method_check;
 ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_payment_method_check CHECK (payment_method IN ('UPI','Bank Transfer','MPESN','NEFT','IMPS','upi','bank_transfer','neft','imps','qr','test_payment'));
 ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_status_check;
@@ -323,7 +346,7 @@ CREATE INDEX IF NOT EXISTS idx_p2p_orders_expiry
 
 CREATE TABLE IF NOT EXISTS p2p_wallet_balances (
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSDB')),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BI2XUSD')),
 	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
 	reserved_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (reserved_raw >= 0),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -337,7 +360,7 @@ CREATE TABLE IF NOT EXISTS p2p_wallet_entries (
 	listing_id UUID REFERENCES p2p_listings(id) ON DELETE SET NULL,
 	order_id UUID REFERENCES p2p_orders(id) ON DELETE SET NULL,
 	kind TEXT NOT NULL,
-	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BIUSDB')),
+	asset TEXT NOT NULL DEFAULT 'USDC' CHECK (asset IN ('USDC','BI2XUSD')),
 	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	idempotency_key TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -347,30 +370,48 @@ CREATE INDEX IF NOT EXISTS idx_p2p_wallet_entries_user
 CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_wallet_fund_idempotency
 	ON p2p_wallet_entries (user_id,kind,idempotency_key)
 	WHERE kind='main_to_p2p' AND idempotency_key IS NOT NULL;
+-- Must run before the CHECK constraints below — see the identical comment
+-- on p2p_listings above.
+UPDATE p2p_wallet_balances SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
+UPDATE p2p_wallet_entries SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
 ALTER TABLE p2p_wallet_balances DROP CONSTRAINT IF EXISTS p2p_wallet_balances_asset_check;
-ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','BIUSDB'));
+ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','BI2XUSD'));
 ALTER TABLE p2p_wallet_entries DROP CONSTRAINT IF EXISTS p2p_wallet_entries_asset_check;
-ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','BIUSDB'));
+ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','BI2XUSD'));
 
 -- System-owned fee wallet. It deliberately has no user_id: customers cannot
 -- authenticate as or spend from this account through the P2P wallet APIs.
 CREATE TABLE IF NOT EXISTS p2p_admin_wallet_balances (
-	asset TEXT PRIMARY KEY CHECK (asset = 'BIUSDB'),
+	asset TEXT PRIMARY KEY CHECK (asset = 'BI2XUSD'),
 	available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-INSERT INTO p2p_admin_wallet_balances(asset) VALUES('BIUSDB') ON CONFLICT(asset) DO NOTHING;
 CREATE TABLE IF NOT EXISTS p2p_admin_wallet_entries (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	order_id UUID NOT NULL REFERENCES p2p_orders(id) ON DELETE RESTRICT,
-	asset TEXT NOT NULL CHECK (asset = 'BIUSDB'),
+	asset TEXT NOT NULL CHECK (asset = 'BI2XUSD'),
 	buyer_fee_raw NUMERIC(38,0) NOT NULL CHECK (buyer_fee_raw >= 0),
 	seller_fee_raw NUMERIC(38,0) NOT NULL CHECK (seller_fee_raw >= 0),
 	amount_raw NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	UNIQUE(order_id)
 );
+-- The two CREATE TABLE IF NOT EXISTS above are no-ops on a database where
+-- these tables already exist from before the rename — their CHECK
+-- constraints (baked into the column definition, not added separately)
+-- still require the literal 'BIUSDB' on such a database, and the existing
+-- admin-wallet row's primary key is still literally 'BIUSDB'. Both must be
+-- fixed explicitly: rename the row's data first, then swap the constraint,
+-- exactly the same ordering requirement as every other asset-check rename
+-- above (data before constraint, or the ADD CONSTRAINT fails validation).
+ALTER TABLE p2p_admin_wallet_balances DROP CONSTRAINT IF EXISTS p2p_admin_wallet_balances_asset_check;
+UPDATE p2p_admin_wallet_balances SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
+ALTER TABLE p2p_admin_wallet_balances ADD CONSTRAINT p2p_admin_wallet_balances_asset_check CHECK (asset = 'BI2XUSD');
+ALTER TABLE p2p_admin_wallet_entries DROP CONSTRAINT IF EXISTS p2p_admin_wallet_entries_asset_check;
+UPDATE p2p_admin_wallet_entries SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
+ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_asset_check CHECK (asset = 'BI2XUSD');
+INSERT INTO p2p_admin_wallet_balances(asset) VALUES('BI2XUSD') ON CONFLICT(asset) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS p2p_payment_accounts (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -470,37 +511,37 @@ ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI_locked" NUMERIC(38,0) NOT
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
--- BIUSDB: the platform's internal stable quote currency, pegged 1:1 to USDT.
--- It has no on-chain contract; every market's quote leg trades in BIUSDB. The
+-- BI2XUSD: the platform's internal stable quote currency, pegged 1:1 to USDT.
+-- It has no on-chain contract; every market's quote leg trades in BI2XUSD. The
 -- USDT/USDC columns above remain only as the deposit-intake ledger (a real
 -- on-chain deposit lands there first via the chain listener), not as a
 -- tradable balance any more.
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSDB" NUMERIC(38,0) NOT NULL DEFAULT 0;
-ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BIUSDB_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2XUSD" NUMERIC(38,0) NOT NULL DEFAULT 0;
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS "BI2XUSD_locked" NUMERIC(38,0) NOT NULL DEFAULT 0;
 
 -- BUSD removed: it was a dormant deposit-intake balance column never wired
 -- into any market, deposit path, or swap conversion — fully retired. Any
 -- lingering "BUSD"/"BUSD_locked" columns and their balances are folded into
--- BIUSDB (the platform's real stable-quote balance) before being dropped.
+-- BI2XUSD (the platform's real stable-quote balance) before being dropped.
 DO $drop_busd$
 BEGIN
 	IF EXISTS (
 		SELECT 1 FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'BUSD'
 	) THEN
-		UPDATE user_balances SET "BIUSDB" = "BIUSDB" + "BUSD", "BIUSDB_locked" = "BIUSDB_locked" + "BUSD_locked";
+		UPDATE user_balances SET "BI2XUSD" = "BI2XUSD" + "BUSD", "BI2XUSD_locked" = "BI2XUSD_locked" + "BUSD_locked";
 		ALTER TABLE user_balances DROP COLUMN "BUSD";
 		ALTER TABLE user_balances DROP COLUMN IF EXISTS "BUSD_locked";
 	END IF;
 END $drop_busd$;
 
 -- ETH, SOL, and BNB columns removed: the SPOT markets they backed
--- (ETH-BIUSDB/SOL-BIUSDB/BNB-BIUSDB) were removed in the 2026-09-12
+-- (ETH-BI2XUSD/SOL-BI2XUSD/BNB-BI2XUSD) were removed in the 2026-09-12
 -- restructure — ETH and SOL now trade FUTURES-only (settled entirely in
--- BIUSDB, never touching a base-asset column; see
+-- BI2XUSD, never touching a base-asset column; see
 -- matching-engine/internal/settlement/futures.go), and BNB has no market at
 -- all any more. Unlike BUSD above, there is no equivalent asset to fold
--- these into (ETH/SOL/BNB are not interchangeable with BIUSDB), so this
+-- these into (ETH/SOL/BNB are not interchangeable with BI2XUSD), so this
 -- drops them outright rather than attempting a conversion.
 ALTER TABLE user_balances DROP COLUMN IF EXISTS "ETH";
 ALTER TABLE user_balances DROP COLUMN IF EXISTS "ETH_locked";
@@ -509,7 +550,7 @@ ALTER TABLE user_balances DROP COLUMN IF EXISTS "SOL_locked";
 ALTER TABLE user_balances DROP COLUMN IF EXISTS "BNB";
 ALTER TABLE user_balances DROP COLUMN IF EXISTS "BNB_locked";
 
--- BI2X: base asset for the BI2X-BIUSDB spot/futures pair (added 2026-09-12,
+-- BI2X: base asset for the BI2X-BI2XUSD spot/futures pair (added 2026-09-12,
 -- matching-engine's currentMarkets). Added alongside the market's own
 -- registration, so deposits/MM funding never hit "unsupported asset" the way
 -- ETH/SOL/BNB briefly did before their columns existed (see the ETH/SOL/BNB
@@ -534,7 +575,7 @@ BEGIN
 					MIN(balance_id) AS keep_id,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDC' THEN total ELSE 0 END), 0) AS usdc,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'USDT' THEN total ELSE 0 END), 0) AS usdt,
-					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'BIUSDB' THEN total ELSE 0 END), 0) AS biusd,
+					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) = 'BI2XUSD' THEN total ELSE 0 END), 0) AS biusd,
 					COALESCE(SUM(CASE WHEN UPPER(REPLACE(asset, '-', '_')) IN ('OUR_TOKEN', 'OURTOKEN') THEN total ELSE 0 END), 0) AS our_token,
 					MIN(updated_at) AS created_at,
 					MAX(updated_at) AS updated_at
@@ -544,7 +585,7 @@ BEGIN
 			UPDATE user_balances ub
 			SET "USDC" = migrated.usdc,
 				"USDT" = migrated.usdt,
-				"BIUSDB" = migrated.biusd,
+				"BI2XUSD" = migrated.biusd,
 				"BI" = migrated.our_token,
 				created_at = migrated.created_at,
 				updated_at = migrated.updated_at
@@ -611,20 +652,20 @@ BEGIN
 END $$;
 `
 
-// migrateUSDTToBIUSDB is the one-time conversion for the USDT→BIUSDB currency
-// switch: every market's quote leg now trades in BIUSDB (pegged 1:1 to USDT,
+// migrateUSDTToBI2XUSD is the one-time conversion for the USDT→BI2XUSD currency
+// switch: every market's quote leg now trades in BI2XUSD (pegged 1:1 to USDT,
 // no on-chain contract of its own), so a balance sitting in the old
-// tradable USDT column must move to BIUSDB or it becomes permanently
+// tradable USDT column must move to BI2XUSD or it becomes permanently
 // inaccessible to trading. Converts at 1:1 and zeroes the USDT columns.
 //
 // Idempotent by construction, not by a migration-log flag: it only touches
 // rows where USDT (or USDT_locked) is still nonzero, which is false after
 // the first successful run, so re-running on every boot is a no-op. Must
-// run after `schema` has created the BIUSDB columns.
-const migrateUSDTToBIUSDB = `
+// run after `schema` has created the BI2XUSD columns.
+const migrateUSDTToBI2XUSD = `
 UPDATE user_balances SET
-	"BIUSDB" = "BIUSDB" + "USDT",
-	"BIUSDB_locked" = "BIUSDB_locked" + "USDT_locked",
+	"BI2XUSD" = "BI2XUSD" + "USDT",
+	"BI2XUSD_locked" = "BI2XUSD_locked" + "USDT_locked",
 	"USDT" = 0,
 	"USDT_locked" = 0,
 	updated_at = now()
@@ -660,13 +701,13 @@ INSERT INTO fee_config (key, rate) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS fee_tiers (
-    tier         INT PRIMARY KEY,
-    biusdb_value NUMERIC(20,2) NOT NULL,
-    discount_pct NUMERIC(5,2) NOT NULL,
-    active       BOOLEAN NOT NULL DEFAULT true
+    tier          INT PRIMARY KEY,
+    bi2xusd_value NUMERIC(20,2) NOT NULL,
+    discount_pct  NUMERIC(5,2) NOT NULL,
+    active        BOOLEAN NOT NULL DEFAULT true
 );
 
-INSERT INTO fee_tiers (tier, biusdb_value, discount_pct) VALUES
+INSERT INTO fee_tiers (tier, bi2xusd_value, discount_pct) VALUES
     (1, '500', '5'),
     (2, '1000', '10'),
     (3, '5000', '15'),
@@ -692,4 +733,75 @@ CREATE TABLE IF NOT EXISTS user_fee_subscriptions (
 );
 CREATE INDEX IF NOT EXISTS idx_user_fee_subscriptions_lookup
     ON user_fee_subscriptions (user_id, status, expires_at);
+`
+
+// migrateFeeModelBI2XUSD is the one-time rename of the fee_model enum value
+// BIUSDB_1PCT_EACH -> BI2XUSD_1PCT_EACH (part of the BIUSDB -> BI2XUSD
+// identifier rename). The Go-level constant/string literal was renamed
+// alongside this migration; existing rows still holding the old enum string
+// must be updated too, since the CHECK constraints on both tables now only
+// allow the new value.
+//
+// Idempotent by construction: the UPDATE only matches rows still holding the
+// old value, which is none after the first successful run.
+const migrateFeeModelBI2XUSD = `
+UPDATE p2p_listings SET fee_model = 'BI2XUSD_1PCT_EACH' WHERE fee_model = 'BIUSDB_1PCT_EACH';
+UPDATE p2p_orders SET fee_model = 'BI2XUSD_1PCT_EACH' WHERE fee_model = 'BIUSDB_1PCT_EACH';
+`
+
+// migrateFeeTiersBI2XUSDValueColumn renames fee_tiers.biusdb_value to
+// bi2xusd_value (part of the BIUSDB -> BI2XUSD identifier rename). Guarded so
+// it only runs if the old column still exists, so it is safe against a fresh
+// database whose CREATE TABLE already used the new column name, and safe to
+// re-run.
+const migrateFeeTiersBI2XUSDValueColumn = `
+DO $rename_fee_tiers_bi2xusd_value$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'fee_tiers' AND column_name = 'biusdb_value'
+	) THEN
+		ALTER TABLE public.fee_tiers RENAME COLUMN biusdb_value TO bi2xusd_value;
+	END IF;
+END $rename_fee_tiers_bi2xusd_value$;
+`
+
+// migrateUserBalancesBI2XUSDColumn renames the user_balances "BIUSDB" and
+// "BIUSDB_locked" columns (holding real user balance data) to "BI2XUSD" and
+// "BI2XUSD_locked" (part of the BIUSDB -> BI2XUSD identifier rename). Guarded
+// so it only runs if the old columns still exist, so it is safe against a
+// fresh database whose CREATE TABLE already used the new column names, and
+// safe to re-run.
+//
+// Also handles a split state where BOTH "BIUSDB" (still holding the real
+// data) and an empty "BI2XUSD" already coexist — this can happen if another
+// service sharing this table (e.g. matching-engine, which also runs its own
+// ADD COLUMN IF NOT EXISTS "BI2XUSD" as part of its own schema-ensure step)
+// creates the new empty column before this migration gets a chance to
+// rename the old one over it. A plain RENAME COLUMN would fail with
+// "column already exists" in that case, so the empty new-name column (and
+// its _locked twin) is dropped first if it holds no data, making room for
+// the real rename.
+const migrateUserBalancesBI2XUSDColumn = `
+DO $rename_user_balances_bi2xusd$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'BIUSDB'
+	) THEN
+		IF EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'BI2XUSD'
+		) THEN
+			IF (SELECT COALESCE(SUM("BI2XUSD"), 0) + COALESCE(SUM("BI2XUSD_locked"), 0) FROM public.user_balances) = 0 THEN
+				ALTER TABLE public.user_balances DROP COLUMN "BI2XUSD";
+				ALTER TABLE public.user_balances DROP COLUMN IF EXISTS "BI2XUSD_locked";
+			ELSE
+				RAISE EXCEPTION 'user_balances has both "BIUSDB" and a non-empty "BI2XUSD" column; manual reconciliation required before this migration can proceed safely';
+			END IF;
+		END IF;
+		ALTER TABLE public.user_balances RENAME COLUMN "BIUSDB" TO "BI2XUSD";
+		ALTER TABLE public.user_balances RENAME COLUMN "BIUSDB_locked" TO "BI2XUSD_locked";
+	END IF;
+END $rename_user_balances_bi2xusd$;
 `

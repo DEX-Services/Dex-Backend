@@ -45,7 +45,7 @@ func (s *FeeServer) Tiers(w http.ResponseWriter, r *http.Request) {
 
 	type tierResp struct {
 		Tier          int    `json:"tier"`
-		BIUSDBValue   string `json:"biusdbValue"`
+		BI2XUSDValue  string `json:"bi2xusdValue"`
 		DiscountPct   string `json:"discountPct"`
 		Active        bool   `json:"active"`
 		BI2XCost      string `json:"bi2xCost,omitempty"`
@@ -54,16 +54,16 @@ func (s *FeeServer) Tiers(w http.ResponseWriter, r *http.Request) {
 	out := make([]tierResp, 0, len(tiers))
 	for _, t := range tiers {
 		tr := tierResp{
-			Tier:        t.Tier,
-			BIUSDBValue: t.BIUSDBValue.String(),
-			DiscountPct: t.DiscountPct.String(),
-			Active:      t.Active,
+			Tier:         t.Tier,
+			BI2XUSDValue: t.BI2XUSDValue.String(),
+			DiscountPct:  t.DiscountPct.String(),
+			Active:       t.Active,
 		}
 		if priceErr == nil {
-			tr.BI2XCost = t.BIUSDBValue.Div(price).StringFixed(6)
+			tr.BI2XCost = t.BI2XUSDValue.Div(price).StringFixed(6)
 		} else {
 			// Show the ladder even if the live price feed is briefly down —
-			// the BIUSDB value alone is still useful information; only the
+			// the BI2XUSD value alone is still useful information; only the
 			// live BI2X-quantity preview is unavailable. The /fees/subscribe
 			// endpoint independently re-checks the price and refuses the
 			// purchase itself if it's still unavailable at that point.
@@ -110,7 +110,7 @@ type subscribeRequestBody struct {
 
 // Subscribe: POST /fees/subscribe {tier} — purchases a fee-tier discount
 // subscription. Reads BI2X's live price fresh (never cached across this
-// request), computes the exact BI2X quantity for the tier's fixed BIUSDB
+// request), computes the exact BI2X quantity for the tier's fixed BI2XUSD
 // value, and atomically debits it and records the subscription (see
 // repo.FeeTierRepo.Subscribe). Any existing active subscription is
 // superseded — a repurchase always resets the 1-year clock, per the
