@@ -247,6 +247,55 @@ func hasLiveReservation(reservedStr string) bool {
 	return ok && reserved.Sign() > 0
 }
 
+// reconcileDustFloor: a drift correction of this size or smaller is always
+// allowed regardless of the account's balance — plausible rounding-scale
+// drift on any asset, any balance size (including a near-zero one, where a
+// fraction-of-balance cap alone would block even a fair correction).
+const reconcileDustFloor = "0.01"
+
+// reconcileMaxFraction: above the dust floor, a correction may still only
+// be at most this fraction of whichever side (Postgres or engine) reports
+// the larger balance for the asset.
+const reconcileMaxFraction = "0.02"
+
+// reconcileDeltaExceedsSafetyCap reports whether reconcileOrderBalance's
+// computed delta (dbAmount - engineAmount) is too large to auto-correct
+// safely. Extracted as a pure function so this guard is directly
+// unit-testable without a real engine or Postgres — same shape as
+// hasLiveReservation above, which exists for the same reason.
+//
+// Added 2026-09-14 after a live incident: reconcileOrderBalance silently
+// debited a user's entire real BI2X balance to zero as a "correction",
+// destroying it with no order ever created to explain where it went. This
+// function's surrounding doc comments already record TWO earlier incidents
+// where a timing/read race made the drift comparison see a bogus delta and
+// auto-correct it for real; this was the third. Rather than trust any
+// single fix to have closed every possible race in the comparison, this
+// caps what an automatic correction is allowed to do: small drift (at most
+// reconcileDustFloor of the asset, or at most reconcileMaxFraction of the
+// larger side's balance) still auto-corrects exactly as before; anything
+// bigger is presumed to be a bug in the comparison itself rather than real
+// drift, and is skipped (the caller logs full detail and returns without
+// touching the balance) rather than silently applied. This can never make
+// a real, legitimate drift worse — the case this function exists for
+// (a stale mirror after a deposit or an engine restart) is caught on a
+// later call once conditions change — but it can no longer wipe an
+// account's real balance in one silent shot.
+func reconcileDeltaExceedsSafetyCap(dbAmount, engineAmount, delta *big.Rat) bool {
+	absDelta := new(big.Rat).Abs(delta)
+	dustFloor, _ := new(big.Rat).SetString(reconcileDustFloor)
+	if absDelta.Cmp(dustFloor) <= 0 {
+		return false
+	}
+	reference := new(big.Rat).Abs(dbAmount)
+	if engAbs := new(big.Rat).Abs(engineAmount); engAbs.Cmp(reference) > 0 {
+		reference = engAbs
+	}
+	maxFraction, _ := new(big.Rat).SetString(reconcileMaxFraction)
+	maxAllowed := new(big.Rat).Mul(reference, maxFraction)
+	return absDelta.Cmp(maxAllowed) > 0
+}
+
 func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symbol, market, side string) error {
 	if s.Ledger == nil || s.Engine == nil {
 		return nil
@@ -350,13 +399,32 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 		return fmt.Errorf("invalid engine balance %s", engineBal.Available)
 	}
 	delta := new(big.Rat).Sub(dbAmount, engineAmount)
+	if delta.Sign() == 0 {
+		return nil
+	}
+
+	// Safety cap (added 2026-09-14, after a live incident where this
+	// function debited a user's entire real BI2X balance to zero with no
+	// order ever created to account for it — see
+	// SEQUENCE-RESET-HISTORY-LOSS-BUG.md's sibling incident writeup, or ask
+	// about "reconcileOrderBalance wiped BI2X balance" from this date).
+	// This function's own comments above already document TWO prior
+	// incidents where a timing/read race made this comparison see a bogus
+	// delta and auto-correct it for real — this is the third. Rather than
+	// trust any single fix to have closed every possible race in this
+	// comparison, cap what an automatic correction is allowed to do — see
+	// reconcileDeltaExceedsSafetyCap's doc comment.
+	if reconcileDeltaExceedsSafetyCap(dbAmount, engineAmount, delta) {
+		s.Log.Error("reconcileOrderBalance: delta exceeds safety cap, skipping auto-correction",
+			"accountId", accountID, "asset", asset, "dbAvailable", dbAmount.FloatString(18),
+			"engineAvailable", engineAmount.FloatString(18), "delta", delta.FloatString(18))
+		return nil
+	}
+
 	if delta.Sign() > 0 {
 		return s.Engine.Credit(ctx, accountID, asset, delta.FloatString(18))
 	}
-	if delta.Sign() < 0 {
-		return s.Engine.Debit(ctx, accountID, asset, new(big.Rat).Abs(delta).FloatString(18))
-	}
-	return nil
+	return s.Engine.Debit(ctx, accountID, asset, new(big.Rat).Abs(delta).FloatString(18))
 }
 
 func (s *TradeServer) AttachedOrder(w http.ResponseWriter, r *http.Request) {
