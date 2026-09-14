@@ -213,14 +213,20 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
-	if err != nil {
-		return err
-	}
+	// The pending-withdrawal hold used to be read in its own round trip
+	// (pendingWithdrawalHoldTx) and then substituted into this UPDATE as a
+	// literal parameter. Folded into a scalar subquery instead: same value,
+	// computed by Postgres inline, one fewer statement in this transaction.
+	// Semantics are unchanged -- COALESCE(SUM(...), 0) is exactly what
+	// pendingWithdrawalHoldTx returned.
 	commandTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
-		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - $3::numeric >= $2::numeric`,
-		userID, amountRaw, pendingHold.String())
+		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - (
+			SELECT COALESCE(SUM(amount), 0) FROM ledger_entries
+			WHERE user_id = $1 AND token = $3 AND kind = $4 AND status IN ($5, $6)
+		 ) >= $2::numeric`,
+		userID, amountRaw, normalized, models.LedgerKindWithdrawalRequest,
+		models.LedgerStatusPending, models.LedgerStatusProcessing)
 	if err != nil {
 		return err
 	}
@@ -439,25 +445,33 @@ func (r *LedgerRepo) SettleSpotTrade(ctx context.Context, buyerID, sellerID, bas
 	}
 	baseLocked := lockedColumns[baseName]
 	quoteLocked := lockedColumns[quoteName]
-	buyerTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`-$2::numeric, `+quoteLocked+`=`+quoteLocked+`-$2::numeric, updated_at=now() WHERE user_id=$1 AND `+quoteColumn+` >= $2::numeric AND `+quoteLocked+` >= $2::numeric`, buyerID, buyerQuoteRaw)
+	// Each side used to take two separate UPDATEs (debit-locked, then a
+	// later credit) — four statements total for one trade. Base and quote
+	// are always different columns for a spot pair, so each side's debit and
+	// credit can be folded into a single UPDATE with two independent SET
+	// clauses instead: same rows touched, same values written, same
+	// insufficient-funds gating (the debit side's >= checks still gate the
+	// whole statement, exactly as before), just two round trips instead of
+	// four inside this transaction.
+	buyerTag, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`-$2::numeric, `+quoteLocked+`=`+quoteLocked+`-$2::numeric, `+baseColumn+`=`+baseColumn+`+$3::numeric, updated_at=now()
+		 WHERE user_id=$1 AND `+quoteColumn+` >= $2::numeric AND `+quoteLocked+` >= $2::numeric`,
+		buyerID, buyerQuoteRaw, baseQtyRaw)
 	if err != nil {
 		return err
 	}
 	if buyerTag.RowsAffected() != 1 {
 		return fmt.Errorf("insufficient locked %s for buyer", quoteName)
 	}
-	sellerTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`-$2::numeric, `+baseLocked+`=`+baseLocked+`-$2::numeric, updated_at=now() WHERE user_id=$1 AND `+baseColumn+` >= $2::numeric AND `+baseLocked+` >= $2::numeric`, sellerID, baseQtyRaw)
+	sellerTag, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`-$2::numeric, `+baseLocked+`=`+baseLocked+`-$2::numeric, `+quoteColumn+`=`+quoteColumn+`+$3::numeric, updated_at=now()
+		 WHERE user_id=$1 AND `+baseColumn+` >= $2::numeric AND `+baseLocked+` >= $2::numeric`,
+		sellerID, baseQtyRaw, sellerQuoteRaw)
 	if err != nil {
 		return err
 	}
 	if sellerTag.RowsAffected() != 1 {
 		return fmt.Errorf("insufficient locked %s for seller", baseName)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`+$2::numeric, updated_at=now() WHERE user_id=$1`, buyerID, baseQtyRaw); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`+$2::numeric, updated_at=now() WHERE user_id=$1`, sellerID, sellerQuoteRaw); err != nil {
-		return err
 	}
 	return tx.Commit(ctx)
 }
