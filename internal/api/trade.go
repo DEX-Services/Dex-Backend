@@ -304,9 +304,37 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if !ok {
 		return nil
 	}
-	bals, err := s.Ledger.BalancesFor(ctx, accountID)
-	if err != nil {
-		return fmt.Errorf("load balance: %w", err)
+	// The three reads below (Postgres balances, Postgres locked balances,
+	// engine's mirror balance) are independent of each other — none needs
+	// another's result, they're only compared once all three are in. Firing
+	// them concurrently instead of one-after-another turns 3 sequential
+	// network/DB round trips (~4-6s each against the live Aiven Postgres
+	// instance and the engine, per engineclient.New's doc comment) into the
+	// cost of whichever one is slowest, since every order pays this before
+	// even reaching the engine's own lock/settle round trips. The
+	// comparison/safety-cap logic after this point is untouched.
+	var (
+		bals, lockedBals              map[string]string
+		engineBal                     engineclient.BalanceResponse
+		balsErr, lockedErr, engineErr error
+	)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		bals, balsErr = s.Ledger.BalancesFor(ctx, accountID)
+	}()
+	go func() {
+		defer wg.Done()
+		lockedBals, lockedErr = s.Ledger.LockedBalancesFor(ctx, accountID)
+	}()
+	go func() {
+		defer wg.Done()
+		engineBal, engineErr = s.Engine.Balance(ctx, accountID, asset)
+	}()
+	wg.Wait()
+	if balsErr != nil {
+		return fmt.Errorf("load balance: %w", balsErr)
 	}
 	raw, ok := bals[strings.ToUpper(asset)]
 	if !ok {
@@ -333,9 +361,8 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	// against a fresh account. The account's real Postgres lock was
 	// untouched, so the next trade against that resting order failed
 	// "insufficient locked ..." and halted the whole symbol.
-	lockedBals, err := s.Ledger.LockedBalancesFor(ctx, accountID)
-	if err != nil {
-		return fmt.Errorf("load locked balance: %w", err)
+	if lockedErr != nil {
+		return fmt.Errorf("load locked balance: %w", lockedErr)
 	}
 	lockedRaw := lockedBals[strings.ToUpper(asset)]
 	dbTotalStr, err := rawToHumanUnits(raw)
@@ -355,9 +382,8 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 		return fmt.Errorf("invalid locked balance amount %s", dbLockedStr)
 	}
 	dbAmount.Sub(dbAmount, dbLocked)
-	engineBal, err := s.Engine.Balance(ctx, accountID, asset)
-	if err != nil {
-		return fmt.Errorf("check engine balance: %w", err)
+	if engineErr != nil {
+		return fmt.Errorf("check engine balance: %w", engineErr)
 	}
 
 	// Never correct drift while the engine has ANY live reservation for this
