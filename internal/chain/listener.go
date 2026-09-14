@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
@@ -121,8 +122,20 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 		return err
 	}
 
+	// event.Amount is the raw on-chain amount (6-decimal scale, same as this
+	// platform's Postgres raw-unit convention — see InsertDeposit above,
+	// which correctly stores it as-is). EngineClient.Credit expects a
+	// HUMAN-decimal amount, not raw — passing event.Amount.String() directly
+	// here inflated every deposit's engine-side balance by 1,000,000× (a
+	// real "31.00004 tokens" deposit became "31,000,040" in the engine's
+	// in-memory ledger while Postgres correctly showed the real amount).
+	// See engineclient.RawToHumanUnits' doc comment for the full incident.
+	humanAmount, err := engineclient.RawToHumanUnits(event.Amount.String())
+	if err != nil {
+		return fmt.Errorf("convert deposit amount for engine credit: %w", err)
+	}
 	engineclient.Async("credit", func(ctx context.Context) error {
-		return l.EngineClient.Credit(ctx, user.ID, creditTokenLabel, event.Amount.String())
+		return l.EngineClient.Credit(ctx, user.ID, creditTokenLabel, humanAmount)
 	})
 	return nil
 }

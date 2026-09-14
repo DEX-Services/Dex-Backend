@@ -11,10 +11,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
+
+// RawUnitScale is this platform's fixed-point scale: every asset column in
+// user_balances is a raw integer (amount × 10^RawUnitScale). Credit/Debit
+// below expect HUMAN-decimal amounts (matching the engine's own risk.Ledger,
+// which is entirely human-unit) — never pass a raw integer straight through,
+// see RawToHumanUnits' doc comment for the exact incident this constant and
+// helper were extracted to prevent a second occurrence of.
+const RawUnitScale = 6
+
+// RawToHumanUnits converts a raw balance string (as stored in Postgres —
+// see RawUnitScale) to the human-decimal string Credit/Debit expect.
+//
+// Added 2026-09-14 after a live incident: internal/chain/listener.go's
+// handleDeposit passed a real on-chain deposit's raw amount (e.g.
+// "31000040", i.e. 31.00004 tokens at 6-decimal scale) directly to
+// EngineClient.Credit with NO conversion, while correctly converting it for
+// Postgres via Ledger.InsertDeposit. The engine's in-memory ledger ended up
+// believing the account held 31,000,040 BI2XUSD — 1,000,000× the real
+// amount — while Postgres correctly showed the real, much smaller figure.
+// This exact class of bug had already been found and fixed once before, in
+// runBackfill's own raw→human conversion (see that function's comment:
+// "Passing the raw integer through here inflated every restored balance by
+// one million after a restart") — but the fix was local to that one call
+// site rather than extracted, so the chain listener's separate, equally
+// wrong call site was never caught. This helper exists so there is exactly
+// one conversion implementation for every Credit/Debit call site to share.
+func RawToHumanUnits(raw string) (string, error) {
+	n, ok := new(big.Int).SetString(raw, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid raw token amount %q", raw)
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(RawUnitScale), nil)
+	r := new(big.Rat).SetFrac(n, scale)
+	return strings.TrimRight(strings.TrimRight(r.FloatString(RawUnitScale), "0"), "."), nil
+}
 
 // Client calls matching-engine's internal ledger-sync endpoint. A nil/zero-
 // value Client (created when MATCHING_ENGINE_URL or ENGINE_SHARED_SECRET is
