@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -203,4 +204,33 @@ func (s *StakingServer) Positions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"positions": positions})
+}
+
+// History handles GET /staking/history: the caller's staking event log
+// (every stake and redeem action, each carrying the interest paid on that
+// specific redemption) — this is what the frontend's redemption history
+// table needs to show interest alongside principal, since a position's own
+// current principal_raw doesn't retain what was paid out on past
+// redemptions from it.
+func (s *StakingServer) History(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	events, err := s.Staking.Events(r.Context(), accountID, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load staking history")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }

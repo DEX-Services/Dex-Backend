@@ -218,3 +218,63 @@ func TestStake_RejectsInsufficientBalance(t *testing.T) {
 		t.Fatal("expected stake to reject an amount exceeding the account's balance")
 	}
 }
+
+// TestEvents_RecordsInterestPaidPerRedemption is a regression test for the
+// staking history feature: Events must return a 'redeem' entry carrying the
+// exact interest actually paid on that specific redemption, distinct from
+// the 'stake' entry that opened the position (which always carries 0
+// interest — see AddHistoryEntry/Stake).
+func TestEvents_RecordsInterestPaidPerRedemption(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	staking := NewStakingRepo(pool, ledger)
+	userID := newTestUser(t, pool)
+	ctx := context.Background()
+
+	if err := ledger.CreditBalance(ctx, userID, "BI2X", "1000000000"); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+	pos, err := staking.Stake(ctx, userID, "1000000000")
+	if err != nil {
+		t.Fatalf("stake: %v", err)
+	}
+	result, err := staking.Redeem(ctx, userID, pos.ID, "1000000000")
+	if err != nil {
+		t.Fatalf("redeem: %v", err)
+	}
+
+	events, err := staking.Events(ctx, userID, 10)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	var sawStake, sawRedeem bool
+	for _, e := range events {
+		if e.PositionID != pos.ID {
+			continue
+		}
+		switch e.Kind {
+		case "stake":
+			sawStake = true
+			if e.InterestRaw != "0" {
+				t.Fatalf("stake event interest = %s, want 0", e.InterestRaw)
+			}
+			if e.PrincipalRaw != "1000000000" {
+				t.Fatalf("stake event principal = %s, want 1000000000", e.PrincipalRaw)
+			}
+		case "redeem":
+			sawRedeem = true
+			if e.InterestRaw != result.InterestRaw {
+				t.Fatalf("redeem event interest = %s, want %s (matching Redeem's own return value)", e.InterestRaw, result.InterestRaw)
+			}
+			if e.PrincipalRaw != result.PrincipalRaw {
+				t.Fatalf("redeem event principal = %s, want %s", e.PrincipalRaw, result.PrincipalRaw)
+			}
+		}
+	}
+	if !sawStake {
+		t.Fatal("expected a 'stake' event for this position")
+	}
+	if !sawRedeem {
+		t.Fatal("expected a 'redeem' event for this position")
+	}
+}

@@ -225,6 +225,7 @@ func main() {
 	mux.HandleFunc("/staking/stake", stakingSrv.Stake)
 	mux.HandleFunc("/staking/redeem", stakingSrv.Redeem)
 	mux.HandleFunc("/staking/positions", stakingSrv.Positions)
+	mux.HandleFunc("/staking/history", stakingSrv.History)
 	mux.HandleFunc("/fees/tiers", feeSrv.Tiers)
 	mux.HandleFunc("/fees/my-subscription", feeSrv.MySubscription)
 	mux.HandleFunc("/fees/subscribe", feeSrv.Subscribe)

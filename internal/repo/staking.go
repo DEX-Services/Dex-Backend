@@ -75,6 +75,33 @@ func (r *StakingRepo) Positions(ctx context.Context, userID string) ([]models.St
 	return out, rows.Err()
 }
 
+// Events returns userID's staking history (every stake and redeem action),
+// most recent first, capped at limit — this is what actually shows the
+// interest paid on each redemption, since a position's own current
+// principal_raw doesn't retain that (Redeem already computes it, but only
+// staking_events keeps a permanent per-action record of it).
+func (r *StakingRepo) Events(ctx context.Context, userID string, limit int) ([]models.StakingEvent, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, position_id, kind, principal_raw::text, interest_raw::text, created_at
+		FROM staking_events
+		WHERE user_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.StakingEvent
+	for rows.Next() {
+		var e models.StakingEvent
+		if err := rows.Scan(&e.ID, &e.PositionID, &e.Kind, &e.PrincipalRaw, &e.InterestRaw, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // Stake debits amountRaw of BI2X from userID's wallet balance and opens a
 // new staking position for it, in one transaction — mirrors
 // LedgerRepo.SwapBalance's shape (debit then insert, single tx, single
