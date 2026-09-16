@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/models"
@@ -68,6 +69,7 @@ type AdminServer struct {
 	Users         *repo.UserRepo
 	Ledger        *repo.LedgerRepo
 	P2P           *repo.P2PRepo
+	Allocation    *repo.BI2XAllocationRepo
 	EngineClient  *engineclient.Client
 	AdminLoginID  string
 	AdminPassword string
@@ -530,6 +532,113 @@ func (s *AdminServer) ResumeSymbol(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Log.Info("admin resumed halted symbol", "symbol", req.Symbol, "market", req.Market)
 	writeJSON(w, http.StatusOK, map[string]any{"symbol": req.Symbol, "market": req.Market, "status": "resumed"})
+}
+
+// bi2xAllocationCategories are the only valid values for a history entry's
+// category — matching exactly the rows seeded by db.ensureBI2XAllocationTables.
+// Validated here (not just left to the DB's foreign key) so an unknown
+// category comes back as a clear 400 instead of a raw constraint-violation
+// error string.
+var bi2xAllocationCategories = map[string]bool{
+	"Initial Burn":      true,
+	"Team Reserve":      true,
+	"Community":         true,
+	"Airdrop":           true,
+	"Marketing":         true,
+	"Treasury Reserve":  true,
+	"Initial Liquidity": true,
+	"Staking Reward":    true,
+}
+
+// BI2XAllocationTotals serves GET /admin/bi2x-allocation: every category's
+// current remaining quantity.
+func (s *AdminServer) BI2XAllocationTotals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	totals, err := s.Allocation.CurrentTotals(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load BI2X allocation totals")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"totals": totals})
+}
+
+type bi2xAllocationHistoryRequest struct {
+	Category string `json:"category"`
+	Amount   string `json:"amount"`
+	Date     string `json:"date,omitempty"` // RFC3339; defaults to now if omitted
+	Note     string `json:"note,omitempty"`
+}
+
+// BI2XAllocationHistory serves GET (list) and POST (record a new
+// burn/distribution) on /admin/bi2x-allocation/history, mirroring
+// P2PAppeals' GET/POST-in-one-handler shape. A successful POST also
+// decrements the category's current remaining quantity (see
+// repo.BI2XAllocationRepo.AddHistoryEntry) and returns the refreshed totals
+// alongside the new entry, so the frontend doesn't need a second round trip.
+func (s *AdminServer) BI2XAllocationHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method == http.MethodGet {
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		history, err := s.Allocation.History(r.Context(), limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not load BI2X allocation history")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"history": history})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req bi2xAllocationHistoryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Category = strings.TrimSpace(req.Category)
+	if !bi2xAllocationCategories[req.Category] {
+		writeError(w, http.StatusBadRequest, "unknown category")
+		return
+	}
+	amount, ok := new(big.Int).SetString(strings.TrimSpace(req.Amount), 10)
+	if !ok || amount.Sign() <= 0 {
+		writeError(w, http.StatusBadRequest, "amount must be a positive whole number of BI2X")
+		return
+	}
+	eventDate := time.Now()
+	if strings.TrimSpace(req.Date) != "" {
+		parsed, err := time.Parse(time.RFC3339, req.Date)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "date must be RFC3339")
+			return
+		}
+		eventDate = parsed
+	}
+	entry, err := s.Allocation.AddHistoryEntry(r.Context(), req.Category, amount.String(), req.Note, adminLoginID, eventDate)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	totals, err := s.Allocation.CurrentTotals(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load refreshed BI2X allocation totals")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entry": entry, "totals": totals})
 }
 
 func (s *AdminServer) requireAdmin(w http.ResponseWriter, r *http.Request) bool {

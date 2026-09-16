@@ -50,6 +50,7 @@ func main() {
 	ledgerRepo := repo.NewLedgerRepo(pool)
 	adminRepo := repo.NewAdminRepo(pool)
 	p2pRepo := repo.NewP2PRepo(pool)
+	allocationRepo := repo.NewBI2XAllocationRepo(pool)
 	feesClient := feeconfig.New(pool)
 	feeTierRepo := repo.NewFeeTierRepo(ledgerRepo, feesClient)
 	referralRepo := repo.NewReferralRepo(pool, ledgerRepo)
@@ -98,6 +99,7 @@ func main() {
 		Users:         userRepo,
 		Ledger:        ledgerRepo,
 		P2P:           p2pRepo,
+		Allocation:    allocationRepo,
 		EngineClient:  engineClient,
 		AdminLoginID:  os.Getenv("ADMIN_LOGIN_ID"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
@@ -167,6 +169,8 @@ func main() {
 	mux.HandleFunc("/admin/users/release-locks", adminSrv.ReleaseStuckLocks)
 	mux.HandleFunc("/admin/halted", adminSrv.HaltedSymbols)
 	mux.HandleFunc("/admin/resume", adminSrv.ResumeSymbol)
+	mux.HandleFunc("/admin/bi2x-allocation", adminSrv.BI2XAllocationTotals)
+	mux.HandleFunc("/admin/bi2x-allocation/history", adminSrv.BI2XAllocationHistory)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)

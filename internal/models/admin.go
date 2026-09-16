@@ -58,3 +58,26 @@ type AdminRecentUser struct {
 	CreatedAt     time.Time  `json:"createdAt"`
 	LastLoginAt   *time.Time `json:"lastLoginAt,omitempty"`
 }
+
+// BI2XAllocationBalance is one category's current remaining quantity out of
+// the fixed 500,000,000 BI2X total supply (see db.ensureBI2XAllocationTables
+// for the starting split). RemainingQty is a plain whole-token decimal
+// string (e.g. "368000000"), not a raw on-chain-scaled amount.
+type BI2XAllocationBalance struct {
+	Category     string    `json:"category"`
+	RemainingQty string    `json:"remainingQty"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// BI2XAllocationHistoryEntry is one recorded burn/distribution against a
+// category, which also decremented that category's BI2XAllocationBalance by
+// AmountQty at the time it was recorded.
+type BI2XAllocationHistoryEntry struct {
+	ID        int64     `json:"id"`
+	Category  string    `json:"category"`
+	AmountQty string    `json:"amountQty"`
+	EventDate time.Time `json:"eventDate"`
+	Note      string    `json:"note,omitempty"`
+	CreatedBy string    `json:"createdBy,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}

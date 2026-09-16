@@ -109,6 +109,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"user_balances BIUSDB to BI2XUSD", migrateUserBalancesBI2XUSDColumn},
 		{"referral and affiliate tables", ensureReferralTables},
 		{"platform_treasury_entries category column", ensureTreasuryEntryCategory},
+		{"BI2X allocation tables", ensureBI2XAllocationTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -914,4 +915,58 @@ BEGIN
             ON public.platform_treasury_entries (category, created_at DESC);
     END IF;
 END $add_treasury_entry_category$;
+`
+
+// ensureBI2XAllocationTables creates the schema for the admin-facing BI2X
+// token allocation feature: a running "remaining quantity" per allocation
+// category (Initial Burn, Team Reserve, Community, Airdrop, Marketing,
+// Treasury Reserve, Initial Liquidity, Staking Reward), seeded from the
+// fixed 500,000,000 total supply at the original 6/5/2/3/4/4/2/74 percent
+// split, plus a permanent history log of every burn/distribution recorded
+// against a category (each of which also decrements that category's
+// remaining total — see repo.BI2XAllocationRepo.AddHistoryEntry).
+//
+// Plain whole-token NUMERIC, not the raw-integer-scaled NUMERIC(38,0) used
+// for on-chain-mirrored wallet balances elsewhere (e.g.
+// platform_treasury_balances.available_raw, user_balances) — this table is
+// an admin bookkeeping/display feature over a fixed, already-minted supply,
+// not a real on-chain or ledger balance subject to RawToHumanUnits-style
+// unit conversion, so introducing that scale here would be a false
+// consistency with a system this table isn't actually part of.
+const ensureBI2XAllocationTables = `
+CREATE TABLE IF NOT EXISTS bi2x_allocation_balances (
+    category      TEXT PRIMARY KEY,
+    remaining_qty NUMERIC(20,0) NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 500,000,000 total supply at 6/5/2/3/4/4/2/74 percent -- sums to exactly
+-- 500,000,000. Seeded once; ON CONFLICT DO NOTHING means a later admin
+-- distribution recorded against a category (which decrements this row) is
+-- never overwritten back to its starting value by a subsequent restart.
+INSERT INTO bi2x_allocation_balances (category, remaining_qty) VALUES
+    ('Initial Burn', 30000000),
+    ('Team Reserve', 25000000),
+    ('Community', 10000000),
+    ('Airdrop', 15000000),
+    ('Marketing', 20000000),
+    ('Treasury Reserve', 20000000),
+    ('Initial Liquidity', 10000000),
+    ('Staking Reward', 370000000)
+ON CONFLICT (category) DO NOTHING;
+
+-- Permanent audit trail: every burn/distribution an admin records against a
+-- category, so "why is Staking Reward's remaining total lower than 370M"
+-- always has a real, dated answer instead of just an opaque running number.
+CREATE TABLE IF NOT EXISTS bi2x_allocation_history (
+    id         BIGSERIAL PRIMARY KEY,
+    category   TEXT NOT NULL REFERENCES bi2x_allocation_balances(category),
+    amount_qty NUMERIC(20,0) NOT NULL CHECK (amount_qty > 0),
+    event_date TIMESTAMPTZ NOT NULL DEFAULT now(),
+    note       TEXT,
+    created_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bi2x_allocation_history_category
+    ON bi2x_allocation_history (category, event_date DESC);
 `
