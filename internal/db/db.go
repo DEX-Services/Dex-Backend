@@ -110,6 +110,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"referral and affiliate tables", ensureReferralTables},
 		{"platform_treasury_entries category column", ensureTreasuryEntryCategory},
 		{"BI2X allocation tables", ensureBI2XAllocationTables},
+		{"staking tables", ensureStakingTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -969,4 +970,56 @@ CREATE TABLE IF NOT EXISTS bi2x_allocation_history (
 );
 CREATE INDEX IF NOT EXISTS idx_bi2x_allocation_history_category
     ON bi2x_allocation_history (category, event_date DESC);
+`
+
+// ensureStakingTables creates the schema for BI2X staking: 5% APR simple
+// interest, no lock-up period, BI2X-only. A user's stake is debited straight
+// out of their tradable BI2X wallet balance (see LedgerRepo.StakeBI2X) into
+// a separate staking_positions row — NOT the same "locked" column used by
+// order reservations elsewhere, since staked BI2X is meant to be entirely
+// out of the tradable wallet, not merely held against an open order.
+//
+// Interest is deliberately NOT stored/accrued as a running column: simple
+// interest at a fixed 5% APR is fully determined by principal_raw and
+// started_at alone (interest = principal * 0.05 * hours_elapsed / 8760), so
+// it's computed on demand — by the frontend for live display (see
+// stakingApi.ts), and authoritatively by the backend at redeem time
+// (LedgerRepo.RedeemBI2X) — rather than needing a background job to credit
+// it hourly into a stored column. "Credited every hour" is satisfied by the
+// number being live-recalculated continuously, not by a scheduled write.
+//
+// A partial redemption reduces principal_raw and pays out that portion's
+// accrued interest, but leaves started_at UNCHANGED for the remainder — the
+// remaining principal keeps accruing from its original start time,
+// uninterrupted, per product decision (2026-09-16).
+const ensureStakingTables = `
+CREATE TABLE IF NOT EXISTS staking_positions (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       TEXT NOT NULL REFERENCES users(id),
+    asset         TEXT NOT NULL DEFAULT 'BI2X' CHECK (asset = 'BI2X'),
+    principal_raw NUMERIC(38,0) NOT NULL CHECK (principal_raw > 0),
+    apr_bps       INTEGER NOT NULL DEFAULT 500, -- 500 basis points = 5.00% APR, fixed at stake time so a later admin rate change never rewrites an existing stake's terms
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'redeemed')),
+    closed_at     TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_staking_positions_user
+    ON staking_positions (user_id, status, started_at DESC);
+
+-- Permanent audit trail: every stake and every (partial or full) redemption,
+-- so "why did my staking position's principal change" and "how much
+-- interest have I actually been paid" both have a real, dated record.
+CREATE TABLE IF NOT EXISTS staking_events (
+    id              BIGSERIAL PRIMARY KEY,
+    position_id     UUID NOT NULL REFERENCES staking_positions(id),
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    kind            TEXT NOT NULL CHECK (kind IN ('stake', 'redeem')),
+    principal_raw   NUMERIC(38,0) NOT NULL, -- amount staked, or amount of principal redeemed
+    interest_raw    NUMERIC(38,0) NOT NULL DEFAULT 0, -- 0 for 'stake' events; the interest paid out for 'redeem' events
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_staking_events_user
+    ON staking_events (user_id, created_at DESC);
 `

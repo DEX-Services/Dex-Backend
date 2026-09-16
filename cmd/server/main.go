@@ -111,6 +111,7 @@ func main() {
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
 	referralSrv := &api.ReferralServer{Server: srv, Referrals: referralRepo}
+	stakingSrv := &api.StakingServer{Server: srv, Staking: repo.NewStakingRepo(pool, ledgerRepo)}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -221,6 +222,9 @@ func main() {
 	mux.HandleFunc("/trade/pnl-history", tradeSrv.PnlHistory)
 	mux.HandleFunc("/trade/positions", tradeSrv.Positions)
 	mux.HandleFunc("/trade/balance", tradeSrv.Balance)
+	mux.HandleFunc("/staking/stake", stakingSrv.Stake)
+	mux.HandleFunc("/staking/redeem", stakingSrv.Redeem)
+	mux.HandleFunc("/staking/positions", stakingSrv.Positions)
 	mux.HandleFunc("/fees/tiers", feeSrv.Tiers)
 	mux.HandleFunc("/fees/my-subscription", feeSrv.MySubscription)
 	mux.HandleFunc("/fees/subscribe", feeSrv.Subscribe)
