@@ -111,6 +111,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"platform_treasury_entries category column", ensureTreasuryEntryCategory},
 		{"BI2X allocation tables", ensureBI2XAllocationTables},
 		{"staking tables", ensureStakingTables},
+		{"platform_treasury_entries prediction category", ensureTreasuryEntryPredictionCategory},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1022,4 +1023,38 @@ CREATE TABLE IF NOT EXISTS staking_events (
 );
 CREATE INDEX IF NOT EXISTS idx_staking_events_user
     ON staking_events (user_id, created_at DESC);
+`
+
+// ensureTreasuryEntryPredictionCategory widens platform_treasury_entries'
+// category CHECK constraint (added by ensureTreasuryEntryCategory above,
+// originally 'spot'|'futures'|'liquidation'|'swap') to also accept
+// 'prediction', so the new prediction-service can route its maker/taker fee
+// revenue into this same shared treasury ledger with its own honest
+// category label instead of being silently miscounted as a different
+// market's fee revenue.
+//
+// The original constraint was added inline via ALTER TABLE ... ADD COLUMN
+// ... CHECK (...) with no explicit name, so Postgres auto-generated one.
+// This migration looks that name up from the system catalog rather than
+// guessing/hardcoding it, drops it, and adds the widened one — idempotent
+// and safe to re-run (checks the constraint's current definition first, so
+// it never re-runs the drop+add after the first successful application).
+const ensureTreasuryEntryPredictionCategory = `
+DO $widen_treasury_entry_category$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    SELECT con.conname INTO constraint_name
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    WHERE rel.relname = 'platform_treasury_entries'
+      AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%category%'
+      AND pg_get_constraintdef(con.oid) NOT LIKE '%prediction%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE public.platform_treasury_entries DROP CONSTRAINT %I', constraint_name);
+        ALTER TABLE public.platform_treasury_entries ADD CONSTRAINT platform_treasury_entries_category_check
+            CHECK (category IS NULL OR category IN ('spot', 'futures', 'liquidation', 'swap', 'prediction'));
+    END IF;
+END $widen_treasury_entry_category$;
 `

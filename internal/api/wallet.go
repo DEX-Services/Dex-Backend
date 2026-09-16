@@ -839,8 +839,20 @@ func (s *WalletServer) InternalSettleFee(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// Added 2026-09-16 alongside the prediction-service's fee routing: this
+	// used to silently coerce ANY unrecognized category to "futures" (only
+	// "futures"/"liquidation" ever called this endpoint before), which would
+	// have misattributed prediction-market fee revenue as futures fee
+	// revenue in reporting. "spot" and "swap" are accepted here too for the
+	// same reason, even though those callers currently route fees through
+	// SettleSpot instead — this endpoint's own accepted set should match the
+	// database's CHECK constraint (ensureTreasuryEntryPredictionCategory),
+	// not silently diverge from it.
 	category := req.Category
-	if category != "futures" && category != "liquidation" {
+	switch category {
+	case "futures", "liquidation", "spot", "swap", "prediction":
+		// already a recognized category
+	default:
 		category = "futures"
 	}
 	if s.Referrals != nil && req.Amount != "" && req.Amount != "0" {
