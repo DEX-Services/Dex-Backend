@@ -83,6 +83,16 @@ func (c *Client) SubmitAttachedOrder(ctx context.Context, attached AttachedOrder
 		q.Set("leverage", fmt.Sprintf("%d", *attached.Parent.Leverage))
 	}
 	setOptional(q, "marginMode", attached.Parent.MarginMode)
+	// TakeProfit is always a LIMIT-style leg on the engine (parseLegSpec's
+	// "tp" group only ever reads its Price field into the group's
+	// LimitPrice — see attached_order.go — never a StopPrice), while
+	// StopLoss is always STOP-style (only its StopPrice is read). The
+	// frontend previously sent the TP leg with only a stopPrice set and no
+	// price, which correctly maps to nothing here: tpPrice stayed empty, so
+	// the engine's parseLegSpec(q, "tp") found no populated field and
+	// silently treated the TP leg as absent. The actual fix is at the
+	// frontend call site (TradePanel.tsx), which must submit the take-profit
+	// leg's target as Price, not StopPrice.
 	if attached.TakeProfit != nil {
 		setOptional(q, "tpPrice", attached.TakeProfit.Price)
 	}

@@ -269,9 +269,14 @@ func main() {
 		port = "8081"
 	}
 
+	// Rate limiting, innermost so it sees the real client IP (via srv's
+	// trusted-proxy-aware clientIP) before CORS/logging wrap the request.
+	// Without this, /auth/nonce could be flooded to exhaust the shared nonce
+	// cache and /admin/login was brute-forceable with no backoff.
+	limiter := api.NewRateLimiter(srv.ClientIP)
 	httpSrv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      api.CORS(origin, mux),
+		Handler:      api.CORS(origin, limiter.Middleware(mux)),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,

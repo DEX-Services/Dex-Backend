@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -101,7 +102,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	if err := s.Users.TouchLogin(ctx, user.ID); err != nil {
 		s.Log.Warn("touch login failed", "err", err)
 	}
-	if _, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, s.clientIP(r), r.UserAgent()); err != nil {
+	if _, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, s.ClientIP(r), r.UserAgent()); err != nil {
 		s.Log.Warn("create session failed", "err", err)
 	}
 
@@ -180,17 +181,24 @@ func (s *Server) authenticate(r *http.Request) (*auth.Claims, bool) {
 	return claims, true
 }
 
-func (s *Server) clientIP(r *http.Request) string {
+// ClientIP resolves the caller's real IP, honoring X-Forwarded-For only when
+// the immediate peer is the configured trusted proxy. Previously compared
+// with strings.HasPrefix(r.RemoteAddr, s.TrustedProxy) — RemoteAddr includes
+// the port ("10.0.0.1:54321"), so TRUSTED_PROXY=10.0.0.1 also matched
+// 10.0.0.100:port, 10.0.0.12:port, etc., letting any host on a /24-ish range
+// spoof its origin IP via X-Forwarded-For. Now splits the host out first and
+// compares it exactly.
+func (s *Server) ClientIP(r *http.Request) string {
 	if s.TrustedProxy != "" {
-		if r.RemoteAddr == s.TrustedProxy || strings.HasPrefix(r.RemoteAddr, s.TrustedProxy) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr // RemoteAddr had no port (e.g. a unix socket or test harness)
+		}
+		if host == s.TrustedProxy {
 			if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 				return strings.TrimSpace(strings.Split(fwd, ",")[0])
 			}
 		}
 	}
-	return r.RemoteAddr
-}
-
-func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
