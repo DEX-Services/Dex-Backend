@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/dex/dex-backend/internal/engineclient"
@@ -158,13 +159,21 @@ func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 
 func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		listings, err := s.P2P.Listings(r.Context(), "", true)
+		// P2P-L1: the marketplace previously returned every active listing
+		// in one response, unbounded as ads accumulate. limit/offset are
+		// both optional — an omitted or invalid value falls back to
+		// ListingsPage's own default/clamp, so an old client hitting this
+		// with no query params still works exactly as before, just capped
+		// at one page instead of unbounded.
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		listings, total, err := s.P2P.ListingsPage(r.Context(), "", true, limit, offset)
 		if err != nil {
 			s.Log.Error("list p2p listings failed", "err", err)
 			writeError(w, http.StatusInternalServerError, "could not load listings")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"listings": listings})
+		writeJSON(w, http.StatusOK, map[string]any{"listings": listings, "total": total})
 		return
 	}
 	if !requirePost(w, r) {

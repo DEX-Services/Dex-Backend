@@ -533,6 +533,60 @@ func (r *P2PRepo) Listings(ctx context.Context, sellerID string, activeOnly bool
 	return out, rows.Err()
 }
 
+// p2pListingsMaxLimit caps a single page (P2P-L1): the public marketplace
+// endpoint previously returned every active listing in one unbounded
+// response, growing without limit as ads accumulate.
+const p2pListingsMaxLimit = 100
+
+// ListingsPage is Listings' paginated counterpart, used by the public
+// marketplace endpoint. limit<=0 or limit>p2pListingsMaxLimit is clamped to
+// p2pListingsMaxLimit; offset<0 is clamped to 0. Returns the page alongside
+// the total matching row count, so the frontend can render "page N of M" /
+// disable a "next" control without a second round trip.
+func (r *P2PRepo) ListingsPage(ctx context.Context, sellerID string, activeOnly bool, limit, offset int) ([]models.P2PListing, int, error) {
+	if limit <= 0 || limit > p2pListingsMaxLimit {
+		limit = p2pListingsMaxLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	// Built independently of listingSelect: that query's per-listing stats
+	// (lateral joins for completed-order counts) are irrelevant to a plain
+	// row count and would need to be computed for every row just to be
+	// thrown away.
+	whereClause, args := ` WHERE 1=1`, []any{}
+	if sellerID != "" {
+		args = append(args, sellerID)
+		whereClause += fmt.Sprintf(" AND l.seller_id=$%d", len(args))
+	}
+	if activeOnly {
+		whereClause += ` AND l.status='ACTIVE' AND l.remaining_raw>0 AND u.p2p_username IS NOT NULL`
+	}
+
+	var total int
+	countQuery := `SELECT count(*) FROM p2p_listings l JOIN users u ON u.id=l.seller_id` + whereClause
+	if err := r.pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	pagedQuery := listingSelect + whereClause + fmt.Sprintf(" ORDER BY l.created_at DESC LIMIT $%d OFFSET $%d", len(pageArgs)-1, len(pageArgs))
+	rows, err := r.pool.Query(ctx, pagedQuery, pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []models.P2PListing{}
+	for rows.Next() {
+		l, e := scanListing(rows)
+		if e != nil {
+			return nil, 0, e
+		}
+		out = append(out, *l)
+	}
+	return out, total, rows.Err()
+}
+
 const orderSelect = `SELECT id,listing_id,seller_id,buyer_id,asset,amount_raw::text,escrow_raw::text,price::text,fiat_currency,gross_amount::text,buyer_fee::text,seller_fee::text,buyer_payable::text,seller_receivable::text,buyer_fee_raw::text,seller_fee_raw::text,buyer_credit_raw::text,seller_debit_raw::text,payment_method,payment_account_name,payment_account_identifier,payment_bank_name,payment_ifsc_code,payment_instructions,status,expires_at,payment_marked_at,buyer_own_account_attested,appeal_available_at,COALESCE(appealed_by,''),COALESCE(appeal_reason,''),appealed_at,updated_at,COALESCE(cancellation_reason,''),completed_at,created_at FROM p2p_orders`
 
 func scanOrder(row pgx.Row) (*models.P2POrder, error) {
