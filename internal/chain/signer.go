@@ -129,6 +129,13 @@ func (s *Signer) SubmitWithdrawal(ctx context.Context, userAddress string, amoun
 
 // SubmitWithdrawalApproval keeps the older audit-only path available for deployments
 // whose vault contract has not yet been upgraded with withdrawToken.
+//
+// Removal criteria (Low-3): safe to delete once every deployed DexVault
+// contract has the withdrawToken function this service actually uses
+// (SubmitWithdrawal) — confirm no live deployment still relies on the
+// record-approval-then-manual-execute flow this backs, then delete this
+// function and the recordWithdrawalApproval ABI entry together. As of this
+// writing it has no other caller anywhere in this codebase (grep-verified).
 func (s *Signer) SubmitWithdrawalApproval(ctx context.Context, userAddress string, amountRaw *big.Int) (string, error) {
 	data, err := s.Client.VaultABI.Pack("recordWithdrawalApproval", common.HexToAddress(userAddress), amountRaw)
 	if err != nil {
