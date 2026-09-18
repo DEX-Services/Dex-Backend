@@ -187,6 +187,7 @@ func (s *AdminServer) P2PAppeals(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	s.P2PEvents.PublishOrder(order.ID, order)
 	writeJSON(w, http.StatusOK, map[string]any{"order": order})
 }
 

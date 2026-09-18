@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dex/dex-backend/internal/auth"
+	"github.com/dex/dex-backend/internal/p2psse"
 	"github.com/dex/dex-backend/internal/repo"
 )
 
@@ -24,6 +25,12 @@ type Server struct {
 	Log          *slog.Logger
 	SecureCookie bool
 	TrustedProxy string
+	// P2PEvents pushes order status updates over SSE (P2P-L2), replacing the
+	// frontend's previous poll of GET /p2p/order. Held on the shared Server
+	// so every handler that can change an order's status (P2PServer and
+	// AdminServer both embed *Server) can publish to it without separate
+	// wiring per server type.
+	P2PEvents *p2psse.Hub
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -317,6 +317,7 @@ func (s *P2PServer) orderAction(w http.ResponseWriter, r *http.Request, action f
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	s.P2PEvents.PublishOrder(order.ID, order)
 	writeJSON(w, http.StatusOK, map[string]any{"order": order})
 }
 
@@ -338,6 +339,7 @@ func (s *P2PServer) MarkPaid(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	s.P2PEvents.PublishOrder(order.ID, order)
 	writeJSON(w, http.StatusOK, map[string]any{"order": order})
 }
 
@@ -363,7 +365,34 @@ func (s *P2PServer) CancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	s.P2PEvents.PublishOrder(order.ID, order)
 	writeJSON(w, http.StatusOK, map[string]any{"order": order})
+}
+
+// OrderStream: GET /p2p/order/stream?orderId=... — Server-Sent Events push
+// of order updates (P2P-L2), replacing the frontend's previous 5s poll of
+// OrderDetail. Auth-checks ownership once up front the same way OrderDetail
+// does (s.P2P.Order returns ErrP2POrderNotFound for a non-owner), then hands
+// off to the hub for the life of the connection.
+func (s *P2PServer) OrderStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	orderID := strings.TrimSpace(r.URL.Query().Get("orderId"))
+	if orderID == "" {
+		writeError(w, http.StatusBadRequest, "orderId is required")
+		return
+	}
+	if _, err := s.P2P.Order(r.Context(), userID, orderID); err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	s.P2PEvents.ServeSSE(w, r, orderID)
 }
 
 func (s *P2PServer) OrderDetail(w http.ResponseWriter, r *http.Request) {
@@ -549,6 +578,7 @@ func (s *P2PServer) AppealOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
+	s.P2PEvents.PublishOrder(order.ID, order)
 	writeJSON(w, http.StatusOK, map[string]any{"order": order})
 }
 

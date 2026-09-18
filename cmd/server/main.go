@@ -19,6 +19,7 @@ import (
 	"github.com/dex/dex-backend/internal/db"
 	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/feeconfig"
+	"github.com/dex/dex-backend/internal/p2psse"
 	"github.com/dex/dex-backend/internal/repo"
 	"github.com/joho/godotenv"
 )
@@ -78,6 +79,7 @@ func main() {
 		Log:          slog.Default(),
 		SecureCookie: os.Getenv("COOKIE_SECURE") != "false",
 		TrustedProxy: os.Getenv("TRUSTED_PROXY"),
+		P2PEvents:    p2psse.NewHub(),
 	}
 	go srv.Nonces.Run(ctx)
 
@@ -208,6 +210,7 @@ func main() {
 	mux.HandleFunc("/p2p/orders/create", p2pSrv.Buy)
 	mux.HandleFunc("/p2p/orders", p2pSrv.Orders)
 	mux.HandleFunc("/p2p/order", p2pSrv.OrderDetail)
+	mux.HandleFunc("/p2p/order/stream", p2pSrv.OrderStream)
 	mux.HandleFunc("/p2p/payment-accounts", p2pSrv.PaymentAccounts)
 	mux.HandleFunc("/p2p/order/messages", p2pSrv.OrderMessages)
 	mux.HandleFunc("/p2p/order/proofs", p2pSrv.OrderProofs)
