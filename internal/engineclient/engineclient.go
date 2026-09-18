@@ -16,6 +16,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // RawUnitScale is this platform's fixed-point scale: every asset column in
@@ -137,23 +139,33 @@ type syncReq struct {
 	Asset     string `json:"asset"`
 	Amount    string `json:"amount"`
 	Direction string `json:"direction"`
+	// RequestID lets the engine recognize a retried call as the same
+	// operation instead of double-applying it (M4) — see
+	// matching-engine's /internal/ledger/sync handler. Generated once per
+	// logical Credit/Debit call, not once per HTTP attempt: retries of the
+	// SAME call must reuse the SAME id, or the dedup is pointless.
+	RequestID string `json:"requestId"`
 }
 
-// Credit tells the engine to add amount to accountID's asset balance.
+// Credit tells the engine to add amount to accountID's asset balance. A
+// fresh request ID is generated per call, so calling this directly (outside
+// Async) always dedup-registers as a distinct operation — as intended for a
+// genuinely new credit. For a call that may be retried, see CreditAsync.
 func (c *Client) Credit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "credit")
+	return c.call(ctx, accountID, asset, amount, "credit", uuid.NewString())
 }
 
 // Debit tells the engine to subtract amount from accountID's asset balance.
+// See Credit's doc comment on request IDs and DebitAsync.
 func (c *Client) Debit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "debit")
+	return c.call(ctx, accountID, asset, amount, "debit", uuid.NewString())
 }
 
-func (c *Client) call(ctx context.Context, accountID, asset, amount, direction string) error {
+func (c *Client) call(ctx context.Context, accountID, asset, amount, direction, requestID string) error {
 	if !c.Enabled() {
 		return nil
 	}
-	body, err := json.Marshal(syncReq{AccountID: accountID, Asset: asset, Amount: amount, Direction: direction})
+	body, err := json.Marshal(syncReq{AccountID: accountID, Asset: asset, Amount: amount, Direction: direction, RequestID: requestID})
 	if err != nil {
 		return err
 	}
@@ -192,6 +204,26 @@ const (
 	asyncRetryAttempts = 3
 	asyncRetryDelay    = 2 * time.Second
 )
+
+// CreditAsync/DebitAsync run Credit/Debit via Async, generating ONE request
+// ID up front and reusing it across every retry attempt (M4) — Async's fn
+// closure runs fresh on each attempt, so generating the ID inside it would
+// give every retry a distinct ID and defeat the engine's dedup entirely.
+// This is the routine way to call Credit/Debit from a background/fire-and-
+// forget path; call Credit/Debit directly only when not going through Async.
+func (c *Client) CreditAsync(op, accountID, asset, amount string) {
+	requestID := uuid.NewString()
+	Async(op, func(ctx context.Context) error {
+		return c.call(ctx, accountID, asset, amount, "credit", requestID)
+	})
+}
+
+func (c *Client) DebitAsync(op, accountID, asset, amount string) {
+	requestID := uuid.NewString()
+	Async(op, func(ctx context.Context) error {
+		return c.call(ctx, accountID, asset, amount, "debit", requestID)
+	})
+}
 
 // Async runs fn in a goroutine with a fresh timeout context per attempt,
 // retrying a few times before giving up and only logging. Use so deposit/

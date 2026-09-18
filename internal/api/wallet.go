@@ -177,9 +177,7 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 		return nil, http.StatusInternalServerError, errors.New("withdrawal submitted on-chain but ledger update failed")
 	}
 
-	engineclient.Async("debit", func(ctx context.Context) error {
-		return s.EngineClient.Debit(ctx, confirmed.UserID, confirmed.Token, confirmed.Amount)
-	})
+	s.EngineClient.DebitAsync("debit", confirmed.UserID, confirmed.Token, confirmed.Amount)
 
 	return map[string]string{"id": requestID, "txHash": txHash, "asset": confirmed.Token, "status": "confirmed"}, http.StatusOK, nil
 }

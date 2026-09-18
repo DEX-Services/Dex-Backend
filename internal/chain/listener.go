@@ -134,9 +134,7 @@ func (l *Listener) handleDeposit(ctx context.Context, vLog types.Log) error {
 	if err != nil {
 		return fmt.Errorf("convert deposit amount for engine credit: %w", err)
 	}
-	engineclient.Async("credit", func(ctx context.Context) error {
-		return l.EngineClient.Credit(ctx, user.ID, creditTokenLabel, humanAmount)
-	})
+	l.EngineClient.CreditAsync("credit", user.ID, creditTokenLabel, humanAmount)
 	return nil
 }
 

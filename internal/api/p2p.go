@@ -150,9 +150,7 @@ func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if moved && s.Engine != nil {
-		engineclient.Async("p2p wallet fund debit", func(ctx context.Context) error {
-			return s.Engine.Debit(ctx, userID, asset, req.AmountRaw)
-		})
+		s.Engine.DebitAsync("p2p wallet fund debit", userID, asset, req.AmountRaw)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
 }
