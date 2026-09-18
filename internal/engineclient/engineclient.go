@@ -175,15 +175,43 @@ func (c *Client) call(ctx context.Context, accountID, asset, amount, direction s
 	return nil
 }
 
-// Async runs fn in a goroutine with a fresh timeout context, logging failures
-// instead of propagating them. Use so deposit/withdrawal confirmation never
-// blocks on engine availability.
+// asyncRetryAttempts/asyncRetryDelay match matching-engine's own
+// internal/backendclient.Async (the reverse-direction sync, engine -> this
+// service), which already retries the same class of call. This function
+// previously made exactly one attempt with no retry at all: a single
+// transient failure (a network blip, the engine mid-restart) left the
+// engine's in-memory ledger silently out of sync with Postgres — for a
+// withdrawal debit specifically, that meant Postgres said "confirmed" while
+// the engine still showed the withdrawn funds as spendable, with nothing to
+// notice or correct it. Retrying a few times over several seconds absorbs
+// exactly that kind of one-off blip without turning this into a full
+// durable outbox (a real gap that remains: an outage longer than the retry
+// window still desyncs the two ledgers with no automatic recovery — see
+// M3/M4's other findings).
+const (
+	asyncRetryAttempts = 3
+	asyncRetryDelay    = 2 * time.Second
+)
+
+// Async runs fn in a goroutine with a fresh timeout context per attempt,
+// retrying a few times before giving up and only logging. Use so deposit/
+// withdrawal confirmation never blocks on engine availability, for calls
+// whose failure shouldn't undo work already committed to Postgres.
 func Async(op string, fn func(ctx context.Context) error) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := fn(ctx); err != nil {
-			slog.Error("engineclient async call failed", "op", op, "error", err)
+		var err error
+		for attempt := 0; attempt < asyncRetryAttempts; attempt++ {
+			if attempt > 0 {
+				time.Sleep(asyncRetryDelay)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = fn(ctx)
+			cancel()
+			if err == nil {
+				return
+			}
+			slog.Warn("engineclient async call failed, retrying", "op", op, "attempt", attempt+1, "error", err)
 		}
+		slog.Error("engineclient async call failed after retries", "op", op, "attempts", asyncRetryAttempts, "error", err)
 	}()
 }

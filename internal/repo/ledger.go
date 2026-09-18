@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/dex/dex-backend/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -649,7 +650,17 @@ func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, wallet
 	return id, tx.Commit(ctx)
 }
 
-// MarkWithdrawalProcessing atomically claims a pending withdrawal request for payout.
+// MarkWithdrawalProcessing atomically claims a withdrawal request for
+// payout, from either "pending" (the normal first attempt) or "processing"
+// (a retry — see AdminRecoverWithdrawal and the withdrawal watchdog). Retry
+// was previously impossible: this only accepted "pending", so a request
+// already stuck in "processing" (the exact state /admin/withdraw-recover's
+// "retry" action and the watchdog exist to fix) always failed at this very
+// first step with "withdrawal request is not pending" — the manual recovery
+// endpoint's own documented purpose ("recovers withdrawals stuck in
+// processing") could never actually succeed. A terminal state (confirmed/
+// failed) is still correctly rejected — this only widens which non-terminal
+// state counts as claimable.
 func (r *LedgerRepo) MarkWithdrawalProcessing(ctx context.Context, requestID string) (*models.LedgerEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -661,12 +672,12 @@ func (r *LedgerRepo) MarkWithdrawalProcessing(ctx context.Context, requestID str
 	err = tx.QueryRow(ctx,
 		`UPDATE ledger_entries
 		 SET status = $2
-		 WHERE id = $1 AND kind = $3 AND status = $4
+		 WHERE id = $1 AND kind = $3 AND status IN ($4, $2)
 		 RETURNING id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at`,
 		requestID, models.LedgerStatusProcessing, models.LedgerKindWithdrawalRequest, models.LedgerStatusPending,
 	).Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt)
 	if err == pgx.ErrNoRows {
-		return nil, fmt.Errorf("withdrawal request is not pending")
+		return nil, fmt.Errorf("withdrawal request is not pending or processing")
 	}
 	if err != nil {
 		return nil, err
@@ -675,6 +686,36 @@ func (r *LedgerRepo) MarkWithdrawalProcessing(ctx context.Context, requestID str
 		return nil, err
 	}
 	return &e, tx.Commit(ctx)
+}
+
+// StuckProcessingWithdrawals returns withdrawal_request rows that have sat in
+// "processing" since before olderThan — candidates for the watchdog to
+// retry. A normal withdrawal completes in seconds (submit + wait-for-receipt
+// + a couple of fast DB writes), so a row still processing minutes later
+// means the server crashed or restarted mid-flight, or a downstream call
+// (the chain RPC, the engine ledger sync) hung — exactly the gap that used
+// to require an admin to notice and call /admin/withdraw-recover by hand.
+func (r *LedgerRepo) StuckProcessingWithdrawals(ctx context.Context, olderThan time.Time) ([]models.LedgerEntry, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, user_id, wallet_address, kind, token, amount::text, tx_hash, status, created_at
+		 FROM ledger_entries
+		 WHERE kind = $1 AND status = $2 AND created_at < $3
+		 ORDER BY created_at ASC`,
+		models.LedgerKindWithdrawalRequest, models.LedgerStatusProcessing, olderThan,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.LedgerEntry
+	for rows.Next() {
+		var e models.LedgerEntry
+		if err := rows.Scan(&e.ID, &e.UserID, &e.WalletAddress, &e.Kind, &e.Token, &e.Amount, &e.TxHash, &e.Status, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // MarkWithdrawalConfirmed stores the successful payout hash on the original request row

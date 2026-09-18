@@ -147,6 +147,12 @@ func main() {
 				os.Exit(1)
 			}
 			walletSrv.Signer = signer
+			// H3: a withdrawal previously could get stuck in "processing"
+			// forever (server crash/restart mid-flight, a hung chain RPC or
+			// engine-sync call) with no automatic recovery — only a human
+			// noticing and calling /admin/withdraw-recover by hand. This
+			// watchdog finds and retries those automatically.
+			go walletSrv.RunWithdrawalWatchdog(ctx, 2*time.Minute)
 		} else {
 			slog.Warn("TREASURY_PRIVATE_KEY not set, /admin/withdraw-approve disabled")
 		}

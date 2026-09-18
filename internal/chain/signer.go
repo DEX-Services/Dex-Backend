@@ -51,24 +51,40 @@ func (s *Signer) submitTx(ctx context.Context, to common.Address, data []byte) (
 		return "", err
 	}
 
-	gasPrice, err := s.Client.ETH.SuggestGasPrice(ctx)
-	if err != nil {
-		return "", err
-	}
-
 	msg := ethereum.CallMsg{From: s.Address, To: &to, Data: data}
 	gasLimit, err := s.Client.ETH.EstimateGas(ctx, msg)
 	if err != nil {
 		return "", err
 	}
 
-	tx := types.NewTx(&types.LegacyTx{
-		Nonce:    nonce,
-		To:       &to,
-		Value:    big.NewInt(0),
-		Gas:      gasLimit,
-		GasPrice: gasPrice,
-		Data:     data,
+	// DynamicFeeTx (EIP-1559) instead of LegacyTx: a fixed GasPrice from
+	// SuggestGasPrice either overpays during calm conditions (that estimate
+	// already bakes in a safety margin against being underpriced) or
+	// underpays and gets stuck during a spike, with no way to bump a
+	// LegacyTx's price after sending. GasFeeCap/GasTipCap let the network
+	// charge only what's actually needed up to the cap, and — for the
+	// nonce-replacement path below — resubmitting the SAME nonce with a
+	// higher tip is the standard, wallet-compatible way to unstick a pending
+	// tx, which a LegacyTx's single GasPrice field can't express as cleanly.
+	tipCap, err := s.Client.ETH.SuggestGasTipCap(ctx)
+	if err != nil {
+		return "", err
+	}
+	head, err := s.Client.ETH.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	feeCap := feeCapFor(head.BaseFee, tipCap)
+
+	tx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   s.ChainID,
+		Nonce:     nonce,
+		To:        &to,
+		Value:     big.NewInt(0),
+		Gas:       gasLimit,
+		GasTipCap: tipCap,
+		GasFeeCap: feeCap,
+		Data:      data,
 	})
 
 	signedTx, err := s.Auth.Signer(s.Auth.From, tx)
@@ -89,6 +105,16 @@ func (s *Signer) submitTx(ctx context.Context, to common.Address, data []byte) (
 		return txHash, fmt.Errorf("%w: %s", ErrTxReverted, txHash)
 	}
 	return txHash, nil
+}
+
+// feeCapFor computes GasFeeCap = 2*baseFee + tipCap, the standard headroom
+// formula (matches what go-ethereum's own transaction-pool helpers and most
+// wallets use): base fee can at most 1.125x per block, so doubling it covers
+// several blocks of increase before this tx would ever be underpriced,
+// while the network still only ever actually charges baseFee+tip, not the
+// cap itself.
+func feeCapFor(baseFee, tipCap *big.Int) *big.Int {
+	return new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(2)), tipCap)
 }
 
 // SubmitWithdrawal transfers USDC from the treasury signer wallet to the user

@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dex/dex-backend/internal/chain"
 	"github.com/dex/dex-backend/internal/engineclient"
@@ -18,6 +19,13 @@ import (
 )
 
 const usdcToken = "USDC"
+
+// withdrawalTxTimeout bounds the on-chain submit+confirm wait when it's
+// deliberately run on a background context (see processWithdrawalRequest) —
+// generous enough for real confirmation delays under network congestion,
+// but still finite so a genuinely stuck chain doesn't leak the goroutine
+// forever.
+const withdrawalTxTimeout = 2 * time.Minute
 
 // WalletServer extends Server with deposit-ledger and withdrawal-approval endpoints. It is a
 // separate type from Server so the base auth service keeps compiling standalone if chain wiring
@@ -140,7 +148,18 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 		return nil, http.StatusInternalServerError, errors.New("invalid withdrawal amount")
 	}
 
-	txHash, err := s.Signer.SubmitWithdrawal(ctx, entry.WalletAddress, amount)
+	// Deliberately NOT ctx (the HTTP request's context): SubmitWithdrawal's
+	// on-chain wait (bind.WaitMined inside submitTx) previously ran on the
+	// request's own context, so a client disconnecting mid-request — closing
+	// their browser tab, a mobile network drop — canceled the wait for a
+	// transaction that had ALREADY been broadcast to the chain. The withdrawal
+	// then sat stuck in "processing" with no automatic recovery, fixable only
+	// by an admin manually running /admin/withdraw-recover. A background
+	// context with its own generous bound survives the request regardless of
+	// what the client does.
+	txCtx, cancel := context.WithTimeout(context.Background(), withdrawalTxTimeout)
+	defer cancel()
+	txHash, err := s.Signer.SubmitWithdrawal(txCtx, entry.WalletAddress, amount)
 	if err != nil {
 		if txHash == "" || errors.Is(err, chain.ErrTxReverted) {
 			_ = s.Ledger.MarkWithdrawalFailed(ctx, requestID)
@@ -350,6 +369,51 @@ func (s *WalletServer) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, status, response)
+}
+
+// stuckWithdrawalAge is how long a withdrawal may sit in "processing" before
+// the watchdog treats it as stuck rather than merely in flight. A normal
+// withdrawal completes in well under a minute (chain confirmation is the
+// slowest step, still seconds on Fuji); several minutes past that means the
+// server crashed or restarted mid-flight, or a downstream call hung — the
+// exact gap that used to require an admin to notice and call
+// /admin/withdraw-recover by hand.
+const stuckWithdrawalAge = 10 * time.Minute
+
+// RunWithdrawalWatchdog polls for withdrawals stuck in "processing" and
+// retries them automatically via the same path AdminRecoverWithdrawal's
+// action=retry already uses, so a stuck withdrawal self-heals instead of
+// silently waiting for a human to run the manual recovery endpoint. Call in
+// its own goroutine; blocks until ctx is done. Safe to run even if s.Signer
+// is nil (retry will fail fast per-item and get picked up again next tick,
+// same failure mode as any other Signer-unavailable path in this file).
+func (s *WalletServer) RunWithdrawalWatchdog(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.recoverStuckWithdrawals(ctx)
+		}
+	}
+}
+
+func (s *WalletServer) recoverStuckWithdrawals(ctx context.Context) {
+	stuck, err := s.Ledger.StuckProcessingWithdrawals(ctx, time.Now().Add(-stuckWithdrawalAge))
+	if err != nil {
+		s.Log.Error("withdrawal watchdog: list stuck withdrawals failed", "err", err)
+		return
+	}
+	for _, entry := range stuck {
+		s.Log.Warn("withdrawal watchdog: retrying withdrawal stuck in processing",
+			"requestId", entry.ID, "userId", entry.UserID, "age", time.Since(entry.CreatedAt))
+		if _, _, err := s.processWithdrawalRequest(ctx, entry.ID); err != nil {
+			s.Log.Error("withdrawal watchdog: retry failed, will retry again next tick",
+				"requestId", entry.ID, "err", err)
+		}
+	}
 }
 
 // AdminRecoverWithdrawal: POST /admin/withdraw-recover {requestId, action}
