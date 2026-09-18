@@ -23,9 +23,12 @@ const (
 	P2PStatusCancelled      = "cancelled"
 	P2PStatusAppeal         = "appeal"
 	p2pFundingWallet        = "P2P_WALLET"
-	p2pFundingLegacyMain    = "MAIN_WALLET_LEGACY"
-	p2pFeeModelLegacy       = "LEGACY_FIAT"
-	p2pFeeModelBI2XUSD      = "BI2XUSD_1PCT_EACH"
+	// P2P-M4: MAIN_WALLET_LEGACY/LEGACY_FIAT (the pre-P2P-wallet funding
+	// source and its matching fee model) were removed after confirming no
+	// listing, live or historical, still used them — every listing has
+	// always been created with p2pFundingWallet/p2pFeeModelBI2XUSD since
+	// before this repo's earliest commit.
+	p2pFeeModelBI2XUSD = "BI2XUSD_1PCT_EACH"
 )
 
 var (
@@ -645,7 +648,6 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 			return nil, err
 		}
 	}
-	legacyDebit := false
 	if side == "BUY" {
 		if err = r.lockWallet(ctx, tx, sellerID, asset); err != nil {
 			return nil, err
@@ -668,24 +670,10 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 		if tag.RowsAffected() != 1 {
 			return nil, fmt.Errorf("seller P2P %s is not reserved for this listing", asset)
 		}
-	} else if source == p2pFundingLegacyMain {
-		if err = r.ledger.lockBalance(ctx, tx, sellerID); err != nil {
-			return nil, err
-		}
-		_, column, columnErr := normalizeAsset(asset)
-		if columnErr != nil {
-			return nil, columnErr
-		}
-		lockedColumn := lockedColumns[asset]
-		tag, e := tx.Exec(ctx, `UPDATE user_balances SET `+column+`=`+column+`-$2::numeric,`+lockedColumn+`=`+lockedColumn+`-$2::numeric,updated_at=now() WHERE user_id=$1 AND `+column+`>=$2::numeric AND `+lockedColumn+`>=$2::numeric`, sellerID, amountRaw)
-		if e != nil {
-			return nil, e
-		}
-		if tag.RowsAffected() != 1 {
-			return nil, fmt.Errorf("seller %s is not reserved for this legacy listing", asset)
-		}
-		legacyDebit = true
 	} else {
+		// P2P-M4: the MAIN_WALLET_LEGACY branch was removed here after
+		// confirming no listing still uses that pre-P2P-wallet funding
+		// source (see CancelListing's matching removal for the same reason).
 		return nil, fmt.Errorf("unsupported P2P listing funding source")
 	}
 
@@ -696,11 +684,7 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	if err != nil {
 		return nil, err
 	}
-	kind := "p2p_to_order"
-	if legacyDebit {
-		kind = "legacy_main_to_order"
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,listing_id,order_id,kind,asset,amount_raw) VALUES($1,$2,$3,$4,$5,$6)`, sellerID, listingID, order.ID, kind, asset, sellerDebitRaw); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,listing_id,order_id,kind,asset,amount_raw) VALUES($1,$2,$3,'p2p_to_order',$4,$5)`, sellerID, listingID, order.ID, asset, sellerDebitRaw); err != nil {
 		return nil, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO p2p_order_events(order_id,actor_id,kind,metadata) VALUES($1,$2,'order_created',jsonb_build_object('paymentMethod',$3::text))`, order.ID, takerID, selectedMethod); err != nil {
@@ -712,7 +696,6 @@ func (r *P2PRepo) CreateOrderWithPayment(ctx context.Context, takerID, listingID
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	order.LegacyMainDebit = legacyDebit
 	return order, nil
 }
 
@@ -1084,21 +1067,13 @@ func (r *P2PRepo) CancelListing(ctx context.Context, sellerID, listingID string)
 			}
 		}
 	} else {
-		if err = r.ledger.lockBalance(ctx, tx, sellerID); err != nil {
-			return err
-		}
-		_, _, columnErr := normalizeAsset(asset)
-		if columnErr != nil {
-			return columnErr
-		}
-		lockedColumn := lockedColumns[asset]
-		tag, e := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+`=`+lockedColumn+`-$2::numeric,updated_at=now() WHERE user_id=$1 AND `+lockedColumn+`>=$2::numeric`, sellerID, remaining)
-		if e != nil {
-			return e
-		}
-		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("seller legacy %s reservation is inconsistent", asset)
-		}
+		// P2P-M4: this was the MAIN_WALLET_LEGACY funding-source branch,
+		// removed after confirming no listing (live or historical) still
+		// uses that pre-P2P-wallet funding source — every listing has been
+		// created with p2pFundingWallet since CreateListing stopped ever
+		// writing MAIN_WALLET_LEGACY. An unrecognized funding_source here
+		// now means data corruption, not a legitimate legacy case.
+		return fmt.Errorf("unrecognized P2P listing funding source %q", source)
 	}
 	if _, err = tx.Exec(ctx, `UPDATE p2p_listings SET status='CANCELLED',updated_at=now() WHERE id=$1`, listingID); err != nil {
 		return err

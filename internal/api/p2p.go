@@ -226,11 +226,6 @@ func (s *P2PServer) Buy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p2pErrorStatus(err), err.Error())
 		return
 	}
-	if order.LegacyMainDebit && s.Engine != nil {
-		engineclient.Async("legacy p2p order debit", func(ctx context.Context) error {
-			return s.Engine.Debit(ctx, order.SellerID, order.Asset, order.AmountRaw)
-		})
-	}
 	writeJSON(w, http.StatusCreated, map[string]any{"order": order})
 }
 

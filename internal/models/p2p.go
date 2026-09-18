@@ -72,11 +72,6 @@ type P2POrder struct {
 	CancellationReason      string     `json:"cancellationReason,omitempty"`
 	CompletedAt             *time.Time `json:"completedAt,omitempty"`
 	CreatedAt               time.Time  `json:"createdAt"`
-
-	// LegacyMainDebit is internal response metadata used only to keep the
-	// matching-engine mirror consistent when an order consumes a pre-P2P-wallet
-	// listing. It is never serialized to clients.
-	LegacyMainDebit bool `json:"-"`
 }
 
 type P2PPaymentAccount struct {
