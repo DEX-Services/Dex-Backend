@@ -499,10 +499,13 @@ func scanListing(row pgx.Row) (*models.P2PListing, error) {
 	return &l, err
 }
 
+// Listings does NOT call ExpirePendingOrders (P2P-M1): this is the public
+// marketplace endpoint, polled by every visitor including logged-out ones —
+// triggering an expiry write on every single read here was hot-path write
+// amplification at scale. Expiry is already handled by main.go's dedicated
+// 30s background ticker; a listing being momentarily stale by at most that
+// interval is a fine tradeoff against turning every page load into a write.
 func (r *P2PRepo) Listings(ctx context.Context, sellerID string, activeOnly bool) ([]models.P2PListing, error) {
-	if err := r.ExpirePendingOrders(ctx, 50); err != nil {
-		return nil, err
-	}
 	query, args := listingSelect+` WHERE 1=1`, []any{}
 	if sellerID != "" {
 		args = append(args, sellerID)

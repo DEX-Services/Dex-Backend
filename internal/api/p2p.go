@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/dex/dex-backend/internal/engineclient"
+	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/models"
 	"github.com/dex/dex-backend/internal/repo"
 )
@@ -19,6 +20,7 @@ type P2PServer struct {
 	*Server
 	P2P    *repo.P2PRepo
 	Engine *engineclient.Client
+	Fees   *feeconfig.Client
 }
 type createListingRequest struct {
 	Asset          string   `json:"asset"`
@@ -260,6 +262,25 @@ func (s *P2PServer) Profile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"profile": profile})
+}
+
+// FeeRates: GET /p2p/fee-rates — returns the caller's own discount-adjusted
+// P2P buyer/seller fee rates (P2P-M2). The frontend previously hardcoded a
+// flat 1% in its fee-math helpers even though the server has genuinely
+// supported per-user discount tiers (feeconfig) for a while — a discounted
+// user saw the wrong number in the UI even though settlement itself always
+// charged the correct, discounted amount.
+func (s *P2PServer) FeeRates(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	buyerRate := s.Fees.EffectiveRate(r.Context(), feeconfig.KeyP2PBuyer, userID)
+	sellerRate := s.Fees.EffectiveRate(r.Context(), feeconfig.KeyP2PSeller, userID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"buyerRate":  buyerRate.String(),
+		"sellerRate": sellerRate.String(),
+	})
 }
 
 func p2pErrorStatus(err error) int {

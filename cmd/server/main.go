@@ -107,7 +107,7 @@ func main() {
 	if adminSrv.AdminLoginID == "" || adminSrv.AdminPassword == "" {
 		slog.Warn("ADMIN_LOGIN_ID/ADMIN_PASSWORD not set, /admin/login disabled (set ADMIN_PASSWORD to a bcrypt hash)")
 	}
-	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo, Engine: engineClient}
+	p2pSrv := &api.P2PServer{Server: srv, P2P: p2pRepo, Engine: engineClient, Fees: feesClient}
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
 	referralSrv := &api.ReferralServer{Server: srv, Referrals: referralRepo}
@@ -200,6 +200,7 @@ func main() {
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)
 	mux.HandleFunc("/p2p/wallet", p2pSrv.Wallet)
 	mux.HandleFunc("/p2p/profile", p2pSrv.Profile)
+	mux.HandleFunc("/p2p/fee-rates", p2pSrv.FeeRates)
 	mux.HandleFunc("/p2p/wallet/fund", p2pSrv.FundWallet)
 	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
@@ -282,7 +283,7 @@ func main() {
 	limiter := api.NewRateLimiter(srv.ClientIP)
 	httpSrv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      api.CORS(origin, limiter.Middleware(mux)),
+		Handler:      api.CORS(origin, limiter.Middleware(api.MaxBodyLimit(mux))),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,

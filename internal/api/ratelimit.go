@@ -99,6 +99,43 @@ func NewRateLimiter(ipFunc func(*http.Request) string) *RateLimiter {
 	}
 }
 
+// defaultMaxBodyBytes caps every request body not otherwise exempted (M2):
+// previously no handler in this service set any limit at all except the P2P
+// proof upload's own explicit 6 MB cap, so a malicious or buggy client could
+// send an arbitrarily large body to any JSON endpoint and have it fully
+// buffered/decoded before validation ever ran. 1 MB is generous for every
+// legitimate JSON payload this API accepts (orders, wallet actions, admin
+// forms) while still bounding worst-case memory per request.
+const defaultMaxBodyBytes = 1 << 20
+
+// bodyLimitExemptPrefixes lists routes with their own, larger, explicit
+// body-size handling (see p2p.go's proof upload) that MaxBodyLimit must not
+// double-restrict.
+var bodyLimitExemptPrefixes = []string{"/p2p/order/proofs"}
+
+func isBodyLimitExempt(path string) bool {
+	for _, p := range bodyLimitExemptPrefixes {
+		if len(path) >= len(p) && path[:len(p)] == p {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxBodyLimit wraps next so every non-exempt request body is capped at
+// defaultMaxBodyBytes; a body over the limit fails with an EOF-like read
+// error the first time a handler's json.Decoder reads past it, surfaced as
+// the handler's own "invalid request body" 400 rather than a distinct error
+// here, matching MaxBytesReader's designed behavior.
+func MaxBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isBodyLimitExempt(r.URL.Path) {
+			r.Body = http.MaxBytesReader(w, r.Body, defaultMaxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 var strictPathPrefixes = []string{"/auth/", "/admin/login"}
 
 func isStrictPath(path string) bool {
