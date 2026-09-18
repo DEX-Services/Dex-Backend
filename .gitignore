@@ -3,3 +3,9 @@ kafka-ca.pem
 
 # macOS
 .DS_Store
+
+# Compiled binaries and runtime logs (M10): these are build/run artifacts,
+# not source — server in particular was a stale manual `go build` output
+# that run.sh doesn't even produce (it builds into .run-pids/ instead).
+server
+*.log
