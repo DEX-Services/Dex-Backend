@@ -112,6 +112,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"BI2X allocation tables", ensureBI2XAllocationTables},
 		{"staking tables", ensureStakingTables},
 		{"platform_treasury_entries prediction category", ensureTreasuryEntryPredictionCategory},
+		{"internal balance idempotency keys table", ensureInternalIdempotencyKeysTable},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -447,11 +448,16 @@ CREATE TABLE IF NOT EXISTS p2p_order_proofs (
 	uploader_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
 	file_name TEXT NOT NULL,
 	mime_type TEXT NOT NULL CHECK (mime_type IN ('image/jpeg','image/png','image/webp','application/pdf')),
-	file_data BYTEA NOT NULL,
+	file_data BYTEA,
+	storage_key TEXT,
 	size_bytes BIGINT NOT NULL CHECK (size_bytes > 0 AND size_bytes <= 5242880),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_p2p_order_proofs_order ON p2p_order_proofs(order_id,created_at);
+-- P2P-M3: proofs now upload to object storage (Backblaze B2); file_data stays
+-- nullable so existing rows keep working while storage_key is used for new ones.
+ALTER TABLE p2p_order_proofs ALTER COLUMN file_data DROP NOT NULL;
+ALTER TABLE p2p_order_proofs ADD COLUMN IF NOT EXISTS storage_key TEXT;
 
 CREATE TABLE IF NOT EXISTS p2p_order_messages (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1039,6 +1045,27 @@ CREATE INDEX IF NOT EXISTS idx_staking_events_user
 // guessing/hardcoding it, drops it, and adds the widened one — idempotent
 // and safe to re-run (checks the constraint's current definition first, so
 // it never re-runs the drop+add after the first successful application).
+// ensureInternalIdempotencyKeysTable backs dedup on the internal balance
+// endpoints (/internal/balance/{credit,fee,lock,unlock}) that matching-engine,
+// the futures engine, and prediction-service all call. A caller may retry
+// one of these calls after losing the response to a timeout/network error
+// without knowing whether the original attempt actually landed; without this
+// table a retry just re-applies the balance change a second time. Callers
+// that opt in send an Idempotency-Key header; the key (scoped by endpoint,
+// since the same key string must not collide across different call types)
+// is checked and inserted inside the SAME transaction as the balance
+// mutation, so a retry either finds the already-committed row and skips the
+// mutation, or the whole thing rolls back together on failure.
+const ensureInternalIdempotencyKeysTable = `
+CREATE TABLE IF NOT EXISTS internal_idempotency_keys (
+    endpoint    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    request     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (endpoint, key)
+);
+`
+
 const ensureTreasuryEntryPredictionCategory = `
 DO $widen_treasury_entry_category$
 DECLARE

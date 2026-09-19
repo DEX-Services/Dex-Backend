@@ -634,7 +634,11 @@ func (s *WalletServer) InternalLockBalance(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.LockBalance(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+	// Idempotency-Key is optional: a caller that doesn't send one (e.g.
+	// matching-engine today) gets the exact old behavior — see
+	// LedgerRepo.LockBalanceIdempotent, which no-ops the guard when the key
+	// is empty.
+	if err := s.Ledger.LockBalanceIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -653,7 +657,7 @@ func (s *WalletServer) InternalUnlockBalance(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.UnlockBalance(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+	if err := s.Ledger.UnlockBalanceIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -862,13 +866,14 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if amount.Sign() < 0 {
-		if err := s.Ledger.DebitBalance(r.Context(), req.UserID, req.Asset, amount.Neg(amount).String()); err != nil {
+		if err := s.Ledger.DebitBalanceIdempotent(r.Context(), req.UserID, req.Asset, amount.Neg(amount).String(), idempotencyKey); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 	} else if amount.Sign() > 0 {
-		if err := s.Ledger.CreditBalance(r.Context(), req.UserID, req.Asset, amount.String()); err != nil {
+		if err := s.Ledger.CreditBalanceIdempotent(r.Context(), req.UserID, req.Asset, amount.String(), idempotencyKey); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -918,7 +923,7 @@ func (s *WalletServer) InternalSettleFee(w http.ResponseWriter, r *http.Request)
 		category = "futures"
 	}
 	if s.Referrals != nil && req.Amount != "" && req.Amount != "0" {
-		if err := s.Referrals.SettleFee(r.Context(), req.UserID, req.Asset, req.Amount, "", category); err != nil {
+		if err := s.Referrals.SettleFeeIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, "", category, r.Header.Get("Idempotency-Key")); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}

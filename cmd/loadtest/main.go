@@ -135,7 +135,7 @@ func main() {
 		fmt.Println("\n== Phase 2: scenario matrix ==")
 		tokens := make(map[string]string, len(users))
 		for _, u := range users {
-			tok, _, err := jwt.Issue(u, u)
+			tok, _, err := jwt.Issue(u, u, "")
 			if err != nil {
 				fatal("issue jwt for %s: %v", u, err)
 			}

@@ -161,7 +161,45 @@ func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amount
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.settleFeeTx(ctx, tx, payerUserID, asset, amountRaw, tradeRef, category); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// SettleFeeIdempotent is SettleFee guarded by idempotencyKey — see
+// LedgerRepo.CreditBalanceIdempotent's doc comment for the guard semantics.
+// Used by InternalSettleFee (/internal/balance/fee), which routes a
+// maker/taker fee to a referral/affiliate beneficiary plus the platform
+// treasury and is otherwise just as susceptible to a caller's retry
+// double-crediting the beneficiary/treasury as InternalCreditBalance is.
+func (r *ReferralRepo) SettleFeeIdempotent(ctx context.Context, payerUserID, asset, amountRaw, tradeRef, category, idempotencyKey string) error {
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return nil // zero/negative fee: nothing to route, not an error
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("fee:%s:%s:%s:%s:%s", payerUserID, asset, amountRaw, tradeRef, category)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/fee", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.settleFeeTx(ctx, tx, payerUserID, asset, amountRaw, tradeRef, category); err != nil {
+		return err
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/fee", idempotencyKey, fingerprint); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *ReferralRepo) settleFeeTx(ctx context.Context, tx pgx.Tx, payerUserID, asset, amountRaw, tradeRef, category string) error {
 	source, err := r.earningSourceTx(ctx, tx, payerUserID)
 	if err != nil {
 		return err
@@ -206,7 +244,7 @@ func (r *ReferralRepo) SettleFee(ctx context.Context, payerUserID, asset, amount
 		}
 	}
 
-	return tx.Commit(ctx)
+	return nil
 }
 
 // CreditTreasuryFee records a fee that goes to the platform treasury in

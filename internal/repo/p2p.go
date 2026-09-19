@@ -11,6 +11,7 @@ import (
 
 	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/models"
+	"github.com/dex/dex-backend/internal/storage"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -48,13 +49,23 @@ var p2pUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{3,24}$`)
 var p2pFiatLimitPattern = regexp.MustCompile(`^\d+(?:\.\d{1,2})?$`)
 
 type P2PRepo struct {
-	pool   *pgxpool.Pool
-	ledger *LedgerRepo
-	fees   *feeconfig.Client
+	pool    *pgxpool.Pool
+	ledger  *LedgerRepo
+	fees    *feeconfig.Client
+	// proofs is the object store proof files upload to (P2P-M3). Nil disables
+	// object storage; AddOrderProof then falls back to storing bytes in
+	// Postgres, matching pre-P2P-M3 behavior.
+	proofs *storage.B2Store
 }
 
 func NewP2PRepo(pool *pgxpool.Pool) *P2PRepo {
 	return &P2PRepo{pool: pool, ledger: NewLedgerRepo(pool), fees: feeconfig.New(pool)}
+}
+
+// WithProofStorage attaches an object store for payment-proof files (P2P-M3).
+func (r *P2PRepo) WithProofStorage(store *storage.B2Store) *P2PRepo {
+	r.proofs = store
+	return r
 }
 
 func (r *P2PRepo) TodayPrice(ctx context.Context) (*models.P2PPrice, error) {

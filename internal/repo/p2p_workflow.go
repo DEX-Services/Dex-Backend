@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dex/dex-backend/internal/models"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -160,7 +161,18 @@ func (r *P2PRepo) AddOrderProof(ctx context.Context, userID, orderID, fileName, 
 		return nil, fmt.Errorf("up to 3 payment proofs are allowed")
 	}
 	var proof models.P2POrderProof
-	if err = tx.QueryRow(ctx, `INSERT INTO p2p_order_proofs(order_id,uploader_id,file_name,mime_type,file_data,size_bytes) VALUES($1,$2,$3,$4,$5,$6) RETURNING id::text,file_name,mime_type,size_bytes,created_at`, orderID, userID, fileName, mimeType, data, len(data)).Scan(&proof.ID, &proof.FileName, &proof.MimeType, &proof.SizeBytes, &proof.CreatedAt); err != nil {
+	if r.proofs != nil {
+		storageKey := fmt.Sprintf("p2p-proofs/%s/%s", orderID, uuid.NewString())
+		if err = tx.QueryRow(ctx, `INSERT INTO p2p_order_proofs(order_id,uploader_id,file_name,mime_type,storage_key,size_bytes) VALUES($1,$2,$3,$4,$5,$6) RETURNING id::text,file_name,mime_type,size_bytes,created_at`, orderID, userID, fileName, mimeType, storageKey, len(data)).Scan(&proof.ID, &proof.FileName, &proof.MimeType, &proof.SizeBytes, &proof.CreatedAt); err != nil {
+			return nil, err
+		}
+		// Uploaded after the row is inserted but before commit, so a B2 failure
+		// aborts the whole tx (rollback deferred above) and no dangling row is
+		// left referencing a storage key nothing was ever written to.
+		if err = r.proofs.Put(ctx, storageKey, mimeType, data); err != nil {
+			return nil, fmt.Errorf("upload proof: %w", err)
+		}
+	} else if err = tx.QueryRow(ctx, `INSERT INTO p2p_order_proofs(order_id,uploader_id,file_name,mime_type,file_data,size_bytes) VALUES($1,$2,$3,$4,$5,$6) RETURNING id::text,file_name,mime_type,size_bytes,created_at`, orderID, userID, fileName, mimeType, data, len(data)).Scan(&proof.ID, &proof.FileName, &proof.MimeType, &proof.SizeBytes, &proof.CreatedAt); err != nil {
 		return nil, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO p2p_order_events(order_id,actor_id,kind,metadata) VALUES($1,$2,'payment_proof_uploaded',jsonb_build_object('proofId',$3::text))`, orderID, userID, proof.ID); err != nil {
@@ -195,11 +207,23 @@ func (r *P2PRepo) OrderProofs(ctx context.Context, userID, orderID string) ([]mo
 
 func (r *P2PRepo) OrderProofFile(ctx context.Context, userID, proofID string) (*models.P2POrderProofFile, error) {
 	var file models.P2POrderProofFile
-	err := r.pool.QueryRow(ctx, `SELECT p.id::text,p.file_name,p.mime_type,p.size_bytes,p.created_at,p.file_data FROM p2p_order_proofs p JOIN p2p_orders o ON o.id=p.order_id WHERE p.id=$1 AND (o.buyer_id=$2 OR o.seller_id=$2)`, proofID, userID).Scan(&file.ID, &file.FileName, &file.MimeType, &file.SizeBytes, &file.CreatedAt, &file.Data)
+	var storageKey *string
+	err := r.pool.QueryRow(ctx, `SELECT p.id::text,p.file_name,p.mime_type,p.size_bytes,p.created_at,p.file_data,p.storage_key FROM p2p_order_proofs p JOIN p2p_orders o ON o.id=p.order_id WHERE p.id=$1 AND (o.buyer_id=$2 OR o.seller_id=$2)`, proofID, userID).Scan(&file.ID, &file.FileName, &file.MimeType, &file.SizeBytes, &file.CreatedAt, &file.Data, &storageKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrP2PNotFound
 	}
-	return &file, err
+	if err != nil {
+		return nil, err
+	}
+	if storageKey != nil {
+		if r.proofs == nil {
+			return nil, fmt.Errorf("proof storage is not configured")
+		}
+		if file.Data, err = r.proofs.Get(ctx, *storageKey); err != nil {
+			return nil, err
+		}
+	}
+	return &file, nil
 }
 
 func (r *P2PRepo) OrderEvents(ctx context.Context, userID, orderID string) ([]models.P2POrderEvent, error) {
@@ -333,11 +357,23 @@ func (r *P2PRepo) AdminOrderProofs(ctx context.Context, orderID string) ([]model
 
 func (r *P2PRepo) AdminOrderProofFile(ctx context.Context, proofID string) (*models.P2POrderProofFile, error) {
 	var file models.P2POrderProofFile
-	err := r.pool.QueryRow(ctx, `SELECT id::text,file_name,mime_type,size_bytes,created_at,file_data FROM p2p_order_proofs WHERE id=$1`, proofID).Scan(&file.ID, &file.FileName, &file.MimeType, &file.SizeBytes, &file.CreatedAt, &file.Data)
+	var storageKey *string
+	err := r.pool.QueryRow(ctx, `SELECT id::text,file_name,mime_type,size_bytes,created_at,file_data,storage_key FROM p2p_order_proofs WHERE id=$1`, proofID).Scan(&file.ID, &file.FileName, &file.MimeType, &file.SizeBytes, &file.CreatedAt, &file.Data, &storageKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrP2PNotFound
 	}
-	return &file, err
+	if err != nil {
+		return nil, err
+	}
+	if storageKey != nil {
+		if r.proofs == nil {
+			return nil, fmt.Errorf("proof storage is not configured")
+		}
+		if file.Data, err = r.proofs.Get(ctx, *storageKey); err != nil {
+			return nil, err
+		}
+	}
+	return &file, nil
 }
 
 func (r *P2PRepo) AdminOrderMessages(ctx context.Context, orderID string) ([]models.P2POrderMessage, error) {

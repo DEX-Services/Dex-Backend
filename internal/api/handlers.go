@@ -12,6 +12,7 @@ import (
 	"github.com/dex/dex-backend/internal/auth"
 	"github.com/dex/dex-backend/internal/p2psse"
 	"github.com/dex/dex-backend/internal/repo"
+	"github.com/dex/dex-backend/internal/sessions"
 )
 
 const sessionCookie = "dex_session"
@@ -31,6 +32,9 @@ type Server struct {
 	// AdminServer both embed *Server) can publish to it without separate
 	// wiring per server type.
 	P2PEvents *p2psse.Hub
+	// Sessions backs JWT revocation (M8): nil disables the check, so a JWT
+	// stays valid until natural expiry, matching pre-M8 behavior.
+	Sessions *sessions.Store
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -109,14 +113,20 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	if err := s.Users.TouchLogin(ctx, user.ID); err != nil {
 		s.Log.Warn("touch login failed", "err", err)
 	}
-	if _, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, s.ClientIP(r), r.UserAgent()); err != nil {
+	sessionID, err := s.Users.CreateSession(ctx, user.ID, user.WalletAddress, s.ClientIP(r), r.UserAgent())
+	if err != nil {
 		s.Log.Warn("create session failed", "err", err)
 	}
 
-	token, expiresAt, err := s.JWT.Issue(user.ID, user.WalletAddress)
+	token, expiresAt, err := s.JWT.Issue(user.ID, user.WalletAddress, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not issue session")
 		return
+	}
+	if s.Sessions != nil && sessionID != "" {
+		if err := s.Sessions.Activate(ctx, sessionID, s.JWT.TTL()); err != nil {
+			s.Log.Warn("activate session failed", "err", err)
+		}
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -141,6 +151,11 @@ func (s *Server) Logout(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		if err := s.Users.CloseSession(r.Context(), claims.UserID); err != nil {
 			s.Log.Warn("close session failed", "err", err)
+		}
+		if s.Sessions != nil && claims.ID != "" {
+			if err := s.Sessions.Revoke(r.Context(), claims.ID); err != nil {
+				s.Log.Warn("revoke session failed", "err", err)
+			}
 		}
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -184,6 +199,15 @@ func (s *Server) authenticate(r *http.Request) (*auth.Claims, bool) {
 	claims, err := s.JWT.Verify(token)
 	if err != nil {
 		return nil, false
+	}
+	// Tokens issued before M8 (or when Sessions is nil) carry no jti; skip the
+	// revocation check for those rather than locking every existing session
+	// out the moment this ships.
+	if s.Sessions != nil && claims.ID != "" {
+		active, err := s.Sessions.IsActive(r.Context(), claims.ID)
+		if err != nil || !active {
+			return nil, false
+		}
 	}
 	return claims, true
 }

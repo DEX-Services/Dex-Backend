@@ -21,6 +21,8 @@ import (
 	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/p2psse"
 	"github.com/dex/dex-backend/internal/repo"
+	"github.com/dex/dex-backend/internal/sessions"
+	"github.com/dex/dex-backend/internal/storage"
 	"github.com/joho/godotenv"
 )
 
@@ -51,6 +53,11 @@ func main() {
 	ledgerRepo := repo.NewLedgerRepo(pool)
 	adminRepo := repo.NewAdminRepo(pool)
 	p2pRepo := repo.NewP2PRepo(pool)
+	if b2Store, err := storage.NewB2Store(ctx, os.Getenv("B2_ENDPOINT"), os.Getenv("B2_REGION"), os.Getenv("B2_BUCKET"), os.Getenv("B2_KEY_ID"), os.Getenv("B2_APPLICATION_KEY")); err != nil {
+		slog.Warn("B2 object storage not configured, P2P proofs will be stored in Postgres", "err", err)
+	} else {
+		p2pRepo.WithProofStorage(b2Store)
+	}
 	allocationRepo := repo.NewBI2XAllocationRepo(pool)
 	feesClient := feeconfig.New(pool)
 	feeTierRepo := repo.NewFeeTierRepo(ledgerRepo, feesClient)
@@ -72,6 +79,12 @@ func main() {
 		}
 	}()
 
+	sessionStore, err := sessions.New(os.Getenv("REDIS_SERVICE_URI"))
+	if err != nil {
+		slog.Warn("session revocation disabled: redis not configured", "err", err)
+		sessionStore = nil
+	}
+
 	srv := &api.Server{
 		Nonces:       auth.NewNonceStore(),
 		JWT:          auth.NewJWTIssuer(jwtSecret, 7*24*time.Hour),
@@ -80,6 +93,7 @@ func main() {
 		SecureCookie: os.Getenv("COOKIE_SECURE") != "false",
 		TrustedProxy: os.Getenv("TRUSTED_PROXY"),
 		P2PEvents:    p2psse.NewHub(),
+		Sessions:     sessionStore,
 	}
 	go srv.Nonces.Run(ctx)
 

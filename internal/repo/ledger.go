@@ -82,6 +82,45 @@ func validateNonNegativeAmount(amountRaw string) error {
 	return nil
 }
 
+// ErrIdempotencyKeyReused means the same (endpoint, key) pair was seen
+// before with different request parameters — the caller is either reusing a
+// key across unrelated operations (a bug) or something is generating
+// colliding keys; either way it's unsafe to guess which request was
+// "right", so this fails loudly instead of silently applying one of them.
+var ErrIdempotencyKeyReused = fmt.Errorf("idempotency key already used for a different request")
+
+// checkIdempotency looks up (endpoint, key) inside tx. found=true means a
+// prior attempt already completed and the caller should skip re-applying
+// the mutation (fingerprint must match — see ErrIdempotencyKeyReused).
+// recordIdempotency must be called inside the same transaction after the
+// mutation succeeds, so the dedup row and the balance change commit or roll
+// back together — a crash between them is impossible by construction.
+func checkIdempotency(ctx context.Context, tx pgx.Tx, endpoint, key, fingerprint string) (found bool, err error) {
+	if key == "" {
+		return false, nil
+	}
+	var priorFingerprint string
+	err = tx.QueryRow(ctx, `SELECT request FROM internal_idempotency_keys WHERE endpoint = $1 AND key = $2`, endpoint, key).Scan(&priorFingerprint)
+	if err == nil {
+		if priorFingerprint != fingerprint {
+			return false, ErrIdempotencyKeyReused
+		}
+		return true, nil
+	}
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	return false, err
+}
+
+func recordIdempotency(ctx context.Context, tx pgx.Tx, endpoint, key, fingerprint string) error {
+	if key == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO internal_idempotency_keys (endpoint, key, request) VALUES ($1, $2, $3)`, endpoint, key, fingerprint)
+	return err
+}
+
 func (r *LedgerRepo) lockUser(ctx context.Context, tx pgx.Tx, userID string) error {
 	var exists int
 	if err := tx.QueryRow(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&exists); err != nil {
@@ -237,6 +276,53 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 	return tx.Commit(ctx)
 }
 
+// LockBalanceIdempotent mirrors CreditBalanceIdempotent for LockBalance (see
+// its doc comment for the guard semantics).
+func (r *LedgerRepo) LockBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("lock:%s:%s:%s", userID, asset, amountRaw)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/lock", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
+		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - (
+			SELECT COALESCE(SUM(amount), 0) FROM ledger_entries
+			WHERE user_id = $1 AND token = $3 AND kind = $4 AND status IN ($5, $6)
+		 ) >= $2::numeric`,
+		userID, amountRaw, normalized, models.LedgerKindWithdrawalRequest,
+		models.LedgerStatusPending, models.LedgerStatusProcessing)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("insufficient %s balance to lock", normalized)
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/lock", idempotencyKey, fingerprint); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // UnlockBalance releases a previously locked amountRaw of asset for userID, e.g. on
 // order cancel/rejection. Floors at zero locked, mirroring the matching-engine's
 // in-memory Ledger.Release semantics.
@@ -261,6 +347,45 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
 		 WHERE user_id = $1`,
 		userID, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// UnlockBalanceIdempotent mirrors CreditBalanceIdempotent for UnlockBalance
+// (see its doc comment for the guard semantics).
+func (r *LedgerRepo) UnlockBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("unlock:%s:%s:%s", userID, asset, amountRaw)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/unlock", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
+		 WHERE user_id = $1`,
+		userID, amountRaw); err != nil {
+		return err
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/unlock", idempotencyKey, fingerprint); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -489,6 +614,35 @@ func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw
 	return tx.Commit(ctx)
 }
 
+// CreditBalanceIdempotent is CreditBalance guarded by idempotencyKey: a
+// retry with the same key and same (userID, asset, amountRaw) is a no-op
+// that reports success without crediting again; a retry with the same key
+// but different parameters fails with ErrIdempotencyKeyReused instead of
+// guessing which request to honor. Pass idempotencyKey="" to skip the guard
+// entirely (identical to CreditBalance).
+func (r *LedgerRepo) CreditBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("credit:%s:%s:%s", userID, asset, amountRaw)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.creditBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+		return err
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (r *LedgerRepo) DebitBalance(ctx context.Context, userID, asset, amountRaw string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -496,6 +650,32 @@ func (r *LedgerRepo) DebitBalance(ctx context.Context, userID, asset, amountRaw 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := r.debitBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// DebitBalanceIdempotent mirrors CreditBalanceIdempotent for debits (see its
+// doc comment); used for InternalCreditBalance's negative-amount branch,
+// which debits rather than credits.
+func (r *LedgerRepo) DebitBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("debit:%s:%s:%s", userID, asset, amountRaw)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.debitBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+		return err
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

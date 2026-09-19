@@ -196,7 +196,7 @@ func creditBI2XUSD(adminTok, userID, amount string) error {
 
 func jwtFor(uid string) string {
 	iss := auth.NewJWTIssuer(jwtSecret, 24*time.Hour)
-	tok, _, err := iss.Issue(uid, uid)
+	tok, _, err := iss.Issue(uid, uid, "")
 	if err != nil {
 		fatal("issue jwt for %s: %v", uid, err)
 	}

@@ -115,7 +115,7 @@ func (s *AdminServer) Login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not load admin profile")
 		return
 	}
-	token, _, err := s.JWT.Issue(adminLoginID, "admin")
+	token, _, err := s.JWT.Issue(adminLoginID, "admin", "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not issue admin session")
 		return

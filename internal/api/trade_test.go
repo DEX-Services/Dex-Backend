@@ -31,7 +31,7 @@ func newTestTradeServer(t *testing.T, engineHandler http.HandlerFunc) (*TradeSer
 
 func sessionRequest(t *testing.T, jwt *auth.JWTIssuer, userID string, method, target string, body string) *http.Request {
 	t.Helper()
-	token, _, err := jwt.Issue(userID, "0xabc")
+	token, _, err := jwt.Issue(userID, "0xabc", "")
 	if err != nil {
 		t.Fatalf("issue token: %v", err)
 	}
