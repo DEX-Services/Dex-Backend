@@ -148,6 +148,31 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 		return nil, http.StatusInternalServerError, errors.New("invalid withdrawal amount")
 	}
 
+	// H4: if a previous attempt at this same request already broadcast a
+	// transaction (crash/timeout during MarkWithdrawalConfirmed or the
+	// confirmation wait, or a prior watchdog retry that itself got stuck),
+	// reuse that exact nonce with a bumped fee instead of asking the chain
+	// for a fresh nonce — which would count the still-pending original as
+	// occupying its slot and skip past it, jamming every withdrawal behind
+	// it indefinitely.
+	var prior *chain.PendingTx
+	if pn, err := s.Ledger.PendingNonceFor(ctx, requestID); err != nil {
+		s.Log.Warn("load pending nonce failed, submitting with a fresh nonce", "requestId", requestID, "err", err)
+	} else if pn != nil {
+		feeCap, feeOK := new(big.Int).SetString(pn.FeeCapWei, 10)
+		tipCap, tipOK := new(big.Int).SetString(pn.TipCapWei, 10)
+		if feeOK && tipOK {
+			prior = &chain.PendingTx{Nonce: pn.Nonce, FeeCapWei: feeCap, TipCapWei: tipCap}
+		} else {
+			s.Log.Warn("stored pending nonce fee could not be parsed, submitting with a fresh nonce", "requestId", requestID)
+		}
+	}
+	onSubmit := func(nonce uint64, feeCapWei, tipCapWei string) {
+		if err := s.Ledger.SavePendingNonce(ctx, requestID, nonce, feeCapWei, tipCapWei); err != nil {
+			s.Log.Error("save pending nonce failed", "requestId", requestID, "err", err)
+		}
+	}
+
 	// Deliberately NOT ctx (the HTTP request's context): SubmitWithdrawal's
 	// on-chain wait (bind.WaitMined inside submitTx) previously ran on the
 	// request's own context, so a client disconnecting mid-request — closing
@@ -159,10 +184,11 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 	// what the client does.
 	txCtx, cancel := context.WithTimeout(context.Background(), withdrawalTxTimeout)
 	defer cancel()
-	txHash, err := s.Signer.SubmitWithdrawal(txCtx, entry.WalletAddress, amount)
+	txHash, err := s.Signer.SubmitWithdrawal(txCtx, entry.WalletAddress, amount, prior, onSubmit)
 	if err != nil {
 		if txHash == "" || errors.Is(err, chain.ErrTxReverted) {
 			_ = s.Ledger.MarkWithdrawalFailed(ctx, requestID)
+			_ = s.Ledger.ClearPendingNonce(ctx, requestID)
 		}
 		s.Log.Error("submit withdrawal failed", "err", err, "requestId", requestID, "txHash", txHash)
 		if txHash != "" {
@@ -176,6 +202,7 @@ func (s *WalletServer) processWithdrawalRequest(ctx context.Context, requestID s
 		s.Log.Error("mark withdrawal confirmed failed", "err", err, "requestId", requestID, "txHash", txHash)
 		return nil, http.StatusInternalServerError, errors.New("withdrawal submitted on-chain but ledger update failed")
 	}
+	_ = s.Ledger.ClearPendingNonce(ctx, requestID)
 
 	s.EngineClient.DebitAsync("debit", confirmed.UserID, confirmed.Token, confirmed.Amount)
 
@@ -443,6 +470,14 @@ func (s *WalletServer) AdminRecoverWithdrawal(w http.ResponseWriter, r *http.Req
 	}
 	switch action {
 	case "fail":
+		// Deliberately does NOT clear any saved pending nonce (see
+		// PendingNonceFor): if this request's earlier transaction is still
+		// sitting in the mempool, it can still land on-chain after this call
+		// marks the request "failed" in Postgres. That's an inherent risk of
+		// force-failing a withdrawal whose broadcast transaction can't be
+		// un-broadcast — an admin using this action should first confirm on a
+		// block explorer that the transaction actually dropped/reverted, not
+		// just that it looked stuck here.
 		if err := s.Ledger.MarkWithdrawalFailed(r.Context(), req.RequestID); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -803,7 +838,7 @@ func (s *WalletServer) InternalSettleBalance(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.SettleLockedDebit(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+	if err := s.Ledger.SettleLockedDebitIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}

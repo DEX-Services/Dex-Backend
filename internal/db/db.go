@@ -51,6 +51,17 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_tx_hash ON ledger_entries(tx_hash) WHERE tx_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ledger_user_id ON ledger_entries(user_id);
 
+-- H4: nonce-replacement for stuck withdrawal transactions. A withdrawal that
+-- gets stuck waiting to be mined (network congestion, a restart mid-wait)
+-- used to be retried by asking the chain for a fresh nonce — which SKIPS the
+-- still-pending nonce rather than freeing it, permanently jamming every
+-- withdrawal after it. Persisting the exact nonce/fee actually submitted
+-- lets a retry resubmit at that SAME nonce with a higher fee (the standard
+-- "speed up/replace" pattern), which is the only way to actually unstick it.
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS pending_nonce BIGINT;
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS pending_fee_cap_wei NUMERIC(78,0);
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS pending_tip_cap_wei NUMERIC(78,0);
+
 CREATE TABLE IF NOT EXISTS chain_cursor (
 	key TEXT PRIMARY KEY,
 	block_number BIGINT NOT NULL

@@ -536,6 +536,55 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 	return tx.Commit(ctx)
 }
 
+// SettleLockedDebitIdempotent mirrors CreditBalanceIdempotent for
+// SettleLockedDebit (see its doc comment for the guard semantics). Added
+// alongside matching-engine's M3 durable-outbox fix: a Settle call that gets
+// replayed by that outbox after an earlier attempt's response was lost must
+// be safe to resend, same as Credit/SettleFee/Lock/Unlock already are.
+func (r *LedgerRepo) SettleLockedDebitIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	lockedColumn := lockedColumns[normalized]
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fingerprint := fmt.Sprintf("settle:%s:%s:%s", userID, asset, amountRaw)
+	found, err := checkIdempotency(ctx, tx, "/internal/balance/settle", idempotencyKey, fingerprint)
+	if err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+	if err := r.lockBalance(ctx, tx, userID); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE user_balances
+		 SET `+column+` = `+column+` - $2::numeric,
+		     `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric),
+		     updated_at = now()
+		 WHERE user_id = $1 AND `+column+` >= $2::numeric`,
+		userID, amountRaw)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return fmt.Errorf("insufficient %s balance to settle", normalized)
+	}
+	if err := recordIdempotency(ctx, tx, "/internal/balance/settle", idempotencyKey, fingerprint); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // SettleSpotTrade completes both legs of a spot fill in one database
 // transaction. The buyer's quote and seller's base were already reserved by
 // the matching engine; this method consumes those reservations and credits the
@@ -939,6 +988,58 @@ func (r *LedgerRepo) MarkWithdrawalFailed(ctx context.Context, requestID string)
 	_, err := r.pool.Exec(ctx,
 		`UPDATE ledger_entries SET status = $2 WHERE id = $1 AND kind = $3 AND status = $4`,
 		requestID, models.LedgerStatusFailed, models.LedgerKindWithdrawalRequest, models.LedgerStatusProcessing,
+	)
+	return err
+}
+
+// PendingNonce is a withdrawal request's last-submitted, not-yet-confirmed
+// on-chain transaction parameters — nil fields mean no transaction has been
+// submitted for this request yet (or it already confirmed/failed and was
+// cleared). Used to replace a stuck transaction at the SAME nonce with a
+// higher fee, instead of re-deriving a fresh nonce that would skip over it
+// (H4).
+type PendingNonce struct {
+	Nonce     uint64
+	FeeCapWei string
+	TipCapWei string
+}
+
+// SavePendingNonce records the nonce/fee actually used for requestID's
+// on-chain submission, before waiting for it to be mined — so a crash or
+// timeout during that wait still leaves a durable record of exactly what
+// was sent, for ReplaceStuckTx to build on.
+func (r *LedgerRepo) SavePendingNonce(ctx context.Context, requestID string, nonce uint64, feeCapWei, tipCapWei string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE ledger_entries SET pending_nonce = $2, pending_fee_cap_wei = $3::numeric, pending_tip_cap_wei = $4::numeric WHERE id = $1`,
+		requestID, nonce, feeCapWei, tipCapWei,
+	)
+	return err
+}
+
+// PendingNonceFor returns requestID's last-saved pending nonce/fee, or nil if
+// none is recorded.
+func (r *LedgerRepo) PendingNonceFor(ctx context.Context, requestID string) (*PendingNonce, error) {
+	var nonce *int64
+	var feeCap, tipCap *string
+	err := r.pool.QueryRow(ctx,
+		`SELECT pending_nonce, pending_fee_cap_wei::text, pending_tip_cap_wei::text FROM ledger_entries WHERE id = $1`,
+		requestID,
+	).Scan(&nonce, &feeCap, &tipCap)
+	if err != nil {
+		return nil, err
+	}
+	if nonce == nil || feeCap == nil || tipCap == nil {
+		return nil, nil
+	}
+	return &PendingNonce{Nonce: uint64(*nonce), FeeCapWei: *feeCap, TipCapWei: *tipCap}, nil
+}
+
+// ClearPendingNonce removes requestID's saved nonce/fee once its transaction
+// has reached a terminal state (confirmed or permanently failed).
+func (r *LedgerRepo) ClearPendingNonce(ctx context.Context, requestID string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE ledger_entries SET pending_nonce = NULL, pending_fee_cap_wei = NULL, pending_tip_cap_wei = NULL WHERE id = $1`,
+		requestID,
 	)
 	return err
 }
