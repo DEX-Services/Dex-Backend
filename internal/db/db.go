@@ -124,6 +124,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"staking tables", ensureStakingTables},
 		{"platform_treasury_entries prediction category", ensureTreasuryEntryPredictionCategory},
 		{"internal balance idempotency keys table", ensureInternalIdempotencyKeysTable},
+		{"prop-firm purchases table", ensurePropFirmPurchasesTable},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1095,4 +1096,32 @@ BEGIN
             CHECK (category IS NULL OR category IN ('spot', 'futures', 'liquidation', 'swap', 'prediction'));
     END IF;
 END $widen_treasury_entry_category$;
+`
+
+// ensurePropFirmPurchasesTable backs POST /prop-firm/purchase
+// (PROP_FIRM_PLAN.md section 3, the exchange side of the one integration
+// point with the standalone BitDX Prop Firm backend). This is deliberately
+// a SEPARATE table from that backend's own pf_purchases — this row is the
+// exchange's own record that "user X paid Y BI2XUSD for package Z", created
+// and updated entirely within this database/service, independent of
+// whatever the prop-firm backend does with the externalRef afterwards.
+//
+// id is what's sent as externalRef to POST /internal/provision: generating
+// it BEFORE calling that endpoint (status starts 'pending') means a crash
+// or timeout between the debit and the provision call leaves a durable,
+// idempotency-key-able record to retry against, rather than a debited
+// wallet with no trace of what it paid for.
+const ensurePropFirmPurchasesTable = `
+CREATE TABLE IF NOT EXISTS prop_firm_purchases (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    package_id      TEXT NOT NULL,
+    price_bi2xusd   NUMERIC(38,0) NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'fulfilled', 'failed', 'refund_needed')),
+    prop_firm_account_id TEXT,
+    fail_reason     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_prop_firm_purchases_user ON prop_firm_purchases (user_id, created_at DESC);
 `

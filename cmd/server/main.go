@@ -20,6 +20,7 @@ import (
 	"github.com/dex/dex-backend/internal/engineclient"
 	"github.com/dex/dex-backend/internal/feeconfig"
 	"github.com/dex/dex-backend/internal/p2psse"
+	"github.com/dex/dex-backend/internal/propfirmclient"
 	"github.com/dex/dex-backend/internal/repo"
 	"github.com/dex/dex-backend/internal/sessions"
 	"github.com/dex/dex-backend/internal/storage"
@@ -64,6 +65,8 @@ func main() {
 	referralRepo := repo.NewReferralRepo(pool, ledgerRepo)
 	userRepo.SetReferrals(referralRepo)
 	engineClient := engineclient.New()
+	propFirmClient := propfirmclient.New()
+	propFirmPurchaseRepo := repo.NewPropFirmPurchaseRepo(pool)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -108,6 +111,15 @@ func main() {
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
+	}
+	propFirmSrv := &api.PropFirmServer{
+		Server:    srv,
+		Ledger:    ledgerRepo,
+		Purchases: propFirmPurchaseRepo,
+		PropFirm:  propFirmClient,
+	}
+	if !propFirmClient.Enabled() {
+		slog.Warn("PROPFIRM_BACKEND_URL or PROPFIRM_INTERNAL_SECRET not set, /prop-firm/purchase disabled")
 	}
 	adminSrv := &api.AdminServer{
 		Server:        srv,
@@ -197,6 +209,7 @@ func main() {
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)
+	mux.HandleFunc("/prop-firm/purchase", propFirmSrv.Purchase)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
 	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)
 	mux.HandleFunc("/internal/user/ensure", walletSrv.InternalEnsureUser)
