@@ -26,6 +26,31 @@ func NewFeeTierRepo(ledger *LedgerRepo, fees *feeconfig.Client) *FeeTierRepo {
 // or has been deactivated by an admin.
 var ErrTierNotFound = fmt.Errorf("fee tier not found or inactive")
 
+// ErrDiscountsExcluded is returned for a user ID that must never receive a
+// fee-tier discount, regardless of who or what tries to subscribe it.
+var ErrDiscountsExcluded = fmt.Errorf("this account is not eligible for fee-tier discounts")
+
+// propFirmMasterUserID is the same fixed master/omnibus account ID BitDX
+// Prop Firm's own backend uses for every funded trader's real order
+// (liveengine.MasterAccountID in that service — duplicated here as a
+// literal since it's a different Go module, not importable). This account
+// must NEVER trade at a discounted rate (PROP_FIRM_PLAN.md section 11):
+// funded traders pay the exchange's real, full fee on every live trade, and
+// discounting it would understate what a live account actually costs the
+// platform. In practice nothing currently calls Subscribe for this account
+// (it never logs in through the normal JWT flow this endpoint requires),
+// but this guard makes that structurally true rather than merely
+// coincidental.
+const propFirmMasterUserID = "propfirm-master"
+
+// isExcludedFromDiscounts reports whether userID must never hold an active
+// fee-tier subscription. A single hardcoded ID today; if more
+// discount-ineligible account classes appear later, this is the one place
+// to extend rather than duplicating the check at every call site.
+func isExcludedFromDiscounts(userID string) bool {
+	return userID == propFirmMasterUserID
+}
+
 // Subscription describes one purchased (or admin-granted) fee-tier row.
 type Subscription struct {
 	ID                int64
@@ -52,6 +77,9 @@ type Subscription struct {
 // replaces the old one and restarts the 1-year clock, regardless of whether
 // the new tier is higher or lower).
 func (r *FeeTierRepo) Subscribe(ctx context.Context, userID string, tier int, currentBI2XPrice decimal.Decimal) (*Subscription, error) {
+	if isExcludedFromDiscounts(userID) {
+		return nil, ErrDiscountsExcluded
+	}
 	if !currentBI2XPrice.IsPositive() {
 		return nil, fmt.Errorf("invalid BI2X price")
 	}

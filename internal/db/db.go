@@ -125,6 +125,8 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"platform_treasury_entries prediction category", ensureTreasuryEntryPredictionCategory},
 		{"internal balance idempotency keys table", ensureInternalIdempotencyKeysTable},
 		{"prop-firm purchases table", ensurePropFirmPurchasesTable},
+		{"prop-firm purchases refund automation columns", ensurePropFirmPurchaseRefundColumns},
+		{"platform_treasury_entries propfirm category", ensureTreasuryEntryPropFirmCategory},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1098,6 +1100,34 @@ BEGIN
 END $widen_treasury_entry_category$;
 `
 
+// ensureTreasuryEntryPropFirmCategory widens platform_treasury_entries'
+// category CHECK once more to accept 'propfirm', so PropFirm Backend's real
+// 20% share of a funded trader's realized live profit (PROP_FIRM_PLAN.md
+// §11) can be recorded honestly as its own revenue line via the new
+// POST /internal/treasury/credit endpoint — CreditTreasuryFee's existing
+// kind='trading_fee' plus this new category matches the same shape
+// FeeRevenueTotals already reads for other categories, so no new admin
+// aggregation code is needed once this category exists.
+const ensureTreasuryEntryPropFirmCategory = `
+DO $widen_treasury_entry_category_propfirm$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    SELECT con.conname INTO constraint_name
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    WHERE rel.relname = 'platform_treasury_entries'
+      AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%category%'
+      AND pg_get_constraintdef(con.oid) NOT LIKE '%propfirm%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE public.platform_treasury_entries DROP CONSTRAINT %I', constraint_name);
+        ALTER TABLE public.platform_treasury_entries ADD CONSTRAINT platform_treasury_entries_category_check
+            CHECK (category IS NULL OR category IN ('spot', 'futures', 'liquidation', 'swap', 'prediction', 'propfirm'));
+    END IF;
+END $widen_treasury_entry_category_propfirm$;
+`
+
 // ensurePropFirmPurchasesTable backs POST /prop-firm/purchase
 // (PROP_FIRM_PLAN.md section 3, the exchange side of the one integration
 // point with the standalone BitDX Prop Firm backend). This is deliberately
@@ -1124,4 +1154,35 @@ CREATE TABLE IF NOT EXISTS prop_firm_purchases (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_prop_firm_purchases_user ON prop_firm_purchases (user_id, created_at DESC);
+`
+
+// ensurePropFirmPurchaseRefundColumns backs the retry-then-refund background
+// job (PROP_FIRM_PLAN.md §3's previously-open "pending/retry/refund
+// bookkeeping" gap): retry_count/last_retry_at let the job give up after a
+// bounded number of attempts instead of retrying forever, and 'refunded' is
+// a new terminal status distinct from 'refund_needed' (still-owed) so a
+// completed refund is never mistaken for one still pending. Widening the
+// status CHECK follows the same DO-block pattern already used for
+// platform_treasury_entries' category constraint.
+const ensurePropFirmPurchaseRefundColumns = `
+ALTER TABLE prop_firm_purchases ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE prop_firm_purchases ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMPTZ;
+
+DO $widen_prop_firm_purchase_status$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    SELECT con.conname INTO constraint_name
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    WHERE rel.relname = 'prop_firm_purchases'
+      AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%status%'
+      AND pg_get_constraintdef(con.oid) NOT LIKE '%refunded%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE public.prop_firm_purchases DROP CONSTRAINT %I', constraint_name);
+        ALTER TABLE public.prop_firm_purchases ADD CONSTRAINT prop_firm_purchases_status_check
+            CHECK (status IN ('pending', 'fulfilled', 'failed', 'refund_needed', 'refunded'));
+    END IF;
+END $widen_prop_firm_purchase_status$;
 `

@@ -916,6 +916,53 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
 }
 
+// InternalCreditTreasury: POST /internal/treasury/credit
+// {asset, amount, accountId, tradeRef, category} — records real platform
+// revenue directly into platform_treasury_entries/platform_treasury_balances
+// via the existing ReferralRepo.CreditTreasuryFee (100% to treasury, no
+// referral/affiliate split — same as a swap fee). Added for BitDX Prop
+// Firm's 20% share of a funded trader's realized live-trading profit
+// (PROP_FIRM_PLAN.md §11/§13): that revenue is computed and split entirely
+// inside the separate PropFirm Backend service, which has no direct access
+// to this database, so it calls this endpoint to record its share honestly
+// instead of the money silently vanishing from any ledger. category is
+// validated against ValidTreasuryCategories rather than trusted verbatim,
+// since it becomes part of a SQL CHECK-constrained column.
+func (s *WalletServer) InternalCreditTreasury(w http.ResponseWriter, r *http.Request) {
+	if !s.checkEngineSecret(w, r) {
+		return
+	}
+	var req struct {
+		Asset     string `json:"asset"`
+		Amount    string `json:"amount"`
+		AccountID string `json:"accountId"`
+		TradeRef  string `json:"tradeRef"`
+		Category  string `json:"category"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Asset == "" || req.Amount == "" {
+		writeError(w, http.StatusBadRequest, "asset and amount are required")
+		return
+	}
+	if !ValidTreasuryCategories[req.Category] {
+		writeError(w, http.StatusBadRequest, "unknown category")
+		return
+	}
+	if err := s.Referrals.CreditTreasuryFee(r.Context(), req.Asset, req.Amount, req.AccountID, req.TradeRef, req.Category); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
+}
+
+// ValidTreasuryCategories mirrors platform_treasury_entries' category CHECK
+// constraint (db.ensureTreasuryEntryCategory and its widening migrations) —
+// kept as a Go-side allowlist so InternalCreditTreasury rejects an unknown
+// category with a clear 400 instead of a raw Postgres constraint-violation
+// error surfacing to a caller.
+var ValidTreasuryCategories = map[string]bool{
+	"spot": true, "futures": true, "liquidation": true, "swap": true, "prediction": true, "propfirm": true,
+}
+
 // InternalSettleFee: POST /internal/balance/fee {userId, asset, amount}
 // Called by the matching-engine after a futures maker/taker fee has already
 // been debited from userId's balance (see FuturesSettlement.applyFill).

@@ -82,6 +82,25 @@ func main() {
 		}
 	}()
 
+	// Retry-then-refund for BitDX Prop Firm purchases whose synchronous
+	// provisioning attempt failed after the wallet was already debited
+	// (PROP_FIRM_PLAN.md §3). No-ops safely if propFirmClient is disabled
+	// (Provision returns an error every call, so nothing ever gets marked
+	// fulfilled — retries just keep failing until PropFirmRetryMaxAttempts,
+	// then refund).
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				api.RetryPropFirmProvisioning(ctx, propFirmPurchaseRepo, ledgerRepo, propFirmClient, slog.Default())
+			}
+		}
+	}()
+
 	sessionStore, err := sessions.New(os.Getenv("REDIS_SERVICE_URI"))
 	if err != nil {
 		slog.Warn("session revocation disabled: redis not configured", "err", err)
@@ -223,6 +242,7 @@ func main() {
 	mux.HandleFunc("/internal/balance/settle", walletSrv.InternalSettleBalance)
 	mux.HandleFunc("/internal/balance/spot-settle", walletSrv.InternalSettleSpot)
 	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
+	mux.HandleFunc("/internal/treasury/credit", walletSrv.InternalCreditTreasury)
 	mux.HandleFunc("/internal/balance/fee", walletSrv.InternalSettleFee)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
