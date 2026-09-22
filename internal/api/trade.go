@@ -52,6 +52,73 @@ type TradeServer struct {
 	// full engine-call timeout for no useful reason.
 	acctLocks   map[string]chan struct{}
 	acctLocksMu sync.Mutex
+
+	// reconcileVerified caches, per accountID+asset, the last time
+	// reconcileOrderBalance ran its full three-way read (Postgres balance,
+	// Postgres locked, engine mirror) and found the two ledgers already in
+	// agreement (delta == 0) — see PERFORMANCE-CODE-REVIEW-FINDINGS.md item
+	// #8. Every order pays reconcileOrderBalance's full round trip (two
+	// Postgres queries + one engine call, fired concurrently but still
+	// ~4-6s of real network latency against the live Aiven instance per
+	// engineclient.New's doc comment) before it even reaches the engine's
+	// own submit path. In the steady state — no deposit, no restart, no
+	// drift — that whole check reliably finds nothing to correct, so a
+	// short TTL lets back-to-back orders from the same account+asset skip
+	// straight past it. Entries are invalidated (deleted, not just left to
+	// expire) the moment ANY correction is applied for that account+asset,
+	// so a real drift is never masked by a stale "recently verified" entry
+	// — see reconcileOrderBalance's use of this map for exactly where.
+	reconcileVerified   map[string]time.Time
+	reconcileVerifiedMu sync.Mutex
+}
+
+// reconcileVerifiedTTL bounds how long a "no drift found" result from
+// reconcileOrderBalance may be trusted without re-checking. Short enough
+// that a real deposit or engine restart is caught within a few seconds of
+// the next order (reconcileOrderBalance's whole purpose), long enough to
+// skip the full three-way round trip for every order in a fast burst from
+// the same account.
+const reconcileVerifiedTTL = 5 * time.Second
+
+// reconcileCacheKey identifies one account+asset pair for reconcileVerified.
+// asset alone (not symbol/market/side) matches what reconcileOrderBalance
+// actually reconciles — settlementAssetForOrder resolves symbol/market/side
+// down to a single asset before any of the reads happen, so two orders on
+// different symbols that happen to settle in the same asset (e.g. two
+// different USDC-quoted pairs) correctly share one cache entry.
+func reconcileCacheKey(accountID, asset string) string {
+	return accountID + ":" + strings.ToUpper(asset)
+}
+
+// reconcileRecentlyVerified reports whether accountID+asset was found fully
+// in sync within the last reconcileVerifiedTTL.
+func (s *TradeServer) reconcileRecentlyVerified(accountID, asset string) bool {
+	s.reconcileVerifiedMu.Lock()
+	defer s.reconcileVerifiedMu.Unlock()
+	t, ok := s.reconcileVerified[reconcileCacheKey(accountID, asset)]
+	return ok && time.Since(t) < reconcileVerifiedTTL
+}
+
+// markReconcileVerified records that accountID+asset was just found fully in
+// sync (delta == 0), starting a fresh TTL window.
+func (s *TradeServer) markReconcileVerified(accountID, asset string) {
+	s.reconcileVerifiedMu.Lock()
+	defer s.reconcileVerifiedMu.Unlock()
+	if s.reconcileVerified == nil {
+		s.reconcileVerified = make(map[string]time.Time)
+	}
+	s.reconcileVerified[reconcileCacheKey(accountID, asset)] = time.Now()
+}
+
+// invalidateReconcileVerified drops any cached "recently verified" entry for
+// accountID+asset — called whenever a real correction is applied, so the
+// next order re-checks from scratch instead of trusting a window that
+// started before the correction (and therefore before whatever caused the
+// drift in the first place).
+func (s *TradeServer) invalidateReconcileVerified(accountID, asset string) {
+	s.reconcileVerifiedMu.Lock()
+	defer s.reconcileVerifiedMu.Unlock()
+	delete(s.reconcileVerified, reconcileCacheKey(accountID, asset))
 }
 
 // acctQueueWait bounds how long a request waits for its own account's slot
@@ -304,6 +371,15 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	if !ok {
 		return nil
 	}
+	// Short-circuit when this account+asset was already found fully in sync
+	// within the last reconcileVerifiedTTL — see reconcileVerified's doc
+	// comment on TradeServer for why this is safe (nothing skipped here can
+	// mask a NEW drift: a deposit or engine restart during the TTL window
+	// just means the next order after the window re-checks and catches it,
+	// same as today's behavior always finding it on the very next order).
+	if s.reconcileRecentlyVerified(accountID, asset) {
+		return nil
+	}
 	// The three reads below (Postgres balances, Postgres locked balances,
 	// engine's mirror balance) are independent of each other — none needs
 	// another's result, they're only compared once all three are in. Firing
@@ -426,6 +502,7 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 	}
 	delta := new(big.Rat).Sub(dbAmount, engineAmount)
 	if delta.Sign() == 0 {
+		s.markReconcileVerified(accountID, asset)
 		return nil
 	}
 
@@ -447,6 +524,10 @@ func (s *TradeServer) reconcileOrderBalance(ctx context.Context, accountID, symb
 		return nil
 	}
 
+	// A real correction is about to be applied — drop any cached "recently
+	// verified" entry so the next order re-checks from scratch rather than
+	// trusting a TTL window that predates whatever caused this drift.
+	s.invalidateReconcileVerified(accountID, asset)
 	if delta.Sign() > 0 {
 		return s.Engine.Credit(ctx, accountID, asset, delta.FloatString(18))
 	}

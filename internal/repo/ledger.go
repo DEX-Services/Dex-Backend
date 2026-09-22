@@ -147,13 +147,16 @@ func (r *LedgerRepo) lockBalance(ctx context.Context, tx pgx.Tx, userID string) 
 }
 
 func (r *LedgerRepo) lockBalances(ctx context.Context, tx pgx.Tx, userIDs []string) error {
-	for _, userID := range userIDs {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO user_balances (user_id)
-			VALUES ($1)
-			ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
-			return err
-		}
+	// One statement for every user_id instead of a per-user round trip — see
+	// PERFORMANCE-CODE-REVIEW-FINDINGS.md item #7. unnest($1) expands the
+	// text[] param into one row per user_id, so this is exactly equivalent
+	// to the old loop's N separate "INSERT ... VALUES ($1) ON CONFLICT DO
+	// NOTHING" statements, just issued as a single round trip to Postgres.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_balances (user_id)
+		SELECT unnest($1::text[])
+		ON CONFLICT (user_id) DO NOTHING`, userIDs); err != nil {
+		return err
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT user_id FROM user_balances
