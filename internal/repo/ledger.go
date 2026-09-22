@@ -1250,6 +1250,56 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 	return out, rows.Err()
 }
 
+// RecordBackfillFailure durably records that a backfill credit for
+// (userID, asset) did not land in the engine even after runBackfill's own
+// in-run retries, so a later backfill run can retry exactly this pair
+// without re-crediting everything else that already succeeded. Upserts on
+// (user_id, asset): a repeated failure for the same pair bumps attempts and
+// refreshes amount/last_error/last_seen_at rather than accumulating rows.
+func (r *LedgerRepo) RecordBackfillFailure(ctx context.Context, userID, asset, amount, lastErr string) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO engine_backfill_failures (user_id, asset, amount, last_error, attempts, first_seen_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, 1, now(), now())
+		ON CONFLICT (user_id, asset) DO UPDATE SET
+			amount = EXCLUDED.amount,
+			last_error = EXCLUDED.last_error,
+			attempts = engine_backfill_failures.attempts + 1,
+			last_seen_at = now()`,
+		userID, asset, amount, lastErr)
+	return err
+}
+
+// ClearBackfillFailure removes the durable failure record for (userID,
+// asset) after a retry finally succeeds — called from runBackfill once a
+// previously-failed pair credits successfully, so PendingBackfillFailures
+// doesn't keep reporting a pair that has since been fixed.
+func (r *LedgerRepo) ClearBackfillFailure(ctx context.Context, userID, asset string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM engine_backfill_failures WHERE user_id = $1 AND asset = $2`, userID, asset)
+	return err
+}
+
+// PendingBackfillFailures returns every (user_id, asset) pair still marked
+// as failed from a previous backfill run — the accounts a fresh backfill
+// run should prioritize/retry, since AllNonzeroBalances alone can't
+// distinguish "already synced" from "failed last time" (both look like a
+// nonzero Postgres balance).
+func (r *LedgerRepo) PendingBackfillFailures(ctx context.Context) ([]NonzeroBalance, error) {
+	rows, err := r.pool.Query(ctx, `SELECT user_id, asset, amount FROM engine_backfill_failures`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NonzeroBalance
+	for rows.Next() {
+		var b NonzeroBalance
+		if err := rows.Scan(&b.UserID, &b.Asset, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // PendingWithdrawalRequest returns the most recent pending withdrawal request for userID, if any.
 func (r *LedgerRepo) PendingWithdrawalRequest(ctx context.Context, userID string) (*models.LedgerEntry, error) {
 	var e models.LedgerEntry

@@ -102,6 +102,112 @@ func TestClient_Unreachable_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestClient_Credit_RetriesOn429AndEventuallySucceeds is a regression test
+// for a live incident: runBackfill fired Credit in a tight, unpaced loop
+// over every nonzero balance, blowing straight through the engine's per-IP
+// rate limiter (40 req/sec sustained, burst 80) — every single credit in
+// the run failed with status 429, and Credit made no attempt to retry it,
+// so backfill "succeeded" for zero users after a restart. Credit must now
+// retry a 429 a few times before giving up.
+func TestClient_Credit_RetriesOn429AndEventuallySucceeds(t *testing.T) {
+	var attempts int
+	var gotRequestIDs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body syncReq
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotRequestIDs = append(gotRequestIDs, body.RequestID)
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := &Client{baseURL: srv.URL, secret: "s", http: srv.Client()}
+	if err := c.Credit(context.Background(), "u1", "USDC", "10"); err != nil {
+		t.Fatalf("Credit should have succeeded after retries, got %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (two 429s then a success)", attempts)
+	}
+	for i, id := range gotRequestIDs {
+		if id != gotRequestIDs[0] {
+			t.Fatalf("attempt %d used a different requestId (%q) than attempt 0 (%q) — retries of the same call must reuse the same id for the engine's dedup to work", i, id, gotRequestIDs[0])
+		}
+	}
+}
+
+// TestClient_Credit_GivesUpAfterRepeated429s confirms the retry is bounded,
+// not infinite — a sustained rate-limit condition must eventually surface
+// as an error to the caller (so runBackfill can durably record it) rather
+// than hanging or looping forever.
+func TestClient_Credit_GivesUpAfterRepeated429s(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := &Client{baseURL: srv.URL, secret: "s", http: srv.Client()}
+	err := c.Credit(context.Background(), "u1", "USDC", "10")
+	if err == nil {
+		t.Fatal("expected an error after exhausting retries against a sustained 429, got nil")
+	}
+	if attempts != callInternalRetryAttempts {
+		t.Fatalf("attempts = %d, want exactly %d (callInternalRetryAttempts)", attempts, callInternalRetryAttempts)
+	}
+}
+
+// TestClient_Credit_DoesNotRetryNonRetryableStatus confirms a genuine
+// client error (e.g. 409 insufficient-balance-shaped conflict) fails fast
+// on the first attempt instead of wasting callInternalRetryAttempts'
+// worth of delay retrying a request that will never succeed as-is.
+func TestClient_Credit_DoesNotRetryNonRetryableStatus(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer srv.Close()
+
+	c := &Client{baseURL: srv.URL, secret: "s", http: srv.Client()}
+	if err := c.Credit(context.Background(), "u1", "USDC", "10"); err == nil {
+		t.Fatal("expected an error for a 409 response, got nil")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want exactly 1 (a non-retryable status must not be retried)", attempts)
+	}
+}
+
+// TestStatusError_Retryable pins down exactly which statuses Credit/Debit
+// will retry — 429 and 5xx, nothing else — independent of the HTTP
+// round-trip, so this classification stays correct even if callWithRetry's
+// wiring changes.
+func TestStatusError_Retryable(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusOK, false}, // never actually constructed for 200, but pins the boundary
+		{http.StatusBadRequest, false},
+		{http.StatusForbidden, false},
+		{http.StatusConflict, false},
+		{http.StatusTooManyRequests, true},
+		{http.StatusInternalServerError, true},
+		{http.StatusBadGateway, true},
+		{http.StatusServiceUnavailable, true},
+	}
+	for _, tc := range cases {
+		e := &StatusError{StatusCode: tc.status}
+		if got := e.Retryable(); got != tc.want {
+			t.Errorf("StatusError{%d}.Retryable() = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}
+
 func TestAsync_RunsFnWithoutBlockingCaller(t *testing.T) {
 	done := make(chan struct{})
 	start := time.Now()

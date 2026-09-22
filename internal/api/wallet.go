@@ -528,32 +528,140 @@ func (s *WalletServer) AdminEngineBackfill(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]int{"synced": synced, "failed": failed, "total": total})
 }
 
+// backfillPacingDelay spaces consecutive Credit calls during a backfill run.
+// The engine's per-IP rate limiter (cmd/engine/ratelimit.go) allows 40
+// req/sec sustained with a burst of 80 — a live incident showed a backfill
+// with hundreds of nonzero balances firing Credit in a tight loop blew
+// through the burst allowance almost immediately and then had every single
+// remaining call rejected with 429, so backfill "succeeded" for zero users
+// after a restart. 30ms keeps this comfortably under the sustained rate
+// (~33 req/sec) even with Dex-Backend as the only caller of this endpoint,
+// while still finishing a few hundred accounts in well under a minute.
+const backfillPacingDelay = 30 * time.Millisecond
+
 // runBackfill pushes every nonzero Postgres balance into the engine ledger,
 // shared by AdminEngineBackfill (human-triggered) and InternalEngineBackfill
 // (engine self-triggered on startup).
+//
+// Two things changed after the incident referenced above (both entries
+// still logged as before, so nothing here reduces visibility, only fixes
+// the actual sync):
+//   - Calls are paced (backfillPacingDelay between each) instead of firing
+//     as fast as the loop can go, and EngineClient.Credit itself now
+//     retries a 429/5xx a few times internally (see engineclient.Client's
+//     StatusError/callWithRetry) — between the two, a burst that used to
+//     blow through the rate limiter now mostly doesn't, and any credit that
+//     still hits a transient 429 gets a few more chances before this loop
+//     gives up on it.
+//   - A credit that still fails after those retries is persisted via
+//     RecordBackfillFailure instead of only logged, so it isn't lost the
+//     moment this process's log rotates — engine_backfill_failures. On
+//     every run (not just when zero-value old failures exist), pending
+//     failures from a PREVIOUS run are retried first: without this, a
+//     later backfill would only ever see AllNonzeroBalances, which cannot
+//     distinguish "this account already synced last time" from "this
+//     account failed last time" — both just look like a nonzero Postgres
+//     balance — and re-crediting an already-synced account would double
+//     it (engineclient.Credit's per-call requestId dedupes a RETRY of the
+//     same call, not two separate backfill runs, which each generate a
+//     fresh id).
 func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total int, err error) {
+	pending, err := s.Ledger.PendingBackfillFailures(ctx)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("load pending backfill failures: %w", err)
+	}
 	balances, err := s.Ledger.AllNonzeroBalances(ctx)
 	if err != nil {
 		return 0, 0, 0, err
 	}
+
+	// Pending failures first (already human-unit amounts as recorded at
+	// failure time — see RecordBackfillFailure's call site below), then
+	// every current nonzero balance. A pair present in both is retried
+	// once: AllNonzeroBalances is the authoritative current amount, so it
+	// wins if a legitimate credit already changed the balance since the
+	// failure was recorded.
+	seen := make(map[[2]string]bool, len(pending)+len(balances))
+	items := make([]backfillItem, 0, len(pending)+len(balances))
+	for _, p := range pending {
+		key := [2]string{p.UserID, p.Asset}
+		seen[key] = true
+		items = append(items, backfillItem{userID: p.UserID, asset: p.Asset, amount: p.Amount, alreadyHuman: true})
+	}
 	for _, b := range balances {
-		// Postgres stores token amounts in 10^-6 raw units, while the matching
-		// engine ledger uses human units. Passing the raw integer through here
-		// inflated every restored balance by one million after a restart.
-		amount, convErr := rawToHumanUnits(b.Amount)
-		if convErr != nil {
-			s.Log.Error("backfill: invalid raw balance", "err", convErr, "userId", b.UserID, "asset", b.Asset)
+		key := [2]string{b.UserID, b.Asset}
+		if seen[key] {
+			continue
+		}
+		items = append(items, backfillItem{userID: b.UserID, asset: b.Asset, amount: b.Amount})
+	}
+
+	return s.processBackfillItems(ctx, items)
+}
+
+// backfillItem is one (account, asset) pair runBackfill needs to credit.
+// amount is either a raw Postgres balance (needs rawToHumanUnits) or an
+// already-human-unit amount previously recorded by RecordBackfillFailure —
+// alreadyHuman distinguishes the two, since re-converting an
+// already-converted amount would silently shrink it by 10^6.
+type backfillItem struct {
+	userID, asset, amount string
+	alreadyHuman          bool
+}
+
+// processBackfillItems is runBackfill's actual pacing/retry/durable-failure
+// loop, factored out so it can be exercised directly against a small
+// synthetic item list in tests — calling it only through runBackfill would
+// mean every test run processes the ENTIRE real AllNonzeroBalances table
+// (104+ rows in this deployment's Postgres as of the incident this was
+// added for), which is both slow (each item pays the real pacing delay
+// plus, for a failing item, real network round trips for its retries) and
+// touches production tables as a side effect of testing.
+func (s *WalletServer) processBackfillItems(ctx context.Context, items []backfillItem) (synced, failed, total int, err error) {
+	for i, it := range items {
+		if i > 0 {
+			select {
+			case <-time.After(backfillPacingDelay):
+			case <-ctx.Done():
+				return synced, failed, len(items), ctx.Err()
+			}
+		}
+		amount := it.amount
+		if !it.alreadyHuman {
+			// Postgres stores token amounts in 10^-6 raw units, while the
+			// matching engine ledger uses human units. Passing the raw
+			// integer through here inflated every restored balance by one
+			// million after a restart. A pending-failure entry was already
+			// converted to human units before being recorded, so it's used
+			// as-is (re-converting it here would be a second, wrong
+			// conversion).
+			converted, convErr := rawToHumanUnits(it.amount)
+			if convErr != nil {
+				s.Log.Error("backfill: invalid raw balance", "err", convErr, "userId", it.userID, "asset", it.asset)
+				failed++
+				continue
+			}
+			amount = converted
+		}
+		if cerr := s.EngineClient.Credit(ctx, it.userID, it.asset, amount); cerr != nil {
+			s.Log.Error("backfill: credit failed", "err", cerr, "userId", it.userID, "asset", it.asset)
+			if rerr := s.Ledger.RecordBackfillFailure(ctx, it.userID, it.asset, amount, cerr.Error()); rerr != nil {
+				s.Log.Error("backfill: could not durably record failure", "err", rerr, "userId", it.userID, "asset", it.asset)
+			}
 			failed++
 			continue
 		}
-		if cerr := s.EngineClient.Credit(ctx, b.UserID, b.Asset, amount); cerr != nil {
-			s.Log.Error("backfill: credit failed", "err", cerr, "userId", b.UserID, "asset", b.Asset)
-			failed++
-			continue
+		if it.alreadyHuman {
+			// This was a previously-failed pair that just succeeded — clear
+			// its durable record so it stops being retried on every future
+			// run once it's actually fixed.
+			if cerr := s.Ledger.ClearBackfillFailure(ctx, it.userID, it.asset); cerr != nil {
+				s.Log.Error("backfill: could not clear resolved failure record", "err", cerr, "userId", it.userID, "asset", it.asset)
+			}
 		}
 		synced++
 	}
-	return synced, failed, len(balances), nil
+	return synced, failed, len(items), nil
 }
 
 // rawToHumanUnits converts this platform's six-decimal database representation

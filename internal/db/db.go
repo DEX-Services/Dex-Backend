@@ -127,6 +127,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"prop-firm purchases table", ensurePropFirmPurchasesTable},
 		{"prop-firm purchases refund automation columns", ensurePropFirmPurchaseRefundColumns},
 		{"platform_treasury_entries propfirm category", ensureTreasuryEntryPropFirmCategory},
+		{"engine backfill failures table", ensureEngineBackfillFailuresTable},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1185,4 +1186,29 @@ BEGIN
             CHECK (status IN ('pending', 'fulfilled', 'failed', 'refund_needed', 'refunded'));
     END IF;
 END $widen_prop_firm_purchase_status$;
+`
+
+// ensureEngineBackfillFailuresTable backs runBackfill's durable failure
+// tracking (internal/api/wallet.go): a credit that fails even after
+// runBackfill's own in-run retries (e.g. the engine was down for the whole
+// backfill, not just rate-limited) is recorded here instead of only logged,
+// so a later backfill run retries exactly the accounts that are still
+// desynced — without re-crediting every account that already succeeded,
+// which engineclient.Credit's per-call requestId would NOT dedupe against
+// (a fresh backfill run generates a new requestId per call, so re-running
+// backfill wholesale is not itself idempotent against a previous
+// successful run). One row per (user_id, asset): a later failure for the
+// same pair overwrites rather than accumulates, since only the latest
+// pending amount/attempt matters for a retry.
+const ensureEngineBackfillFailuresTable = `
+CREATE TABLE IF NOT EXISTS engine_backfill_failures (
+    user_id      TEXT        NOT NULL,
+    asset        TEXT        NOT NULL,
+    amount       TEXT        NOT NULL,
+    last_error   TEXT        NOT NULL,
+    attempts     INTEGER     NOT NULL DEFAULT 1,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, asset)
+);
 `

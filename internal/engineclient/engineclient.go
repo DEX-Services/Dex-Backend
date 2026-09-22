@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -147,18 +148,82 @@ type syncReq struct {
 	RequestID string `json:"requestId"`
 }
 
+// StatusError wraps a non-200 HTTP response from the engine so callers can
+// distinguish a retryable rate-limit response from a genuine failure
+// (a bad request, an auth error, engine unreachable) without parsing the
+// error string. Added after a live incident: runBackfill's tight,
+// unpaced loop over every nonzero balance blew straight through the
+// engine's per-IP rate limiter (cmd/engine/ratelimit.go, 40 req/sec
+// sustained / burst 80) — every single credit in the run failed with
+// status 429, and the failure was indistinguishable from a real error by
+// the caller, so nothing retried it. See StatusError.Retryable.
+type StatusError struct {
+	StatusCode int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("engineclient sync: status %d", e.StatusCode)
+}
+
+// Retryable reports whether this status is worth retrying automatically:
+// 429 (rate-limited — the request itself was fine, just throttled) and 5xx
+// (transient server-side failure) are; a 4xx like 400/403/409 reflects a
+// genuinely bad or conflicting request that retrying verbatim would only
+// repeat.
+func (e *StatusError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
 // Credit tells the engine to add amount to accountID's asset balance. A
 // fresh request ID is generated per call, so calling this directly (outside
 // Async) always dedup-registers as a distinct operation — as intended for a
 // genuinely new credit. For a call that may be retried, see CreditAsync.
+// Automatically retries a few times on a retryable StatusError (429/5xx) —
+// see StatusError's doc comment for the incident this closes — reusing the
+// SAME request ID across attempts so the engine's own dedup treats them as
+// one logical call, exactly like Async's retry loop does.
 func (c *Client) Credit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "credit", uuid.NewString())
+	return c.callWithRetry(ctx, accountID, asset, amount, "credit", uuid.NewString())
 }
 
 // Debit tells the engine to subtract amount from accountID's asset balance.
-// See Credit's doc comment on request IDs and DebitAsync.
+// See Credit's doc comment on request IDs, retry behavior, and DebitAsync.
 func (c *Client) Debit(ctx context.Context, accountID, asset, amount string) error {
-	return c.call(ctx, accountID, asset, amount, "debit", uuid.NewString())
+	return c.callWithRetry(ctx, accountID, asset, amount, "debit", uuid.NewString())
+}
+
+// callInternalRetryAttempts/Delay bound Credit/Debit's own built-in retry
+// for a retryable status (429/5xx), independent of and in addition to the
+// separate Async wrapper's retry loop (Async retries ANY error, including
+// a non-retryable one, on a longer 2s cadence for background/fire-and-
+// forget calls; this one is specifically for a synchronous caller like
+// runBackfill that needs a prompt, bounded wait before giving up on one
+// item and moving to the next).
+const (
+	callInternalRetryAttempts = 3
+	callInternalRetryDelay    = 250 * time.Millisecond
+)
+
+func (c *Client) callWithRetry(ctx context.Context, accountID, asset, amount, direction, requestID string) error {
+	var err error
+	for attempt := 0; attempt < callInternalRetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(callInternalRetryDelay * time.Duration(attempt)):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		err = c.call(ctx, accountID, asset, amount, direction, requestID)
+		if err == nil {
+			return nil
+		}
+		var statusErr *StatusError
+		if !errors.As(err, &statusErr) || !statusErr.Retryable() {
+			return err
+		}
+	}
+	return err
 }
 
 func (c *Client) call(ctx context.Context, accountID, asset, amount, direction, requestID string) error {
@@ -182,7 +247,7 @@ func (c *Client) call(ctx context.Context, accountID, asset, amount, direction, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("engineclient sync: status %d", resp.StatusCode)
+		return &StatusError{StatusCode: resp.StatusCode}
 	}
 	return nil
 }
