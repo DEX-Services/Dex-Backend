@@ -128,6 +128,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"prop-firm purchases refund automation columns", ensurePropFirmPurchaseRefundColumns},
 		{"platform_treasury_entries propfirm category", ensureTreasuryEntryPropFirmCategory},
 		{"engine backfill failures table", ensureEngineBackfillFailuresTable},
+		{"swap pool balances tables", ensureSwapPoolTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1211,4 +1212,41 @@ CREATE TABLE IF NOT EXISTS engine_backfill_failures (
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, asset)
 );
+`
+
+// ensureSwapPoolTables backs the swappable/reserve split for USDT/USDC<->
+// BI2XUSD swaps: every USDT/USDC -> BI2XUSD swap splits the incoming raw
+// stablecoin amount 60% into swappable_raw (available to pay out on the
+// reverse BI2XUSD -> USDT/USDC direction) and 40% into reserve_raw (a
+// one-way admin-only accumulation — admin can top up swappable directly,
+// but nothing in this codebase moves reserve_raw back into swappable_raw,
+// by design). Both columns are pure bookkeeping: the underlying funds stay
+// in the same platform wallet/custody as every other balance in
+// user_balances, this table only tracks how much of it is earmarked for
+// swap-out liquidity right now. Two independent pools (USDT, USDC), never
+// combined. swap_pool_entries is the audit trail, mirroring
+// platform_treasury_entries' kind/amount/account_id/created_at shape (see
+// ensureReferralTables below) — every split-credit, admin top-up, and
+// user-triggered debit is recorded here so "why is swappable_raw at X"
+// always has a real answer, not just an opaque running total.
+const ensureSwapPoolTables = `
+CREATE TABLE IF NOT EXISTS swap_pool_balances (
+    asset          TEXT PRIMARY KEY,
+    swappable_raw  NUMERIC(38,0) NOT NULL DEFAULT 0,
+    reserve_raw    NUMERIC(38,0) NOT NULL DEFAULT 0,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO swap_pool_balances (asset) VALUES ('USDT') ON CONFLICT (asset) DO NOTHING;
+INSERT INTO swap_pool_balances (asset) VALUES ('USDC') ON CONFLICT (asset) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS swap_pool_entries (
+    id                  BIGSERIAL PRIMARY KEY,
+    kind                TEXT NOT NULL CHECK (kind IN ('split_credit', 'admin_topup', 'user_debit')),
+    asset               TEXT NOT NULL,
+    swappable_delta_raw NUMERIC(38,0) NOT NULL DEFAULT 0,
+    reserve_delta_raw   NUMERIC(38,0) NOT NULL DEFAULT 0,
+    account_id          TEXT REFERENCES users(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_swap_pool_entries_asset ON swap_pool_entries (asset, created_at DESC);
 `

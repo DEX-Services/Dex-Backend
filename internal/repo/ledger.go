@@ -764,6 +764,20 @@ func (r *LedgerRepo) TransferBalance(ctx context.Context, senderID, recipientID,
 	return tx.Commit(ctx)
 }
 
+// SwapBalance moves sourceAmountRaw of sourceAsset out of userID's balance
+// and credits destinationAmountRaw of destinationAsset in, atomically. When
+// one side of the swap is BI2XUSD and the other is USDT/USDC, this also
+// applies the swappable/reserve pool bookkeeping (see swappool.go) inside
+// the SAME transaction, so a swap's user-balance movement and its
+// platform-wide pool effect always commit or roll back together:
+//   - USDT/USDC -> BI2XUSD: splits sourceAmountRaw 60/40 into that asset's
+//     swappable/reserve pool (CreditSwapPoolSplit).
+//   - BI2XUSD -> USDT/USDC: caps the payout against that asset's swappable
+//     pool (DebitSwapPoolCapped, using destinationAmountRaw — the NET
+//     amount the user actually receives, matching what the pool needs to
+//     cover). If the pool can't cover it, this returns ErrSwapPoolInsufficient
+//     and the entire transaction rolls back, including the user-side
+//     debit/credit above — the caller never sees a partially-applied swap.
 func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourceAmountRaw, destinationAsset, destinationAmountRaw string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -775,6 +789,15 @@ func (r *LedgerRepo) SwapBalance(ctx context.Context, userID, sourceAsset, sourc
 	}
 	if err := r.creditBalanceTx(ctx, tx, userID, destinationAsset, destinationAmountRaw); err != nil {
 		return err
+	}
+	if destinationAsset == "BI2XUSD" && swapPoolAssets[sourceAsset] {
+		if err := r.CreditSwapPoolSplit(ctx, tx, sourceAsset, sourceAmountRaw, userID); err != nil {
+			return err
+		}
+	} else if sourceAsset == "BI2XUSD" && swapPoolAssets[destinationAsset] {
+		if err := r.DebitSwapPoolCapped(ctx, tx, destinationAsset, destinationAmountRaw, userID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

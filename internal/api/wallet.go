@@ -338,6 +338,42 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// SwapPoolMax: GET /wallet/swap/max?asset=USDT|USDC
+// Returns the amount of asset currently available in that asset's swappable
+// pool — the exact figure a BI2XUSD -> USDT/USDC swap will be capped at
+// right now (see repo.LedgerRepo.DebitSwapPoolCapped, which is the actual
+// source of truth this mirrors). Any authenticated user can call this (same
+// auth level as Swap itself) — it's a plain read of platform-wide state, not
+// account-specific, so there's no reason to restrict it further. The
+// frontend calls this before a user confirms a BI2XUSD -> stablecoin swap so
+// the cap is visible upfront rather than only surfacing as a submit-time
+// rejection; the server-side cap in SwapBalance is still the real
+// enforcement point since this figure can go stale between the read and the
+// actual swap (a concurrent swap-out or a fresh admin top-up can both move
+// it in between).
+func (s *WalletServer) SwapPoolMax(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
+	if asset != "USDT" && asset != "USDC" {
+		writeError(w, http.StatusBadRequest, "asset must be USDT or USDC")
+		return
+	}
+	swappableRaw, _, err := s.Ledger.SwapPoolBalance(r.Context(), asset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load swap pool balance: "+err.Error())
+		return
+	}
+	maxSwappable, err := rawToHumanUnits(swappableRaw)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "convert swap pool balance: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"asset": asset, "maxSwappable": maxSwappable})
+}
+
 type adminApproveBody struct {
 	RequestID string `json:"requestId"`
 	Action    string `json:"action"`
