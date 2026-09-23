@@ -141,3 +141,83 @@ func TestBI2XChartProxy_RejectsNonGET(t *testing.T) {
 		t.Fatalf("status = %d, want 405 for POST", rec.Code)
 	}
 }
+
+// The upstream is observed to fail transiently (5xx/429) and then recover a
+// moment later — the proxy must retry rather than surface the first
+// transient failure straight to the browser.
+func TestBI2XChartProxy_RetriesTransientErrorThenSucceeds(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls < 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"s":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	handler := newBI2XChartProxy(upstream.URL, testLogger())
+	req := httptest.NewRequest(http.MethodGet, "/bi2x-chart/history?symbol=BI2X&resolution=1&to=1&countback=1", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retry recovers", rec.Code)
+	}
+	if rec.Body.String() != `{"s":"ok"}` {
+		t.Errorf("body = %q, want the successful retry's body", rec.Body.String())
+	}
+	if calls < 2 {
+		t.Errorf("calls = %d, want at least 2 (one 429 then a success)", calls)
+	}
+}
+
+// A successful response is cached briefly: a second identical request
+// within the TTL must not hit the upstream again.
+func TestBI2XChartProxy_CachesSuccessfulResponse(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"s":"ok","call":1}`))
+	}))
+	defer upstream.Close()
+
+	handler := newBI2XChartProxy(upstream.URL, testLogger())
+	url := "/bi2x-chart/history?symbol=BI2X&resolution=1&to=1&countback=1"
+
+	rec1 := httptest.NewRecorder()
+	handler(rec1, httptest.NewRequest(http.MethodGet, url, nil))
+	rec2 := httptest.NewRecorder()
+	handler(rec2, httptest.NewRequest(http.MethodGet, url, nil))
+
+	if calls != 1 {
+		t.Errorf("upstream calls = %d, want exactly 1 (second request served from cache)", calls)
+	}
+	if rec2.Code != http.StatusOK || rec2.Body.String() != rec1.Body.String() {
+		t.Errorf("cached response mismatch: rec1=%q rec2=%q", rec1.Body.String(), rec2.Body.String())
+	}
+}
+
+// A 5xx/429 response must NOT be cached — caching an error would keep
+// serving it to every viewer of the chart for the whole TTL instead of
+// letting the next request retry against a possibly-recovered upstream.
+func TestBI2XChartProxy_DoesNotCacheErrorResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("down"))
+	}))
+	defer upstream.Close()
+
+	handler := newBI2XChartProxy(upstream.URL, testLogger())
+	url := "/bi2x-chart/history?symbol=BI2X&resolution=1&to=1&countback=1"
+	rec := httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodGet, url, nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 passed through after exhausting retries", rec.Code)
+	}
+}
