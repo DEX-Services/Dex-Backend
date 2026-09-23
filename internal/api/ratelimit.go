@@ -66,7 +66,8 @@ func (s *limiterStore) reapLoop() {
 
 // RateLimiter wraps next with a per-client-IP token-bucket limiter. general
 // governs most routes; strict (tighter) is applied additionally to the
-// path prefixes in strictPaths — currently /auth/ and /admin/login, the
+// path prefixes in strictPaths — currently /auth/nonce, /auth/login, and
+// /admin/login, the
 // endpoints an attacker would flood to exhaust the nonce cache or brute-force
 // a password. A request that exceeds either bucket gets 429 with a
 // Retry-After hint instead of reaching the handler.
@@ -136,7 +137,7 @@ func MaxBodyLimit(next http.Handler) http.Handler {
 	})
 }
 
-var strictPathPrefixes = []string{"/auth/", "/admin/login"}
+var strictPathPrefixes = []string{"/auth/nonce", "/auth/login", "/admin/login"}
 
 func isStrictPath(path string) bool {
 	for _, p := range strictPathPrefixes {

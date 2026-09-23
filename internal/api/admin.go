@@ -338,9 +338,9 @@ func (s *AdminServer) AdjustUserBalance(w http.ResponseWriter, r *http.Request) 
 	// normal wallet API) is already correct; the engine will pick it up on
 	// its next restart backfill if this fails.
 	if s.EngineClient != nil && s.EngineClient.Enabled() {
-		engErr := s.EngineClient.Credit(r.Context(), req.UserID, req.Asset, raw)
+		engErr := s.EngineClient.Credit(r.Context(), req.UserID, req.Asset, req.Amount)
 		if req.Direction == "debit" {
-			engErr = s.EngineClient.Debit(r.Context(), req.UserID, req.Asset, raw)
+			engErr = s.EngineClient.Debit(r.Context(), req.UserID, req.Asset, req.Amount)
 		}
 		if engErr != nil {
 			s.Log.Warn("admin balance adjust: engine ledger sync failed", "userId", req.UserID, "asset", req.Asset, "err", engErr)
