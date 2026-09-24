@@ -29,7 +29,11 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if connString == "" {
 		t.Skip("POSTGRES_SERVICE_URI not set, skipping live-Postgres integration test")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// See the identical comment on internal/repo/ledger_test.go's testPool:
+	// the full migration sequence genuinely takes ~12s against the real
+	// Aiven instance (timed directly), so 10s here was too tight even
+	// before this file's own migration additions.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool, err := db.New(ctx, connString)
 	if err != nil {

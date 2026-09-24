@@ -316,6 +316,36 @@ func (s *WalletServer) Swap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// Mirror both legs into the engine's in-memory ledger, same as every
+	// other balance-adjusting path (see AdjustUserBalance in admin.go).
+	// Before this, SwapBalance above was PURE Postgres — it never touched
+	// the engine at all, for either leg, on every single swap. Since a
+	// swap's own reconcileOrderBalance safety cap only auto-corrects up to
+	// 2% drift (see trade.go), a full swap amount missing from the engine
+	// (a 100% delta) could never self-heal there; the account was stuck
+	// showing "available=0" in the engine despite a fully correct Postgres
+	// balance until an admin happened to run a full backfill. Best-effort
+	// here (logged, not fatal to the response): Postgres is still the
+	// source of truth, and a failure here now falls back to the SAME
+	// backfill/reconcile safety net that already exists for every other
+	// balance-adjusting path — this fix closes the common case at its
+	// source instead of only ever relying on that fallback.
+	if s.EngineClient != nil && s.EngineClient.Enabled() {
+		sourceHuman, err := engineclient.RawToHumanUnits(amount.String())
+		if err != nil {
+			s.Log.Error("swap: convert source amount for engine sync failed", "userId", claims.UserID, "asset", source, "err", err)
+		} else if engErr := s.EngineClient.Debit(r.Context(), claims.UserID, source, sourceHuman); engErr != nil {
+			s.Log.Warn("swap: engine ledger debit failed", "userId", claims.UserID, "asset", source, "err", engErr)
+		}
+		destHuman, err := engineclient.RawToHumanUnits(credited.String())
+		if err != nil {
+			s.Log.Error("swap: convert destination amount for engine sync failed", "userId", claims.UserID, "asset", destination, "err", err)
+		} else if engErr := s.EngineClient.Credit(r.Context(), claims.UserID, destination, destHuman); engErr != nil {
+			s.Log.Warn("swap: engine ledger credit failed", "userId", claims.UserID, "asset", destination, "err", engErr)
+		}
+	}
+
 	if feeAmount != nil && feeAmount.Sign() > 0 && s.Referrals != nil {
 		// Swap fees go to the treasury in full — no referral/affiliate split
 		// (only spot/futures trading fees split; see
