@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +21,16 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if connString == "" {
 		t.Skip("POSTGRES_SERVICE_URI not set, skipping live-Postgres integration test")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The full migration sequence run inside db.New (35+ statements against
+	// the real Aiven instance, ~1-2s each) genuinely takes ~12s end to end —
+	// confirmed directly (timed at 12.09s) after this budget started
+	// intermittently timing out test runs mid-migration with no actual lock
+	// contention (pg_stat_activity showed only one idle, unrelated
+	// connection at the time). 10s was too tight even before this session's
+	// swap-pool migration added two more statements to the list; 30s leaves
+	// real headroom for the list to keep growing and for ordinary network
+	// jitter against a real, non-local Postgres instance.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool, err := db.New(ctx, connString)
 	if err != nil {
@@ -290,5 +300,124 @@ func TestSettleSpotTrade_InsufficientLockedRejectsWholeTrade(t *testing.T) {
 	}
 	if sellerBals["BI2X"] != "50" || sellerLocked["BI2X"] != "10" {
 		t.Fatalf("seller balances changed despite failed settle: available=%s locked=%s", sellerBals["BI2X"], sellerLocked["BI2X"])
+	}
+}
+
+// newUnprovisionedDeskWallet returns a market-maker desk wallet id with no
+// users row, cleaning up whatever the call under test creates. This is the
+// exact state a desk can be left in after a database restore/clear or a
+// cleanup pass, and the state that used to make desk enable fail: the ledger's
+// user_balances INSERT is a create-on-demand, but user_balances.user_id has a
+// FOREIGN KEY to users(id), so without the users row Postgres raised
+//
+//	insert or update on table "user_balances" violates foreign key
+//	constraint "user_balances_reordered_user_id_fkey" (SQLSTATE 23503)
+//
+// and every balance call — release-locks, replace-locks, lock — returned that
+// raw driver error instead of doing its job.
+func newUnprovisionedDeskWallet(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	wallet := fmt.Sprintf("mm:TEST%d:spot", time.Now().UnixNano())
+	if _, err := pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, wallet); err != nil {
+		t.Fatalf("clear desk user: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM user_balances WHERE user_id = $1`, wallet)
+		pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, wallet)
+	})
+	return wallet
+}
+
+// TestReleaseLocksFor_UnprovisionedDeskWalletSucceeds covers the desk-enable
+// path: bots' mm.Service.recreditDesk releases a desk's stale quote locks
+// before starting it, and a desk can reach that point with no users row.
+func TestReleaseLocksFor_UnprovisionedDeskWalletSucceeds(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	wallet := newUnprovisionedDeskWallet(t, pool)
+	ctx := context.Background()
+
+	if err := ledger.ReleaseLocksFor(ctx, wallet, "BI2XUSD"); err != nil {
+		t.Fatalf("ReleaseLocksFor on an unprovisioned desk wallet: %v", err)
+	}
+	// The call must leave a usable account behind, not just avoid the error.
+	bal, err := ledger.BalanceFor(ctx, wallet, "BI2XUSD")
+	if err != nil {
+		t.Fatalf("BalanceFor after release: %v", err)
+	}
+	if bal != "0" {
+		t.Fatalf("BI2XUSD balance = %s, want 0", bal)
+	}
+}
+
+// TestReplaceLocksFor_UnprovisionedDeskWalletFailsOnFundsNotForeignKey pins
+// the other half of the same bug: the engine's ladder replacement calls
+// replace-locks for a funded desk, and the only failure a caller should ever
+// see there is a genuine "insufficient balance", never a raw FK violation.
+func TestReplaceLocksFor_UnprovisionedDeskWalletFailsOnFundsNotForeignKey(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	wallet := newUnprovisionedDeskWallet(t, pool)
+	ctx := context.Background()
+
+	err := ledger.ReplaceLocksFor(ctx, wallet, map[string]string{"BI2XUSD": "1000"})
+	if err == nil {
+		t.Fatal("expected replace-locks to fail on an unfunded desk")
+	}
+	if !strings.Contains(err.Error(), "insufficient") {
+		t.Fatalf("replace-locks error = %v, want an insufficient-balance error (not a foreign key violation)", err)
+	}
+}
+
+// TestReplaceLocksFor_UnprovisionedDeskWalletSucceedsWhenFunded is the same
+// call with real funds behind it: it must now succeed outright.
+func TestReplaceLocksFor_UnprovisionedDeskWalletSucceedsWhenFunded(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	wallet := newUnprovisionedDeskWallet(t, pool)
+	ctx := context.Background()
+
+	if err := ledger.CreditBalance(ctx, wallet, "BI2XUSD", "5000"); err != nil {
+		t.Fatalf("credit desk wallet: %v", err)
+	}
+	if err := ledger.ReplaceLocksFor(ctx, wallet, map[string]string{"BI2XUSD": "4000"}); err != nil {
+		t.Fatalf("ReplaceLocksFor on a funded unprovisioned desk wallet: %v", err)
+	}
+	locked, err := ledger.LockedBalancesFor(ctx, wallet)
+	if err != nil {
+		t.Fatalf("locked balances: %v", err)
+	}
+	if locked["BI2XUSD"] != "4000" {
+		t.Fatalf("locked BI2XUSD = %s, want 4000", locked["BI2XUSD"])
+	}
+}
+
+// TestLockBalances_ProvisionsMultipleUserIDs covers the batched variant used
+// by spot settlement and swaps, where both sides of a trade are locked in one
+// statement and either may be a synthetic desk id.
+func TestLockBalances_ProvisionsMultipleUserIDs(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	first := newUnprovisionedDeskWallet(t, pool)
+	second := newUnprovisionedDeskWallet(t, pool)
+	ctx := context.Background()
+
+	for _, id := range []string{first, second} {
+		if err := ledger.CreditBalance(ctx, id, "BI2XUSD", "250"); err != nil {
+			t.Fatalf("credit %s: %v", id, err)
+		}
+	}
+	// SettleSpotTrade is the real caller of the batched path; it locks buyer
+	// and seller together, so a missing users row on either would abort it.
+	if err := ledger.SettleSpotTrade(ctx, first, second, "BI2X", "BI2XUSD", "1", "10", "9"); err == nil {
+		t.Fatal("expected settle to fail: neither side has a locked BI2X leg")
+	}
+	// The failure must be the business one, not an FK violation.
+	locked, err := ledger.LockedBalancesFor(ctx, first)
+	if err != nil {
+		t.Fatalf("locked balances: %v", err)
+	}
+	if locked["BI2XUSD"] != "0" {
+		t.Fatalf("locked BI2XUSD = %s, want 0 after rollback", locked["BI2XUSD"])
 	}
 }

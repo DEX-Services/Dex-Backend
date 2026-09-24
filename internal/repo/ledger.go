@@ -132,7 +132,38 @@ func (r *LedgerRepo) lockUser(ctx context.Context, tx pgx.Tx, userID string) err
 	return nil
 }
 
+// lockBalance ensures the account has a user_balances row and row-locks it for
+// the caller's transaction. Every ledger mutation funnels through here, so this
+// is the one place that has to guarantee the row exists.
+//
+// user_balances.user_id carries a foreign key to users(id) (currently named
+// user_balances_reordered_user_id_fkey — the constraint kept its name from the
+// table rebuild that reordered the asset columns). The balance INSERT below is
+// an intentional create-on-demand, but it can only ever satisfy that FK when
+// the users row already exists: otherwise Postgres raises SQLSTATE 23503 and
+// the whole ledger call fails with an opaque
+//
+//	insert or update on table "user_balances" violates foreign key
+//	constraint "user_balances_reordered_user_id_fkey"
+//
+// rather than anything actionable. That is exactly what happened to a
+// market-maker desk: bots' mm.Service.Create/Deposit provision the desk wallet
+// via /internal/user/ensure, but mm.Service.recreditDesk (called on every
+// desk enable) reached release-locks first, so a desk whose users row was
+// missing — after a DB restore/clear, or a cleanup pass — failed to start with
+// the FK error above and no way to tell why.
+//
+// Provisioning the users row here, in the same transaction, makes the balance
+// row always creatable and keeps the create-on-demand contract the rest of the
+// ledger relies on. ON CONFLICT DO NOTHING makes it a no-op for the common
+// case (a real, already-provisioned user), so this costs one extra statement
+// on the first touch of an account and nothing thereafter. wallet_type is
+// recorded as 'market-maker' only as an audit hint for an id the caller did
+// not already know about; a pre-existing row is never modified.
 func (r *LedgerRepo) lockBalance(ctx context.Context, tx pgx.Tx, userID string) error {
+	if err := ensureUsersForTx(ctx, tx, []string{userID}); err != nil {
+		return fmt.Errorf("ensure user %s: %w", userID, err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_balances (user_id)
 		VALUES ($1)
@@ -146,7 +177,28 @@ func (r *LedgerRepo) lockBalance(ctx context.Context, tx pgx.Tx, userID string) 
 	).Scan(&exists)
 }
 
+// ensureUsersForTx provisions a users row for each id in a single statement, so
+// a following user_balances INSERT cannot fail its foreign key to users(id).
+// It is the batched counterpart to the provisioning inside lockBalance, for the
+// multi-account paths (spot settlement, swaps) that lock both sides at once.
+func ensureUsersForTx(ctx context.Context, tx pgx.Tx, userIDs []string) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO users (id, wallet_address, wallet_type)
+		SELECT id, id, 'market-maker' FROM unnest($1::text[]) AS id
+		ON CONFLICT (id) DO NOTHING`, userIDs)
+	return err
+}
+
 func (r *LedgerRepo) lockBalances(ctx context.Context, tx pgx.Tx, userIDs []string) error {
+	// Same FK hazard as lockBalance: the user_balances rows below can only be
+	// auto-created once each id has a users row, and buyer/seller/sender/
+	// recipient desks are exactly the synthetic ids that may not.
+	if err := ensureUsersForTx(ctx, tx, userIDs); err != nil {
+		return err
+	}
 	// One statement for every user_id instead of a per-user round trip — see
 	// PERFORMANCE-CODE-REVIEW-FINDINGS.md item #7. unnest($1) expands the
 	// text[] param into one row per user_id, so this is exactly equivalent
