@@ -67,6 +67,7 @@ func main() {
 	engineClient := engineclient.New()
 	propFirmClient := propfirmclient.New()
 	propFirmPurchaseRepo := repo.NewPropFirmPurchaseRepo(pool)
+	partnerRepo := repo.NewPartnerRepo(pool)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -97,6 +98,24 @@ func main() {
 				return
 			case <-ticker.C:
 				api.RetryPropFirmProvisioning(ctx, propFirmPurchaseRepo, ledgerRepo, propFirmClient, slog.Default())
+			}
+		}
+	}()
+
+	// Partner profit-sharing daily split (see internal/api/partner_profit_split.go).
+	// Hourly, not a precise midnight trigger — the job itself is idempotent
+	// per UTC day via PartnerRepo.AlreadySplit, so an hourly cadence just
+	// means the split lands within an hour of the day rolling over, same
+	// tradeoff as the other ticker-driven jobs above.
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				api.RunDailyPartnerProfitSplit(ctx, partnerRepo, slog.Default())
 			}
 		}
 	}()
@@ -137,6 +156,7 @@ func main() {
 		Purchases: propFirmPurchaseRepo,
 		PropFirm:  propFirmClient,
 	}
+	partnerSrv := &api.PartnerServer{Server: srv, Partner: partnerRepo}
 	if !propFirmClient.Enabled() {
 		slog.Warn("PROPFIRM_BACKEND_URL or PROPFIRM_INTERNAL_SECRET not set, /prop-firm/purchase disabled")
 	}
@@ -227,6 +247,8 @@ func main() {
 	mux.HandleFunc("/admin/bi2x-allocation/history", adminSrv.BI2XAllocationHistory)
 	mux.HandleFunc("/admin/swap-pool", adminSrv.SwapPoolStatus)
 	mux.HandleFunc("/admin/swap-pool/topup", adminSrv.AdminTopUpSwapPool)
+	mux.HandleFunc("/partner/login", partnerSrv.Login)
+	mux.HandleFunc("/partner/profit", partnerSrv.Profit)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)

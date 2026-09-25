@@ -129,6 +129,8 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"platform_treasury_entries propfirm category", ensureTreasuryEntryPropFirmCategory},
 		{"engine backfill failures table", ensureEngineBackfillFailuresTable},
 		{"swap pool balances tables", ensureSwapPoolTables},
+		{"partner profit share tables", ensurePartnerProfitShareTables},
+		{"seed partner accounts", seedPartnerAccounts},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1249,4 +1251,62 @@ CREATE TABLE IF NOT EXISTS swap_pool_entries (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_swap_pool_entries_asset ON swap_pool_entries (asset, created_at DESC);
+`
+
+// ensurePartnerProfitShareTables backs the partner profit-sharing feature:
+// a fixed set of "partner" admin logins (distinct from the single env-var
+// owner admin — see AdminServer.Login) who can only view their own share of
+// the platform's daily profit, never the full dashboard and never a
+// withdrawal. partner_accounts stores their login credentials the same way
+// admin_profiles stores the owner's profile (bcrypt hash, not env-driven,
+// since there's more than one). partner_profit_splits is the daily,
+// idempotent record of "how much did partner X earn on day Y" — one row per
+// partner per UTC day, written once by RunDailyPartnerProfitSplit
+// (internal/api/partner_profit_split.go) and never mutated afterward, so a
+// partner's history is a fixed ledger, not a live-recomputed number that
+// could drift if fee data changes retroactively. The unique (partner_id,
+// profit_date) constraint is what makes the daily job safe to run more than
+// once for the same day (an hourly ticker checking "already split today?"
+// is the intended caller, not a precise midnight-only trigger).
+//
+// p2p_admin_wallet_entries never had a created_at index (see
+// FeeRevenueTotals's comment on why P2P is tracked separately from
+// platform_treasury_entries) — the daily split's per-day range query over
+// this table would otherwise be a full sequential scan every run.
+const ensurePartnerProfitShareTables = `
+CREATE INDEX IF NOT EXISTS idx_p2p_admin_wallet_entries_created_at ON p2p_admin_wallet_entries (created_at);
+
+CREATE TABLE IF NOT EXISTS partner_accounts (
+    login_id      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS partner_profit_splits (
+    id                BIGSERIAL PRIMARY KEY,
+    partner_id        TEXT NOT NULL REFERENCES partner_accounts(login_id),
+    profit_date       DATE NOT NULL,
+    share_raw         NUMERIC(38,0) NOT NULL,
+    source_total_raw  NUMERIC(38,0) NOT NULL,
+    partner_count     INTEGER NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (partner_id, profit_date)
+);
+CREATE INDEX IF NOT EXISTS idx_partner_profit_splits_partner ON partner_profit_splits (partner_id, profit_date DESC);
+`
+
+// seedPartnerAccounts creates the 3 initial partner logins. Bcrypt hashes
+// were generated once, out-of-band, from randomly-generated passwords
+// handed to the user directly (never logged, never stored in plaintext
+// anywhere) — this migration only ever inserts the hash, and ON CONFLICT DO
+// NOTHING means re-running it is a no-op once the rows exist, so rotating a
+// partner's password later is a separate UPDATE, not a re-run of this
+// migration.
+const seedPartnerAccounts = `
+INSERT INTO partner_accounts (login_id, password_hash, name) VALUES
+    ('partner1', '$2a$10$RGCjipw1WX07mK6G0QA6ru.OnAkOgyiPWr2Vxp.hTNRTeCopVQ/Wu', 'Partner 1'),
+    ('partner2', '$2a$10$lOhHCpxzBuwAxyaZulVqpOxmZfvMNNhPsfMCOjcfVn8oRcEpr2wbm', 'Partner 2'),
+    ('partner3', '$2a$10$RovD979ZHFfVhBwJn0XhrOf6uliF8yOIn/m.HCJUeGKuBLOVTSHSG', 'Partner 3')
+ON CONFLICT (login_id) DO NOTHING;
 `
