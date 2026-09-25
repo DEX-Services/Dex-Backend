@@ -72,10 +72,25 @@ func (r *P2PRepo) TodayPrice(ctx context.Context) (*models.P2PPrice, error) {
 	return r.PriceFor(ctx, "BI2XUSD")
 }
 
+// P2PAssets is every asset P2P supports, in the order they should list in
+// any "all assets" response (e.g. WalletBalances) — deliberately a slice,
+// not just the validP2PAssets map below, since map iteration order isn't
+// stable and a wallet-balance list reordering itself on every request would
+// be a confusing UI flicker for no reason.
+//
+// USDT and USDC are pegged 1:1 with each other and with BI2XUSD for P2P
+// purposes — a listing/order in USDT or USDC prices and settles exactly
+// like a BI2XUSD one (see p2pFeeModelBI2XUSD's settlement math, which is
+// asset-agnostic despite its BI2XUSD-specific name), just against a
+// different wallet balance column and a different admin fee wallet row.
+var P2PAssets = []string{"BI2XUSD", "USDT", "USDC"}
+
+var validP2PAssets = map[string]bool{"BI2XUSD": true, "USDT": true, "USDC": true}
+
 func normalizeP2PAsset(asset string) (string, error) {
 	asset = strings.ToUpper(strings.TrimSpace(asset))
-	if asset != "BI2XUSD" {
-		return "", fmt.Errorf("P2P asset must be BI2XUSD")
+	if !validP2PAssets[asset] {
+		return "", fmt.Errorf("P2P asset must be one of BI2XUSD, USDT, USDC")
 	}
 	return asset, nil
 }
@@ -238,8 +253,8 @@ func (r *P2PRepo) WalletBalanceForAsset(ctx context.Context, userID, asset strin
 }
 
 func (r *P2PRepo) WalletBalances(ctx context.Context, userID string) ([]models.P2PWalletBalance, error) {
-	out := make([]models.P2PWalletBalance, 0, 1)
-	for _, asset := range []string{"BI2XUSD"} {
+	out := make([]models.P2PWalletBalance, 0, len(P2PAssets))
+	for _, asset := range P2PAssets {
 		balance, err := r.WalletBalanceForAsset(ctx, userID, asset)
 		if err != nil {
 			return nil, err
@@ -554,7 +569,10 @@ const p2pListingsMaxLimit = 100
 // p2pListingsMaxLimit; offset<0 is clamped to 0. Returns the page alongside
 // the total matching row count, so the frontend can render "page N of M" /
 // disable a "next" control without a second round trip.
-func (r *P2PRepo) ListingsPage(ctx context.Context, sellerID string, activeOnly bool, limit, offset int) ([]models.P2PListing, int, error) {
+// asset, when non-empty, must already be normalizeP2PAsset-clean — callers
+// (the API handler) are responsible for validating/uppercasing it before
+// it reaches this filter, same as every other asset-taking repo function.
+func (r *P2PRepo) ListingsPage(ctx context.Context, sellerID, asset string, activeOnly bool, limit, offset int) ([]models.P2PListing, int, error) {
 	if limit <= 0 || limit > p2pListingsMaxLimit {
 		limit = p2pListingsMaxLimit
 	}
@@ -569,6 +587,10 @@ func (r *P2PRepo) ListingsPage(ctx context.Context, sellerID string, activeOnly 
 	if sellerID != "" {
 		args = append(args, sellerID)
 		whereClause += fmt.Sprintf(" AND l.seller_id=$%d", len(args))
+	}
+	if asset != "" {
+		args = append(args, asset)
+		whereClause += fmt.Sprintf(" AND l.asset=$%d", len(args))
 	}
 	if activeOnly {
 		whereClause += ` AND l.status='ACTIVE' AND l.remaining_raw>0 AND u.p2p_username IS NOT NULL`

@@ -165,7 +165,8 @@ func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 		// at one page instead of unbounded.
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-		listings, total, err := s.P2P.ListingsPage(r.Context(), "", true, limit, offset)
+		asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
+		listings, total, err := s.P2P.ListingsPage(r.Context(), "", asset, true, limit, offset)
 		if err != nil {
 			s.Log.Error("list p2p listings failed", "err", err)
 			writeError(w, http.StatusInternalServerError, "could not load listings")

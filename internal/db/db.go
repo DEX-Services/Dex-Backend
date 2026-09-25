@@ -131,6 +131,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"swap pool balances tables", ensureSwapPoolTables},
 		{"partner profit share tables", ensurePartnerProfitShareTables},
 		{"seed partner accounts", seedPartnerAccounts},
+		{"P2P multi-asset support (USDT/USDC)", ensureP2PMultiAssetSupport},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -429,12 +430,24 @@ CREATE TABLE IF NOT EXISTS p2p_admin_wallet_entries (
 -- fixed explicitly: rename the row's data first, then swap the constraint,
 -- exactly the same ordering requirement as every other asset-check rename
 -- above (data before constraint, or the ADD CONSTRAINT fails validation).
+--
+-- Widened to also allow 'USDC'/'USDT' here (not just 'BI2XUSD') so this
+-- step — which re-runs, unconditionally, on every single db.New call, not
+-- just once — stays consistent with ensureP2PMultiAssetSupport's later,
+-- final widening of the same two constraints. Before this fix, every
+-- subsequent app restart silently re-narrowed the constraint straight back
+-- to 'BI2XUSD'-only immediately after ensureP2PMultiAssetSupport had just
+-- widened it, which was harmless only until a USDT/USDC row actually
+-- existed — at that point this line made every future migration run fail
+-- outright (confirmed via TestP2PWalletBI2XUSDEscrowSuccess, which
+-- deliberately re-runs db.New a second time against an already-migrated
+-- schema, exactly the scenario this line broke).
 ALTER TABLE p2p_admin_wallet_balances DROP CONSTRAINT IF EXISTS p2p_admin_wallet_balances_asset_check;
 UPDATE p2p_admin_wallet_balances SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
-ALTER TABLE p2p_admin_wallet_balances ADD CONSTRAINT p2p_admin_wallet_balances_asset_check CHECK (asset = 'BI2XUSD');
+ALTER TABLE p2p_admin_wallet_balances ADD CONSTRAINT p2p_admin_wallet_balances_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
 ALTER TABLE p2p_admin_wallet_entries DROP CONSTRAINT IF EXISTS p2p_admin_wallet_entries_asset_check;
 UPDATE p2p_admin_wallet_entries SET asset = 'BI2XUSD' WHERE asset = 'BIUSDB';
-ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_asset_check CHECK (asset = 'BI2XUSD');
+ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
 INSERT INTO p2p_admin_wallet_balances(asset) VALUES('BI2XUSD') ON CONFLICT(asset) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS p2p_payment_accounts (
@@ -1309,4 +1322,48 @@ INSERT INTO partner_accounts (login_id, password_hash, name) VALUES
     ('partner2', '$2a$10$lOhHCpxzBuwAxyaZulVqpOxmZfvMNNhPsfMCOjcfVn8oRcEpr2wbm', 'Partner 2'),
     ('partner3', '$2a$10$RovD979ZHFfVhBwJn0XhrOf6uliF8yOIn/m.HCJUeGKuBLOVTSHSG', 'Partner 3')
 ON CONFLICT (login_id) DO NOTHING;
+`
+
+// ensureP2PMultiAssetSupport widens P2P from BI2XUSD-only to also accept
+// USDT and USDC (pegged 1:1 with BI2XUSD and each other for P2P purposes —
+// see normalizeP2PAsset in internal/repo/p2p.go). Every CHECK constraint
+// this touches already had 'USDC' in its allowlist from before P2P settled
+// exclusively on BI2XUSD (that's how "USDC" ended up as several tables'
+// DEFAULT, despite it never actually being reachable through
+// normalizeP2PAsset until now) — this migration adds 'USDT' alongside it,
+// and separately widens the two admin fee-wallet tables, which were
+// hard-locked to the single literal 'BI2XUSD' rather than an allowlist.
+//
+// The admin fee wallet gets its own row per asset (not a single converted
+// BI2XUSD total) so a USDT fee and a USDC fee are never conflated into one
+// number — same reasoning as swap_pool_balances tracking USDT/USDC as two
+// independent pools rather than combining them.
+const ensureP2PMultiAssetSupport = `
+ALTER TABLE p2p_listings DROP CONSTRAINT IF EXISTS p2p_listings_asset_check;
+ALTER TABLE p2p_listings ADD CONSTRAINT p2p_listings_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+
+ALTER TABLE p2p_orders DROP CONSTRAINT IF EXISTS p2p_orders_asset_check;
+ALTER TABLE p2p_orders ADD CONSTRAINT p2p_orders_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+
+ALTER TABLE p2p_wallet_balances DROP CONSTRAINT IF EXISTS p2p_wallet_balances_asset_check;
+ALTER TABLE p2p_wallet_balances ADD CONSTRAINT p2p_wallet_balances_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+
+ALTER TABLE p2p_wallet_entries DROP CONSTRAINT IF EXISTS p2p_wallet_entries_asset_check;
+ALTER TABLE p2p_wallet_entries ADD CONSTRAINT p2p_wallet_entries_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+
+ALTER TABLE p2p_admin_wallet_balances DROP CONSTRAINT IF EXISTS p2p_admin_wallet_balances_asset_check;
+ALTER TABLE p2p_admin_wallet_balances ADD CONSTRAINT p2p_admin_wallet_balances_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+INSERT INTO p2p_admin_wallet_balances(asset) VALUES('USDT') ON CONFLICT(asset) DO NOTHING;
+INSERT INTO p2p_admin_wallet_balances(asset) VALUES('USDC') ON CONFLICT(asset) DO NOTHING;
+
+ALTER TABLE p2p_admin_wallet_entries DROP CONSTRAINT IF EXISTS p2p_admin_wallet_entries_asset_check;
+ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_asset_check CHECK (asset IN ('USDC','USDT','BI2XUSD'));
+
+-- p2p_price_history has no CHECK on asset at all, so USDT needs only a seed
+-- row, matching the existing USDC/BI2XUSD seed rows above it in
+-- ensureP2PTables — see PriceFor's 1:1-peg comment in p2p.go for why this
+-- is a fixed value, not a live feed.
+INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
+VALUES ('USDT', 'INR', 100, CURRENT_DATE)
+ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
 `

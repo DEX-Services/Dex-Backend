@@ -568,7 +568,14 @@ func p2pTestPool(t *testing.T) *pgxpool.Pool {
 	if connString == "" {
 		t.Skip("POSTGRES_SERVICE_URI not set, skipping live-Postgres integration test")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// The full migration sequence (35+ statements against the real Aiven
+	// instance) genuinely takes ~12s end to end on its own — see testPool's
+	// identical comment in ledger_test.go — and this helper also creates a
+	// throwaway schema first, on the same budget. 15s was already tight
+	// before the P2P multi-asset migration added one more statement to the
+	// chain; 30s leaves real headroom for both steps plus ordinary network
+	// jitter against a real, non-local Postgres instance.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	admin, err := pgxpool.New(ctx, connString)
 	if err != nil {
