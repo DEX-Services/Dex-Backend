@@ -74,6 +74,25 @@ func (s *FeeServer) Tiers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tiers": out})
 }
 
+// Price: GET /bi2x/price — the current live BI2X/BI2XUSD price, public (no
+// auth), for display purposes (e.g. the Token page's BI2X card). Same
+// underlying reader Tiers/Subscribe already use for purchase math; this
+// just exposes the raw number on its own instead of folding it into a
+// bigger response, since a page that only wants "what's BI2X worth right
+// now" shouldn't have to fetch the whole fee-tier ladder to get it.
+func (s *FeeServer) Price(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	price, err := s.BI2XPrice.CurrentPrice(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "live BI2X price unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"priceUsd": price.String()})
+}
+
 // MySubscription: GET /fees/my-subscription — the caller's own active
 // fee-tier discount, if any.
 func (s *FeeServer) MySubscription(w http.ResponseWriter, r *http.Request) {
