@@ -1,6 +1,6 @@
 // Package api: BI2X chart datafeed proxy.
 //
-// The BI2X data feed (https://bitdx-feed-jk3y.onrender.com) exposes a
+// The BI2X data feed (https://bitdx-feed-ez3b.onrender.com) exposes a
 // TradingView UDF-compatible datafeed at /api/datafeed/* — exactly the
 // protocol the licensed Advanced Charting Library's Datafeeds.UDFCompatibleDatafeed
 // adapter expects, so the frontend needs no custom datafeed code for BI2X the
@@ -41,7 +41,7 @@ const (
 	// bi2xFeedBaseURL is the real feed server this proxies to. Not made
 	// configurable via env var: this is specific to one third-party
 	// dependency for one specific asset, not a general integration point.
-	bi2xFeedBaseURL = "https://bitdx-feed-jk3y.onrender.com"
+	bi2xFeedBaseURL = "https://bitdx-feed-ez3b.onrender.com"
 
 	// bi2xProxyPrefix is the path prefix this backend exposes to the
 	// frontend; everything after it is forwarded verbatim (path + query) to

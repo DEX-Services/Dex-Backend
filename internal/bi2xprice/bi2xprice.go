@@ -24,7 +24,7 @@ import (
 // feedURL is the BI2X feed's plain tick endpoint (see
 // BI2X-DATAFEED-CHART-SPEC.md) — not the UDF chart path, which is shaped for
 // TradingView, not a single current-price read.
-const feedURL = "https://bitdx-feed-jk3y.onrender.com/tick"
+const feedURL = "https://bitdx-feed-ez3b.onrender.com/tick"
 
 // maxAge bounds how stale a price reading may be before it's rejected rather
 // than used to compute a purchase — see FEE-TIER-SYSTEM-PLAN.md's guard
