@@ -32,6 +32,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +42,7 @@ const (
 	// bi2xFeedBaseURL is the real feed server this proxies to. Not made
 	// configurable via env var: this is specific to one third-party
 	// dependency for one specific asset, not a general integration point.
-	bi2xFeedBaseURL = "https://bitdx-feed-ez3b.onrender.com"
+	defaultBI2XFeedBaseURL = "https://bitdx-feed-ez3b.onrender.com"
 
 	// bi2xProxyPrefix is the path prefix this backend exposes to the
 	// frontend; everything after it is forwarded verbatim (path + query) to
@@ -120,7 +121,13 @@ func (c *bi2xCache) set(key string, e bi2xCacheEntry) {
 // symbols/search/history) passes through unchanged, so this proxy needs no
 // changes if the feed's own response shapes evolve.
 func BI2XChartProxy(log *slog.Logger) http.HandlerFunc {
-	return newBI2XChartProxy(bi2xFeedBaseURL, log)
+	// BI2X_FEED_URL overrides the upstream host (no trailing slash) so a
+	// redeployed/renamed feed instance needs a config change, not a code change.
+	base := strings.TrimRight(os.Getenv("BI2X_FEED_URL"), "/")
+	if base == "" {
+		base = defaultBI2XFeedBaseURL
+	}
+	return newBI2XChartProxy(base, log)
 }
 
 // newBI2XChartProxy is the testable constructor: upstreamBase is injectable
