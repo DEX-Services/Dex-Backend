@@ -132,6 +132,8 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"partner profit share tables", ensurePartnerProfitShareTables},
 		{"seed partner accounts", seedPartnerAccounts},
 		{"P2P multi-asset support (USDT/USDC)", ensureP2PMultiAssetSupport},
+		{"user_balances market-type partition (Spot/Futures/Options)", ensureUserBalancesMarketType},
+		{"engine_backfill_failures market-type partition", ensureEngineBackfillFailuresMarketType},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1366,4 +1368,59 @@ ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_ass
 INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
 VALUES ('USDT', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+`
+
+// ensureEngineBackfillFailuresMarketType adds the same market_type
+// partition to engine_backfill_failures that ensureUserBalancesMarketType
+// adds to user_balances — a failed backfill retry needs to know which
+// market pool to retry crediting into now that AllNonzeroBalances returns
+// per-market rows, and a user can have independent backfill failures for
+// the same asset in two different markets (e.g. SPOT BI2XUSD succeeds,
+// FUTURES BI2XUSD fails). Existing rows (all pre-dating any market
+// concept) are pre-Spot/Futures-split data and get 'SPOT' — consistent
+// with user_balances' own backfill default.
+const ensureEngineBackfillFailuresMarketType = `
+ALTER TABLE engine_backfill_failures ADD COLUMN IF NOT EXISTS market_type TEXT NOT NULL DEFAULT 'SPOT'
+	CHECK (market_type IN ('SPOT', 'FUTURES', 'OPTIONS'));
+ALTER TABLE engine_backfill_failures DROP CONSTRAINT IF EXISTS engine_backfill_failures_pkey;
+ALTER TABLE engine_backfill_failures ADD PRIMARY KEY (user_id, market_type, asset);
+`
+
+// ensureUserBalancesMarketType reshapes user_balances from "one row per
+// user" to "one row per (user, market_type)" — the Postgres durable-log
+// counterpart to the matching-engine's risk.Ledger partition by
+// models.MarketType (Spot/Futures/Options), which closed a confirmed
+// production bug: a futures liquidation's debit could silently consume
+// funds a resting spot order had already reserved, since both lived in one
+// shared balance pool with only a soft reservation convention.
+//
+// Confirmed via direct code research before this migration was written:
+// user_balances today has NO existing per-market data to preserve — futures
+// margin was always a pure in-engine-memory concept, debited through the
+// exact same generic "<ASSET>_locked" column a spot order's hold uses, with
+// zero durable Postgres representation of "this portion is futures margin."
+// So every existing row is unambiguously the general/Spot pool; this
+// migration is additive new schema, not a data-splitting migration — see
+// the one-time backfill below, which simply stamps every pre-existing row
+// 'SPOT' and leaves its values untouched.
+//
+// Scope: only the TRADING-LOCK mechanics (LockBalance, SettleLockedDebit,
+// ReplaceLocksFor, the AllNonzeroBalances engine-backfill query) become
+// market-aware, matching exactly which engine operations now carry a
+// models.MarketType. Deposits, withdrawals, swaps, admin credits/debits,
+// and P2P/staking fund transfers are inherently market-agnostic money
+// movement and always target 'SPOT' explicitly — the general-purpose
+// wallet funds land in by default, same rationale already applied on the
+// matching-engine side for /internal/ledger/sync and /admin/balance.
+const ensureUserBalancesMarketType = `
+ALTER TABLE user_balances ADD COLUMN IF NOT EXISTS market_type TEXT NOT NULL DEFAULT 'SPOT'
+	CHECK (market_type IN ('SPOT', 'FUTURES', 'OPTIONS'));
+
+-- The old one-row-per-user unique index/FK no longer match the new
+-- per-market shape — every existing row becomes that user's SPOT row
+-- (see the doc comment above: there is nothing to split, only to label).
+DROP INDEX IF EXISTS user_balances_user_id_uidx;
+CREATE UNIQUE INDEX IF NOT EXISTS user_balances_user_id_market_uidx ON user_balances (user_id, market_type);
+
+CREATE INDEX IF NOT EXISTS user_balances_market_type_idx ON user_balances (market_type);
 `

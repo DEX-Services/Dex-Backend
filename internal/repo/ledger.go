@@ -66,6 +66,32 @@ func normalizeAsset(asset string) (string, string, error) {
 	}
 	return normalized, column, nil
 }
+
+// validMarketTypes mirrors the matching-engine's models.MarketType values
+// that map to a real user_balances.market_type partition (ComboOptions
+// shares the Options pool on the engine side and never reaches this layer
+// under its own name — see risk.Ledger's doc comment). Kept as a small
+// local set rather than importing the engine's type: this repo package has
+// no existing dependency on matching-engine's module, and market_type here
+// is just a TEXT column value, not a shared Go type.
+var validMarketTypes = map[string]bool{"SPOT": true, "FUTURES": true, "OPTIONS": true}
+
+// normalizeMarket validates and upper-cases a market-type string for a
+// user_balances row. Empty defaults to SPOT — the general-purpose pool
+// every market-agnostic caller (deposits, withdrawals, swaps, admin
+// credits/debits, P2P/staking transfers) targets implicitly, matching the
+// matching-engine side's identical default for /internal/ledger/sync and
+// /admin/balance.
+func normalizeMarket(market string) (string, error) {
+	m := strings.ToUpper(strings.TrimSpace(market))
+	if m == "" {
+		m = "SPOT"
+	}
+	if !validMarketTypes[m] {
+		return "", fmt.Errorf("unsupported market type %q", market)
+	}
+	return m, nil
+}
 func validatePositiveAmount(amountRaw string) error {
 	amount, ok := new(big.Int).SetString(amountRaw, 10)
 	if !ok || amount.Sign() <= 0 {
@@ -160,20 +186,33 @@ func (r *LedgerRepo) lockUser(ctx context.Context, tx pgx.Tx, userID string) err
 // on the first touch of an account and nothing thereafter. wallet_type is
 // recorded as 'market-maker' only as an audit hint for an id the caller did
 // not already know about; a pre-existing row is never modified.
+// lockBalance ensures and row-locks userID's SPOT balance row — the
+// general-purpose pool every market-agnostic caller in this file operates
+// on. Trading-lock call sites that need a specific market's row use
+// lockBalanceMarket directly instead.
 func (r *LedgerRepo) lockBalance(ctx context.Context, tx pgx.Tx, userID string) error {
+	return r.lockBalanceMarket(ctx, tx, userID, "SPOT")
+}
+
+// lockBalanceMarket is lockBalance's market-aware counterpart: ensures and
+// row-locks userID's balance row for the given market_type specifically
+// (SPOT/FUTURES/OPTIONS), creating it on first touch exactly like
+// lockBalance already does for SPOT. market must already be normalized
+// (normalizeMarket) by the caller.
+func (r *LedgerRepo) lockBalanceMarket(ctx context.Context, tx pgx.Tx, userID, market string) error {
 	if err := ensureUsersForTx(ctx, tx, []string{userID}); err != nil {
 		return fmt.Errorf("ensure user %s: %w", userID, err)
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO user_balances (user_id)
-		VALUES ($1)
-		ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+		INSERT INTO user_balances (user_id, market_type)
+		VALUES ($1, $2)
+		ON CONFLICT (user_id, market_type) DO NOTHING`, userID, market); err != nil {
 		return err
 	}
 	var exists int
 	return tx.QueryRow(ctx,
-		`SELECT 1 FROM user_balances WHERE user_id = $1 FOR UPDATE`,
-		userID,
+		`SELECT 1 FROM user_balances WHERE user_id = $1 AND market_type = $2 FOR UPDATE`,
+		userID, market,
 	).Scan(&exists)
 }
 
@@ -192,7 +231,17 @@ func ensureUsersForTx(ctx context.Context, tx pgx.Tx, userIDs []string) error {
 	return err
 }
 
+// lockBalances row-locks every id's SPOT balance row — spot settlement
+// (the only caller) always operates on the SPOT pool, matching the
+// matching-engine's own SettleSpot wiring, which never carries a market
+// parameter because spot trades are definitionally SPOT.
 func (r *LedgerRepo) lockBalances(ctx context.Context, tx pgx.Tx, userIDs []string) error {
+	return r.lockBalancesMarket(ctx, tx, userIDs, "SPOT")
+}
+
+// lockBalancesMarket is lockBalances' market-aware counterpart. market must
+// already be normalized by the caller.
+func (r *LedgerRepo) lockBalancesMarket(ctx context.Context, tx pgx.Tx, userIDs []string, market string) error {
 	// Same FK hazard as lockBalance: the user_balances rows below can only be
 	// auto-created once each id has a users row, and buyer/seller/sender/
 	// recipient desks are exactly the synthetic ids that may not.
@@ -205,16 +254,16 @@ func (r *LedgerRepo) lockBalances(ctx context.Context, tx pgx.Tx, userIDs []stri
 	// to the old loop's N separate "INSERT ... VALUES ($1) ON CONFLICT DO
 	// NOTHING" statements, just issued as a single round trip to Postgres.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO user_balances (user_id)
-		SELECT unnest($1::text[])
-		ON CONFLICT (user_id) DO NOTHING`, userIDs); err != nil {
+		INSERT INTO user_balances (user_id, market_type)
+		SELECT unnest($1::text[]), $2
+		ON CONFLICT (user_id, market_type) DO NOTHING`, userIDs, market); err != nil {
 		return err
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT user_id FROM user_balances
-		WHERE user_id = ANY($1)
+		WHERE user_id = ANY($1) AND market_type = $2
 		ORDER BY user_id
-		FOR UPDATE`, userIDs)
+		FOR UPDATE`, userIDs, market)
 	if err != nil {
 		return err
 	}
@@ -243,7 +292,7 @@ func (r *LedgerRepo) creditBalanceTx(ctx context.Context, tx pgx.Tx, userID, ass
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` + $2::numeric, updated_at = now() WHERE user_id = $1`, userID, amountRaw)
+	_, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` + $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID, amountRaw)
 	return err
 }
 
@@ -258,7 +307,7 @@ func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asse
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	commandTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` - $2::numeric, updated_at = now() WHERE user_id = $1 AND `+column+` >= $2::numeric`, userID, amountRaw)
+	commandTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` - $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT' AND `+column+` >= $2::numeric`, userID, amountRaw)
 	if err != nil {
 		return err
 	}
@@ -291,8 +340,26 @@ func (r *LedgerRepo) pendingWithdrawalHoldTx(ctx context.Context, tx pgx.Tx, use
 	}
 	return hold, nil
 }
+// LockBalance reserves amountRaw of asset for userID in the SPOT pool.
+// Deprecated for engine-driven trading locks in favor of LockBalanceMarket —
+// kept as the SPOT-only convenience wrapper most non-trading callers want.
 func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	return r.LockBalanceMarket(ctx, userID, "SPOT", asset, amountRaw)
+}
+
+// LockBalanceMarket reserves amountRaw of asset for userID in the given
+// market's pool (SPOT/FUTURES/OPTIONS) — the durable counterpart to the
+// matching-engine's risk.Ledger.Reserve for that same market. The pending-
+// withdrawal-hold guard only applies when market is SPOT: withdrawals only
+// ever debit the SPOT pool (see InsertWithdrawalRequest/MarkWithdrawalConfirmed),
+// so a pending withdrawal has no bearing on how much a user can lock in a
+// different market's pool — those are now genuinely separate funds.
+func (r *LedgerRepo) LockBalanceMarket(ctx context.Context, userID, market, asset, amountRaw string) error {
 	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -305,7 +372,7 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	// The pending-withdrawal hold used to be read in its own round trip
@@ -313,15 +380,16 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 	// literal parameter. Folded into a scalar subquery instead: same value,
 	// computed by Postgres inline, one fewer statement in this transaction.
 	// Semantics are unchanged -- COALESCE(SUM(...), 0) is exactly what
-	// pendingWithdrawalHoldTx returned.
+	// pendingWithdrawalHoldTx returned. Gated to market='SPOT' per this
+	// function's doc comment above.
 	commandTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
-		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - (
-			SELECT COALESCE(SUM(amount), 0) FROM ledger_entries
+		 WHERE user_id = $1 AND market_type = $7 AND `+column+` - `+lockedColumn+` - (
+			SELECT CASE WHEN $7 = 'SPOT' THEN COALESCE(SUM(amount), 0) ELSE 0 END FROM ledger_entries
 			WHERE user_id = $1 AND token = $3 AND kind = $4 AND status IN ($5, $6)
 		 ) >= $2::numeric`,
 		userID, amountRaw, normalized, models.LedgerKindWithdrawalRequest,
-		models.LedgerStatusPending, models.LedgerStatusProcessing)
+		models.LedgerStatusPending, models.LedgerStatusProcessing, market)
 	if err != nil {
 		return err
 	}
@@ -334,7 +402,17 @@ func (r *LedgerRepo) LockBalance(ctx context.Context, userID, asset, amountRaw s
 // LockBalanceIdempotent mirrors CreditBalanceIdempotent for LockBalance (see
 // its doc comment for the guard semantics).
 func (r *LedgerRepo) LockBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	return r.LockBalanceMarketIdempotent(ctx, userID, "SPOT", asset, amountRaw, idempotencyKey)
+}
+
+// LockBalanceMarketIdempotent is LockBalanceMarket guarded by idempotencyKey
+// — see LockBalanceIdempotent's doc comment for the dedup semantics.
+func (r *LedgerRepo) LockBalanceMarketIdempotent(ctx context.Context, userID, market, asset, amountRaw, idempotencyKey string) error {
 	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -347,7 +425,7 @@ func (r *LedgerRepo) LockBalanceIdempotent(ctx context.Context, userID, asset, a
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	fingerprint := fmt.Sprintf("lock:%s:%s:%s", userID, asset, amountRaw)
+	fingerprint := fmt.Sprintf("lock:%s:%s:%s:%s", userID, market, asset, amountRaw)
 	found, err := checkIdempotency(ctx, tx, "/internal/balance/lock", idempotencyKey, fingerprint)
 	if err != nil {
 		return err
@@ -355,17 +433,17 @@ func (r *LedgerRepo) LockBalanceIdempotent(ctx context.Context, userID, asset, a
 	if found {
 		return tx.Commit(ctx)
 	}
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	commandTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = `+lockedColumn+` + $2::numeric, updated_at = now()
-		 WHERE user_id = $1 AND `+column+` - `+lockedColumn+` - (
-			SELECT COALESCE(SUM(amount), 0) FROM ledger_entries
+		 WHERE user_id = $1 AND market_type = $7 AND `+column+` - `+lockedColumn+` - (
+			SELECT CASE WHEN $7 = 'SPOT' THEN COALESCE(SUM(amount), 0) ELSE 0 END FROM ledger_entries
 			WHERE user_id = $1 AND token = $3 AND kind = $4 AND status IN ($5, $6)
 		 ) >= $2::numeric`,
 		userID, amountRaw, normalized, models.LedgerKindWithdrawalRequest,
-		models.LedgerStatusPending, models.LedgerStatusProcessing)
+		models.LedgerStatusPending, models.LedgerStatusProcessing, market)
 	if err != nil {
 		return err
 	}
@@ -378,11 +456,23 @@ func (r *LedgerRepo) LockBalanceIdempotent(ctx context.Context, userID, asset, a
 	return tx.Commit(ctx)
 }
 
-// UnlockBalance releases a previously locked amountRaw of asset for userID, e.g. on
-// order cancel/rejection. Floors at zero locked, mirroring the matching-engine's
-// in-memory Ledger.Release semantics.
+// UnlockBalance releases a previously locked amountRaw of asset for userID
+// in the SPOT pool. See LockBalance's doc comment — kept as the SPOT-only
+// convenience wrapper; engine-driven trading unlocks use UnlockBalanceMarket.
 func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw string) error {
+	return r.UnlockBalanceMarket(ctx, userID, "SPOT", asset, amountRaw)
+}
+
+// UnlockBalanceMarket releases a previously locked amountRaw of asset for
+// userID in the given market's pool, e.g. on order cancel/rejection. Floors
+// at zero locked, mirroring the matching-engine's in-memory
+// risk.Ledger.Release semantics for that same market.
+func (r *LedgerRepo) UnlockBalanceMarket(ctx context.Context, userID, market, asset, amountRaw string) error {
 	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -395,13 +485,13 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
-		 WHERE user_id = $1`,
-		userID, amountRaw); err != nil {
+		 WHERE user_id = $1 AND market_type = $3`,
+		userID, amountRaw, market); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -410,7 +500,18 @@ func (r *LedgerRepo) UnlockBalance(ctx context.Context, userID, asset, amountRaw
 // UnlockBalanceIdempotent mirrors CreditBalanceIdempotent for UnlockBalance
 // (see its doc comment for the guard semantics).
 func (r *LedgerRepo) UnlockBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	return r.UnlockBalanceMarketIdempotent(ctx, userID, "SPOT", asset, amountRaw, idempotencyKey)
+}
+
+// UnlockBalanceMarketIdempotent is UnlockBalanceMarket guarded by
+// idempotencyKey — see LockBalanceIdempotent's doc comment for the dedup
+// semantics.
+func (r *LedgerRepo) UnlockBalanceMarketIdempotent(ctx context.Context, userID, market, asset, amountRaw, idempotencyKey string) error {
 	normalized, _, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -423,7 +524,7 @@ func (r *LedgerRepo) UnlockBalanceIdempotent(ctx context.Context, userID, asset,
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	fingerprint := fmt.Sprintf("unlock:%s:%s:%s", userID, asset, amountRaw)
+	fingerprint := fmt.Sprintf("unlock:%s:%s:%s:%s", userID, market, asset, amountRaw)
 	found, err := checkIdempotency(ctx, tx, "/internal/balance/unlock", idempotencyKey, fingerprint)
 	if err != nil {
 		return err
@@ -431,13 +532,13 @@ func (r *LedgerRepo) UnlockBalanceIdempotent(ctx context.Context, userID, asset,
 	if found {
 		return tx.Commit(ctx)
 	}
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric), updated_at = now()
-		 WHERE user_id = $1`,
-		userID, amountRaw); err != nil {
+		 WHERE user_id = $1 AND market_type = $3`,
+		userID, amountRaw, market); err != nil {
 		return err
 	}
 	if err := recordIdempotency(ctx, tx, "/internal/balance/unlock", idempotencyKey, fingerprint); err != nil {
@@ -473,7 +574,7 @@ func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets
 		}
 		lockedColumn := lockedColumns[normalized]
 		ct, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = $2::numeric, updated_at = now()
-			WHERE user_id = $1 AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String())
+			WHERE user_id = $1 AND market_type = 'SPOT' AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String())
 		if err != nil {
 			return err
 		}
@@ -486,7 +587,10 @@ func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets
 
 // ReleaseLocksFor clears all trading locks for one internal desk wallet and
 // asset after the matching engine has restarted and discarded its in-memory
-// orders. It preserves the wallet's balance.
+// orders. It preserves the wallet's balance. Desk wallets (mm:<base>:<market>
+// account ids) already get per-desk isolation via their own distinct
+// userID, so their user_balances row always lives under market_type='SPOT'
+// regardless of which market the desk itself trades — see lockBalance.
 func (r *LedgerRepo) ReleaseLocksFor(ctx context.Context, userID, asset string) error {
 	normalized, _, err := normalizeAsset(asset)
 	if err != nil {
@@ -501,7 +605,7 @@ func (r *LedgerRepo) ReleaseLocksFor(ctx context.Context, userID, asset string) 
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -523,7 +627,7 @@ func (r *LedgerRepo) ResetBalanceFor(ctx context.Context, userID, asset string) 
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -550,16 +654,31 @@ func (r *LedgerRepo) SyncBalanceFor(ctx context.Context, userID, asset, amountRa
 	if err := r.lockBalance(ctx, tx, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = $2::numeric, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1`, userID, amountRaw); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = $2::numeric, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID, amountRaw); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
 // SettleLockedDebit converts a previously locked hold into a real debit, e.g. when an
-// order fills: both balance and locked amount are reduced together in one transaction.
+// order fills: both balance and locked amount are reduced together in one
+// transaction, in the SPOT pool. Engine-driven trading settlement uses
+// SettleLockedDebitMarket; this SPOT-only wrapper remains for non-trading
+// callers.
 func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amountRaw string) error {
+	return r.SettleLockedDebitMarket(ctx, userID, "SPOT", asset, amountRaw)
+}
+
+// SettleLockedDebitMarket converts a previously locked hold into a real
+// debit within the given market's pool, e.g. when an order fills — the
+// durable counterpart to the matching-engine's risk.Ledger.Debit for that
+// same market.
+func (r *LedgerRepo) SettleLockedDebitMarket(ctx context.Context, userID, market, asset, amountRaw string) error {
 	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -572,7 +691,7 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	commandTag, err := tx.Exec(ctx,
@@ -580,8 +699,8 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 		 SET `+column+` = `+column+` - $2::numeric,
 		     `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric),
 		     updated_at = now()
-		 WHERE user_id = $1 AND `+column+` >= $2::numeric`,
-		userID, amountRaw)
+		 WHERE user_id = $1 AND market_type = $3 AND `+column+` >= $2::numeric`,
+		userID, amountRaw, market)
 	if err != nil {
 		return err
 	}
@@ -597,7 +716,18 @@ func (r *LedgerRepo) SettleLockedDebit(ctx context.Context, userID, asset, amoun
 // replayed by that outbox after an earlier attempt's response was lost must
 // be safe to resend, same as Credit/SettleFee/Lock/Unlock already are.
 func (r *LedgerRepo) SettleLockedDebitIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	return r.SettleLockedDebitMarketIdempotent(ctx, userID, "SPOT", asset, amountRaw, idempotencyKey)
+}
+
+// SettleLockedDebitMarketIdempotent is SettleLockedDebitMarket guarded by
+// idempotencyKey — see LockBalanceIdempotent's doc comment for the dedup
+// semantics.
+func (r *LedgerRepo) SettleLockedDebitMarketIdempotent(ctx context.Context, userID, market, asset, amountRaw, idempotencyKey string) error {
 	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -610,7 +740,7 @@ func (r *LedgerRepo) SettleLockedDebitIdempotent(ctx context.Context, userID, as
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	fingerprint := fmt.Sprintf("settle:%s:%s:%s", userID, asset, amountRaw)
+	fingerprint := fmt.Sprintf("settle:%s:%s:%s:%s", userID, market, asset, amountRaw)
 	found, err := checkIdempotency(ctx, tx, "/internal/balance/settle", idempotencyKey, fingerprint)
 	if err != nil {
 		return err
@@ -618,7 +748,7 @@ func (r *LedgerRepo) SettleLockedDebitIdempotent(ctx context.Context, userID, as
 	if found {
 		return tx.Commit(ctx)
 	}
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	commandTag, err := tx.Exec(ctx,
@@ -626,8 +756,8 @@ func (r *LedgerRepo) SettleLockedDebitIdempotent(ctx context.Context, userID, as
 		 SET `+column+` = `+column+` - $2::numeric,
 		     `+lockedColumn+` = GREATEST(0, `+lockedColumn+` - $2::numeric),
 		     updated_at = now()
-		 WHERE user_id = $1 AND `+column+` >= $2::numeric`,
-		userID, amountRaw)
+		 WHERE user_id = $1 AND market_type = $3 AND `+column+` >= $2::numeric`,
+		userID, amountRaw, market)
 	if err != nil {
 		return err
 	}
@@ -685,7 +815,7 @@ func (r *LedgerRepo) SettleSpotTrade(ctx context.Context, buyerID, sellerID, bas
 	// four inside this transaction.
 	buyerTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+quoteColumn+`=`+quoteColumn+`-$2::numeric, `+quoteLocked+`=`+quoteLocked+`-$2::numeric, `+baseColumn+`=`+baseColumn+`+$3::numeric, updated_at=now()
-		 WHERE user_id=$1 AND `+quoteColumn+` >= $2::numeric AND `+quoteLocked+` >= $2::numeric`,
+		 WHERE user_id=$1 AND market_type='SPOT' AND `+quoteColumn+` >= $2::numeric AND `+quoteLocked+` >= $2::numeric`,
 		buyerID, buyerQuoteRaw, baseQtyRaw)
 	if err != nil {
 		return err
@@ -695,7 +825,7 @@ func (r *LedgerRepo) SettleSpotTrade(ctx context.Context, buyerID, sellerID, bas
 	}
 	sellerTag, err := tx.Exec(ctx,
 		`UPDATE user_balances SET `+baseColumn+`=`+baseColumn+`-$2::numeric, `+baseLocked+`=`+baseLocked+`-$2::numeric, `+quoteColumn+`=`+quoteColumn+`+$3::numeric, updated_at=now()
-		 WHERE user_id=$1 AND `+baseColumn+` >= $2::numeric AND `+baseLocked+` >= $2::numeric`,
+		 WHERE user_id=$1 AND market_type='SPOT' AND `+baseColumn+` >= $2::numeric AND `+baseLocked+` >= $2::numeric`,
 		sellerID, baseQtyRaw, sellerQuoteRaw)
 	if err != nil {
 		return err
@@ -925,7 +1055,7 @@ func (r *LedgerRepo) InsertWithdrawalRequest(ctx context.Context, userID, wallet
 	}
 
 	var balanceRaw, lockedRaw string
-	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
 		return "", err
 	}
 	balance, ok := new(big.Int).SetString(balanceRaw, 10)
@@ -1136,14 +1266,18 @@ func (r *LedgerRepo) RejectWithdrawalRequest(ctx context.Context, requestID stri
 	return nil
 }
 
-// BalanceFor returns the current balance for userID/token.
+// BalanceFor returns userID's current SPOT balance for token. The frontend
+// wallet display reads only the SPOT pool for now (see
+// Dex New Frontend/src/lib/useWallet.ts) — surfacing Futures/Options
+// balances through this same API is Phase 6 (frontend unification) of
+// ~/.claude/plans/wallet-separation.md, not yet implemented.
 func (r *LedgerRepo) BalanceFor(ctx context.Context, userID, token string) (string, error) {
 	_, column, err := normalizeAsset(token)
 	if err != nil {
 		return "0", err
 	}
 	var balance string
-	err = r.pool.QueryRow(ctx, `SELECT `+column+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balance)
+	err = r.pool.QueryRow(ctx, `SELECT `+column+`::text FROM user_balances WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&balance)
 	if err == pgx.ErrNoRows {
 		return "0", nil
 	}
@@ -1160,13 +1294,15 @@ func zeroBalanceMap() map[string]string {
 	return map[string]string{"BTC": "0", "BI2X": "0", "BI2XUSD": "0", "USDC": "0", "USDT": "0"}
 }
 
+// BalancesFor returns userID's SPOT balances per asset — see BalanceFor's
+// doc comment on why this is SPOT-only for now.
 func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	balances := map[string]string{}
 	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
 		SELECT "BTC"::text, "BI2X"::text, "BI2XUSD"::text, "USDC"::text, "USDT"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
+		WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -1181,14 +1317,15 @@ func (r *LedgerRepo) BalancesFor(ctx context.Context, userID string) (map[string
 	return balances, nil
 }
 
-// LockedBalancesFor returns the currently locked (held/frozen) amount per asset for userID.
+// LockedBalancesFor returns the currently locked (held/frozen) amount per
+// asset for userID's SPOT pool — see BalanceFor's doc comment.
 func (r *LedgerRepo) LockedBalancesFor(ctx context.Context, userID string) (map[string]string, error) {
 	locked := map[string]string{}
 	var btc, bi2x, biusd, usdc, usdt string
 	err := r.pool.QueryRow(ctx, `
 		SELECT "BTC_locked"::text, "BI2X_locked"::text, "BI2XUSD_locked"::text, "USDC_locked"::text, "USDT_locked"::text
 		FROM user_balances
-		WHERE user_id = $1`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
+		WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&btc, &bi2x, &biusd, &usdc, &usdt)
 	if err == pgx.ErrNoRows {
 		return zeroBalanceMap(), nil
 	}
@@ -1258,7 +1395,7 @@ func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token stri
 		return "0", err
 	}
 	var balanceRaw, lockedRaw string
-	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
 		return "0", err
 	}
 	balance, ok := new(big.Int).SetString(balanceRaw, 10)
@@ -1277,16 +1414,21 @@ func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token stri
 	return available.String(), tx.Commit(ctx)
 }
 
-// NonzeroBalance is one user's nonzero balance for one asset.
+// NonzeroBalance is one user's nonzero balance for one asset in one market
+// pool.
 type NonzeroBalance struct {
 	UserID string
+	Market string
 	Asset  string
 	Amount string
 }
 
-// AllNonzeroBalances returns every (user, asset) pair with a positive
-// *available* balance (total minus whatever is locked behind still-open
-// orders), for one-time backfill of the matching-engine's in-memory ledger.
+// AllNonzeroBalances returns every (user, market, asset) row with a
+// positive *available* balance (total minus whatever is locked behind
+// still-open orders), for one-time backfill of the matching-engine's
+// in-memory ledger — across every market pool (SPOT/FUTURES/OPTIONS), since
+// the engine's risk.Ledger now partitions by market too and a restart must
+// restore all of them, not just SPOT.
 //
 // The engine's ledger represents spendable capital — it's what Reserve/Lock
 // draws down for new orders — so backfilling it with the raw total column
@@ -1300,15 +1442,15 @@ type NonzeroBalance struct {
 // "available" everywhere else.
 func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT user_id, 'USDC', GREATEST("USDC" - "USDC_locked", 0)::text FROM user_balances WHERE "USDC" - "USDC_locked" > 0
+		SELECT user_id, market_type, 'USDC', GREATEST("USDC" - "USDC_locked", 0)::text FROM user_balances WHERE "USDC" - "USDC_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BTC', GREATEST("BTC" - "BTC_locked", 0)::text FROM user_balances WHERE "BTC" - "BTC_locked" > 0
+		SELECT user_id, market_type, 'BTC', GREATEST("BTC" - "BTC_locked", 0)::text FROM user_balances WHERE "BTC" - "BTC_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BI2X', GREATEST("BI2X" - "BI2X_locked", 0)::text FROM user_balances WHERE "BI2X" - "BI2X_locked" > 0
+		SELECT user_id, market_type, 'BI2X', GREATEST("BI2X" - "BI2X_locked", 0)::text FROM user_balances WHERE "BI2X" - "BI2X_locked" > 0
 		UNION ALL
-		SELECT user_id, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
+		SELECT user_id, market_type, 'USDT', GREATEST("USDT" - "USDT_locked", 0)::text FROM user_balances WHERE "USDT" - "USDT_locked" > 0
 		UNION ALL
-		SELECT user_id, 'BI2XUSD', GREATEST("BI2XUSD" - "BI2XUSD_locked", 0)::text FROM user_balances WHERE "BI2XUSD" - "BI2XUSD_locked" > 0`)
+		SELECT user_id, market_type, 'BI2XUSD', GREATEST("BI2XUSD" - "BI2XUSD_locked", 0)::text FROM user_balances WHERE "BI2XUSD" - "BI2XUSD_locked" > 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -1317,7 +1459,7 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 	var out []NonzeroBalance
 	for rows.Next() {
 		var b NonzeroBalance
-		if err := rows.Scan(&b.UserID, &b.Asset, &b.Amount); err != nil {
+		if err := rows.Scan(&b.UserID, &b.Market, &b.Asset, &b.Amount); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -1326,40 +1468,50 @@ func (r *LedgerRepo) AllNonzeroBalances(ctx context.Context) ([]NonzeroBalance, 
 }
 
 // RecordBackfillFailure durably records that a backfill credit for
-// (userID, asset) did not land in the engine even after runBackfill's own
-// in-run retries, so a later backfill run can retry exactly this pair
-// without re-crediting everything else that already succeeded. Upserts on
-// (user_id, asset): a repeated failure for the same pair bumps attempts and
-// refreshes amount/last_error/last_seen_at rather than accumulating rows.
-func (r *LedgerRepo) RecordBackfillFailure(ctx context.Context, userID, asset, amount, lastErr string) error {
-	_, err := r.pool.Exec(ctx, `
-		INSERT INTO engine_backfill_failures (user_id, asset, amount, last_error, attempts, first_seen_at, last_seen_at)
-		VALUES ($1, $2, $3, $4, 1, now(), now())
-		ON CONFLICT (user_id, asset) DO UPDATE SET
+// (userID, market, asset) did not land in the engine even after
+// runBackfill's own in-run retries, so a later backfill run can retry
+// exactly this pool/pair without re-crediting everything else that already
+// succeeded. Upserts on (user_id, market_type, asset): a repeated failure
+// for the same triple bumps attempts and refreshes amount/last_error/
+// last_seen_at rather than accumulating rows.
+func (r *LedgerRepo) RecordBackfillFailure(ctx context.Context, userID, market, asset, amount, lastErr string) error {
+	market, err := normalizeMarket(market)
+	if err != nil {
+		return err
+	}
+	_, err = r.pool.Exec(ctx, `
+		INSERT INTO engine_backfill_failures (user_id, market_type, asset, amount, last_error, attempts, first_seen_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, 1, now(), now())
+		ON CONFLICT (user_id, market_type, asset) DO UPDATE SET
 			amount = EXCLUDED.amount,
 			last_error = EXCLUDED.last_error,
 			attempts = engine_backfill_failures.attempts + 1,
 			last_seen_at = now()`,
-		userID, asset, amount, lastErr)
+		userID, market, asset, amount, lastErr)
 	return err
 }
 
 // ClearBackfillFailure removes the durable failure record for (userID,
-// asset) after a retry finally succeeds — called from runBackfill once a
-// previously-failed pair credits successfully, so PendingBackfillFailures
-// doesn't keep reporting a pair that has since been fixed.
-func (r *LedgerRepo) ClearBackfillFailure(ctx context.Context, userID, asset string) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM engine_backfill_failures WHERE user_id = $1 AND asset = $2`, userID, asset)
+// market, asset) after a retry finally succeeds — called from runBackfill
+// once a previously-failed pool/pair credits successfully, so
+// PendingBackfillFailures doesn't keep reporting one that has since been
+// fixed.
+func (r *LedgerRepo) ClearBackfillFailure(ctx context.Context, userID, market, asset string) error {
+	market, err := normalizeMarket(market)
+	if err != nil {
+		return err
+	}
+	_, err = r.pool.Exec(ctx, `DELETE FROM engine_backfill_failures WHERE user_id = $1 AND market_type = $2 AND asset = $3`, userID, market, asset)
 	return err
 }
 
-// PendingBackfillFailures returns every (user_id, asset) pair still marked
-// as failed from a previous backfill run — the accounts a fresh backfill
-// run should prioritize/retry, since AllNonzeroBalances alone can't
-// distinguish "already synced" from "failed last time" (both look like a
-// nonzero Postgres balance).
+// PendingBackfillFailures returns every (user_id, market, asset) row still
+// marked as failed from a previous backfill run — the accounts/pools a
+// fresh backfill run should prioritize/retry, since AllNonzeroBalances
+// alone can't distinguish "already synced" from "failed last time" (both
+// look like a nonzero Postgres balance).
 func (r *LedgerRepo) PendingBackfillFailures(ctx context.Context) ([]NonzeroBalance, error) {
-	rows, err := r.pool.Query(ctx, `SELECT user_id, asset, amount FROM engine_backfill_failures`)
+	rows, err := r.pool.Query(ctx, `SELECT user_id, market_type, asset, amount FROM engine_backfill_failures`)
 	if err != nil {
 		return nil, err
 	}
@@ -1367,7 +1519,7 @@ func (r *LedgerRepo) PendingBackfillFailures(ctx context.Context) ([]NonzeroBala
 	var out []NonzeroBalance
 	for rows.Next() {
 		var b NonzeroBalance
-		if err := rows.Scan(&b.UserID, &b.Asset, &b.Amount); err != nil {
+		if err := rows.Scan(&b.UserID, &b.Market, &b.Asset, &b.Amount); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

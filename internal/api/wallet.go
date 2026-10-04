@@ -647,14 +647,29 @@ func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total i
 	// once: AllNonzeroBalances is the authoritative current amount, so it
 	// wins if a legitimate credit already changed the balance since the
 	// failure was recorded.
+	//
+	// AllNonzeroBalances/PendingBackfillFailures now return rows across all
+	// market pools (Spot/Futures/Options), but EngineClient.Credit only ever
+	// targets the engine's Spot pool (the admin credit endpoint defaults to
+	// Spot — see cmd/engine/main.go's /admin/balance handler). Restoring
+	// Futures/Options balances through this path isn't wired yet (tracked in
+	// ~/.claude/plans/wallet-separation.md's later phases), so this loop
+	// filters to SPOT rows only for now rather than mis-crediting a
+	// Futures/Options balance into the wrong pool.
 	seen := make(map[[2]string]bool, len(pending)+len(balances))
 	items := make([]backfillItem, 0, len(pending)+len(balances))
 	for _, p := range pending {
+		if p.Market != "" && p.Market != "SPOT" {
+			continue
+		}
 		key := [2]string{p.UserID, p.Asset}
 		seen[key] = true
 		items = append(items, backfillItem{userID: p.UserID, asset: p.Asset, amount: p.Amount, alreadyHuman: true})
 	}
 	for _, b := range balances {
+		if b.Market != "" && b.Market != "SPOT" {
+			continue
+		}
 		key := [2]string{b.UserID, b.Asset}
 		if seen[key] {
 			continue
@@ -711,7 +726,7 @@ func (s *WalletServer) processBackfillItems(ctx context.Context, items []backfil
 		}
 		if cerr := s.EngineClient.Credit(ctx, it.userID, it.asset, amount); cerr != nil {
 			s.Log.Error("backfill: credit failed", "err", cerr, "userId", it.userID, "asset", it.asset)
-			if rerr := s.Ledger.RecordBackfillFailure(ctx, it.userID, it.asset, amount, cerr.Error()); rerr != nil {
+			if rerr := s.Ledger.RecordBackfillFailure(ctx, it.userID, "SPOT", it.asset, amount, cerr.Error()); rerr != nil {
 				s.Log.Error("backfill: could not durably record failure", "err", rerr, "userId", it.userID, "asset", it.asset)
 			}
 			failed++
@@ -721,7 +736,7 @@ func (s *WalletServer) processBackfillItems(ctx context.Context, items []backfil
 			// This was a previously-failed pair that just succeeded — clear
 			// its durable record so it stops being retried on every future
 			// run once it's actually fixed.
-			if cerr := s.Ledger.ClearBackfillFailure(ctx, it.userID, it.asset); cerr != nil {
+			if cerr := s.Ledger.ClearBackfillFailure(ctx, it.userID, "SPOT", it.asset); cerr != nil {
 				s.Log.Error("backfill: could not clear resolved failure record", "err", cerr, "userId", it.userID, "asset", it.asset)
 			}
 		}
