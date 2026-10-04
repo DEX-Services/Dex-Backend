@@ -146,6 +146,7 @@ func main() {
 		EngineClient: engineClient,
 		Fees:         feesClient,
 		Referrals:    referralRepo,
+		Prediction:   repo.NewPredictionWalletRepo(pool),
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
@@ -254,6 +255,9 @@ func main() {
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)
 	mux.HandleFunc("/wallet/swap/max", walletSrv.SwapPoolMax)
 	mux.HandleFunc("/wallet/transfer", walletSrv.Transfer)
+	mux.HandleFunc("/wallet/prediction", walletSrv.PredictionWalletBalance)
+	mux.HandleFunc("/wallet/prediction/fund", walletSrv.FundPredictionWallet)
+	mux.HandleFunc("/wallet/prediction/unfund", walletSrv.UnfundPredictionWallet)
 	mux.HandleFunc("/prop-firm/purchase", propFirmSrv.Purchase)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
 	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)
@@ -270,6 +274,11 @@ func main() {
 	mux.HandleFunc("/internal/balance/credit", walletSrv.InternalCreditBalance)
 	mux.HandleFunc("/internal/treasury/credit", walletSrv.InternalCreditTreasury)
 	mux.HandleFunc("/internal/balance/fee", walletSrv.InternalSettleFee)
+	mux.HandleFunc("/internal/prediction-wallet/lock", walletSrv.InternalPredictionLock)
+	mux.HandleFunc("/internal/prediction-wallet/unlock", walletSrv.InternalPredictionUnlock)
+	mux.HandleFunc("/internal/prediction-wallet/debit", walletSrv.InternalPredictionDebit)
+	mux.HandleFunc("/internal/prediction-wallet/credit", walletSrv.InternalPredictionCredit)
+	mux.HandleFunc("/internal/prediction-wallet/available", walletSrv.InternalPredictionAvailable)
 	mux.HandleFunc("/admin/engine-backfill", walletSrv.AdminEngineBackfill)
 	mux.HandleFunc("/internal/engine-backfill", walletSrv.InternalEngineBackfill)
 	mux.HandleFunc("/p2p/price", p2pSrv.Price)

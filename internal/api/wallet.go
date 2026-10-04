@@ -39,6 +39,7 @@ type WalletServer struct {
 	EngineClient *engineclient.Client
 	Fees         *feeconfig.Client
 	Referrals    *repo.ReferralRepo
+	Prediction   *repo.PredictionWalletRepo
 }
 
 // Balance: GET /wallet/balance

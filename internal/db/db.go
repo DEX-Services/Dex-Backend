@@ -135,6 +135,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"user_balances market-type partition (Spot/Futures/Options)", ensureUserBalancesMarketType},
 		{"engine_backfill_failures market-type partition", ensureEngineBackfillFailuresMarketType},
 		{"staking wallet tables", ensureStakingWalletTables},
+		{"prediction wallet tables", ensurePredictionWalletTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1119,6 +1120,64 @@ CREATE INDEX IF NOT EXISTS idx_staking_wallet_entries_user
 CREATE UNIQUE INDEX IF NOT EXISTS idx_staking_wallet_fund_idempotency
     ON staking_wallet_entries (user_id, kind, idempotency_key)
     WHERE kind IN ('main_to_staking', 'staking_to_main') AND idempotency_key IS NOT NULL;
+`
+
+// ensurePredictionWalletTables adds a dedicated prediction-market wallet
+// (Phase 4 of ~/.claude/plans/wallet-separation.md) — another Category B
+// wallet, same structural copy of P2P's pattern as staking's (Phase 3,
+// ensureStakingWalletTables), BI2XUSD-only like staking since prediction
+// markets have never supported another asset.
+//
+// Unlike staking, prediction-service's order flow genuinely needs a
+// reserve/release cycle through this wallet's own lifetime (an order locks
+// its cost, a match consumes part of the lock via a debit, an unmatched
+// remainder unlocks at window-lock time) rather than staking's simpler
+// single stake-then-redeem shape — so this wallet's kind values mirror the
+// full P2P vocabulary (lock/unlock/debit/credit) instead of staking's
+// narrower stake/redeem pair. fee_entries records each maker/taker fee
+// charged, kept separate from amount_raw's CHECK(>0) on the main entries
+// table so a fee of exactly 0 (no fee configured) doesn't need a workaround.
+//
+// position_ref is a free-text tag (prediction-service's own order/fill id),
+// not a foreign key — this wallet has no reason to depend on
+// prediction-service's schema, which lives in a separate database/service
+// entirely (unlike staking, which lives in this same database and can
+// reference staking_positions directly).
+const ensurePredictionWalletTables = `
+CREATE TABLE IF NOT EXISTS prediction_wallet_balances (
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
+    reserved_raw  NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (reserved_raw >= 0),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id)
+);
+
+CREATE TABLE IF NOT EXISTS prediction_wallet_entries (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    position_ref    TEXT,
+    kind            TEXT NOT NULL CHECK (kind IN ('main_to_prediction', 'prediction_to_main', 'lock', 'unlock', 'debit', 'credit', 'fee')),
+    amount_raw      NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+    idempotency_key TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_wallet_entries_user
+    ON prediction_wallet_entries (user_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prediction_wallet_fund_idempotency
+    ON prediction_wallet_entries (user_id, kind, idempotency_key)
+    WHERE kind IN ('main_to_prediction', 'prediction_to_main') AND idempotency_key IS NOT NULL;
+-- Every trading-flow kind (lock/unlock/debit/credit/fee) is driven by
+-- prediction-service, which already generates a globally unique
+-- idempotency key per logical operation (pf.IdempotencyKey + a role
+-- suffix) — unique across ALL users, not just scoped to one, unlike the
+-- fund/unfund kinds above which are scoped per (user_id, kind). A separate
+-- unique index (not reusing idx_prediction_wallet_fund_idempotency's
+-- per-user shape) since collapsing to (kind, idempotency_key) alone is
+-- sufficient and marginally cheaper to check.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prediction_wallet_trade_idempotency
+    ON prediction_wallet_entries (kind, idempotency_key)
+    WHERE kind IN ('lock', 'unlock', 'debit', 'credit', 'fee') AND idempotency_key IS NOT NULL;
 `
 
 // ensureTreasuryEntryPredictionCategory widens platform_treasury_entries'
