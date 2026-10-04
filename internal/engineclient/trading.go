@@ -255,6 +255,19 @@ func (c *Client) Balance(ctx context.Context, accountID, asset string) (BalanceR
 	return out, err
 }
 
+// BalanceForMarket is Balance with an explicit market pool (e.g. "FUTURES")
+// — Phase 6 of ~/.claude/plans/wallet-separation.md: the frontend's
+// balances-by-area view needs the live Futures balance, which only exists
+// in the engine's own in-memory risk.Ledger, never in Postgres
+// user_balances (Spot-only — see LedgerRepo.BalanceFor's doc comment).
+// Balance itself stays market-less (defaults to SPOT engine-side) so its
+// existing callers are unaffected.
+func (c *Client) BalanceForMarket(ctx context.Context, accountID, market, asset string) (BalanceResponse, error) {
+	var out BalanceResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/admin/balance", url.Values{"account": {accountID}, "asset": {asset}, "market": {market}}, &out)
+	return out, err
+}
+
 // HaltedSymbol is one entry of the engine's current halt state.
 type HaltedSymbol struct {
 	Symbol string `json:"symbol"`

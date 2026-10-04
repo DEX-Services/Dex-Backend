@@ -40,6 +40,7 @@ type WalletServer struct {
 	Fees         *feeconfig.Client
 	Referrals    *repo.ReferralRepo
 	Prediction   *repo.PredictionWalletRepo
+	Staking      *repo.StakingRepo
 }
 
 // Balance: GET /wallet/balance
@@ -137,6 +138,81 @@ func (s *WalletServer) Transfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"transfer": result})
+}
+
+// areaBalance is one wallet area's balance figures in a shape the frontend
+// can render identically across areas — Phase 6 of
+// ~/.claude/plans/wallet-separation.md. AvailableRaw/ReservedRaw/TotalRaw
+// are raw integer strings at this platform's standard 6-decimal scale,
+// same convention as every other balance figure in this API.
+type areaBalance struct {
+	AvailableRaw string `json:"availableRaw"`
+	ReservedRaw  string `json:"reservedRaw"`
+	TotalRaw     string `json:"totalRaw"`
+}
+
+// BalancesByArea: GET /wallet/balances-by-area — the per-area breakdown the
+// frontend's unified wallet view needs (Spot/Futures/Staking/Prediction),
+// in one response rather than four separate round trips. Each area is
+// fetched independently and a failure in one does NOT fail the whole
+// response: an area that couldn't be loaded is omitted from the map with
+// its error logged, so e.g. the engine being briefly unreachable still
+// lets the user see their Spot/Staking/Prediction balances instead of a
+// blank error page. BI2XUSD only for Futures/Staking/Prediction (all three
+// are single-asset pools today — see their own schema doc comments);
+// Spot's breakdown stays the full multi-asset shape the existing
+// /wallet/balance endpoint already returns, nested here as "assets" so a
+// caller that only wants the areas' totals doesn't have to special-case
+// Spot's shape.
+func (s *WalletServer) BalancesByArea(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	ctx := r.Context()
+	areas := map[string]any{}
+
+	spotBalances, err := s.Ledger.BalancesFor(ctx, claims.UserID)
+	if err != nil {
+		s.Log.Error("balances-by-area: spot balance lookup failed", "err", err)
+	} else {
+		spotLocked, lockErr := s.Ledger.LockedBalancesFor(ctx, claims.UserID)
+		if lockErr != nil {
+			s.Log.Error("balances-by-area: spot locked lookup failed", "err", lockErr)
+			spotLocked = map[string]string{}
+		}
+		areas["SPOT"] = map[string]any{"assets": spotBalances, "locked": spotLocked}
+	}
+
+	if s.EngineClient != nil && s.EngineClient.Enabled() {
+		futuresBal, err := s.EngineClient.BalanceForMarket(ctx, claims.UserID, "FUTURES", "BI2XUSD")
+		if err != nil {
+			s.Log.Error("balances-by-area: futures balance lookup failed", "userId", claims.UserID, "err", err)
+		} else {
+			areas["FUTURES"] = areaBalance{AvailableRaw: futuresBal.Available, ReservedRaw: futuresBal.Reserved, TotalRaw: futuresBal.Balance}
+		}
+	}
+
+	if s.Staking != nil {
+		stakingBal, err := s.Staking.WalletBalance(ctx, claims.UserID)
+		if err != nil {
+			s.Log.Error("balances-by-area: staking wallet lookup failed", "userId", claims.UserID, "err", err)
+		} else {
+			areas["STAKING"] = areaBalance{AvailableRaw: stakingBal.AvailableRaw, ReservedRaw: stakingBal.ReservedRaw, TotalRaw: stakingBal.TotalRaw}
+		}
+	}
+
+	if s.Prediction != nil {
+		predictionBal, err := s.Prediction.WalletBalance(ctx, claims.UserID)
+		if err != nil {
+			s.Log.Error("balances-by-area: prediction wallet lookup failed", "userId", claims.UserID, "err", err)
+		} else {
+			areas["PREDICTION"] = areaBalance{AvailableRaw: predictionBal.AvailableRaw, ReservedRaw: predictionBal.ReservedRaw, TotalRaw: predictionBal.TotalRaw}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"areas": areas})
 }
 
 type withdrawRequestBody struct {

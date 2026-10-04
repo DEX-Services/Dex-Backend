@@ -138,6 +138,7 @@ func main() {
 	}
 	go srv.Nonces.Run(ctx)
 
+	stakingRepo := repo.NewStakingRepo(pool, ledgerRepo)
 	walletSrv := &api.WalletServer{
 		Server:       srv,
 		Ledger:       ledgerRepo,
@@ -147,6 +148,7 @@ func main() {
 		Fees:         feesClient,
 		Referrals:    referralRepo,
 		Prediction:   repo.NewPredictionWalletRepo(pool),
+		Staking:      stakingRepo,
 	}
 	if walletSrv.EngineSecret == "" {
 		slog.Warn("ENGINE_SHARED_SECRET not set, /internal/balance/* disabled")
@@ -179,7 +181,7 @@ func main() {
 	tradeSrv := &api.TradeServer{Server: srv, Engine: engineClient, Ledger: ledgerRepo}
 	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
 	referralSrv := &api.ReferralServer{Server: srv, Referrals: referralRepo}
-	stakingSrv := &api.StakingServer{Server: srv, Staking: repo.NewStakingRepo(pool, ledgerRepo)}
+	stakingSrv := &api.StakingServer{Server: srv, Staking: stakingRepo}
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -251,6 +253,7 @@ func main() {
 	mux.HandleFunc("/partner/login", partnerSrv.Login)
 	mux.HandleFunc("/partner/profit", partnerSrv.Profit)
 	mux.HandleFunc("/wallet/balance", walletSrv.Balance)
+	mux.HandleFunc("/wallet/balances-by-area", walletSrv.BalancesByArea)
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)
 	mux.HandleFunc("/wallet/swap/max", walletSrv.SwapPoolMax)
