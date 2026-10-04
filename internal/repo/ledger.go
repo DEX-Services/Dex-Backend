@@ -282,32 +282,53 @@ func (r *LedgerRepo) lockBalancesMarket(ctx context.Context, tx pgx.Tx, userIDs 
 }
 
 func (r *LedgerRepo) creditBalanceTx(ctx context.Context, tx pgx.Tx, userID, asset, amountRaw string) error {
+	return r.creditBalanceMarketTx(ctx, tx, userID, "SPOT", asset, amountRaw)
+}
+
+// creditBalanceMarketTx is creditBalanceTx against an explicit market pool —
+// used by InternalCreditBalance for a Futures position-close credit, which
+// is not a SPOT-default case like a deposit or swap.
+func (r *LedgerRepo) creditBalanceMarketTx(ctx context.Context, tx pgx.Tx, userID, market, asset, amountRaw string) error {
 	_, column, err := normalizeAsset(asset)
 	if err != nil {
 		return err
 	}
-	if err := validatePositiveAmount(amountRaw); err != nil {
-		return err
-	}
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` + $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID, amountRaw)
-	return err
-}
-
-func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asset, amountRaw string) error {
-	normalized, column, err := normalizeAsset(asset)
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
 	if err := validatePositiveAmount(amountRaw); err != nil {
 		return err
 	}
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
-	commandTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` - $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT' AND `+column+` >= $2::numeric`, userID, amountRaw)
+	_, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` + $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = $3`, userID, amountRaw, market)
+	return err
+}
+
+func (r *LedgerRepo) debitBalanceTx(ctx context.Context, tx pgx.Tx, userID, asset, amountRaw string) error {
+	return r.debitBalanceMarketTx(ctx, tx, userID, "SPOT", asset, amountRaw)
+}
+
+// debitBalanceMarketTx is debitBalanceTx against an explicit market pool —
+// used by InternalCreditBalance for a Futures position-close net-loss debit.
+func (r *LedgerRepo) debitBalanceMarketTx(ctx context.Context, tx pgx.Tx, userID, market, asset, amountRaw string) error {
+	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
+	if err != nil {
+		return err
+	}
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return err
+	}
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
+		return err
+	}
+	commandTag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = `+column+` - $2::numeric, updated_at = now() WHERE user_id = $1 AND market_type = $3 AND `+column+` >= $2::numeric`, userID, amountRaw, market)
 	if err != nil {
 		return err
 	}
@@ -855,12 +876,20 @@ func (r *LedgerRepo) CreditBalance(ctx context.Context, userID, asset, amountRaw
 // guessing which request to honor. Pass idempotencyKey="" to skip the guard
 // entirely (identical to CreditBalance).
 func (r *LedgerRepo) CreditBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	return r.CreditBalanceMarketIdempotent(ctx, userID, "SPOT", asset, amountRaw, idempotencyKey)
+}
+
+// CreditBalanceMarketIdempotent is CreditBalanceIdempotent against an
+// explicit market pool — used by InternalCreditBalance for a Futures
+// position-close credit, which is driven by the engine's own market, not a
+// SPOT-default money movement like a deposit or swap.
+func (r *LedgerRepo) CreditBalanceMarketIdempotent(ctx context.Context, userID, market, asset, amountRaw, idempotencyKey string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	fingerprint := fmt.Sprintf("credit:%s:%s:%s", userID, asset, amountRaw)
+	fingerprint := fmt.Sprintf("credit:%s:%s:%s:%s", userID, market, asset, amountRaw)
 	found, err := checkIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint)
 	if err != nil {
 		return err
@@ -868,7 +897,7 @@ func (r *LedgerRepo) CreditBalanceIdempotent(ctx context.Context, userID, asset,
 	if found {
 		return tx.Commit(ctx)
 	}
-	if err := r.creditBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+	if err := r.creditBalanceMarketTx(ctx, tx, userID, market, asset, amountRaw); err != nil {
 		return err
 	}
 	if err := recordIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint); err != nil {
@@ -893,12 +922,19 @@ func (r *LedgerRepo) DebitBalance(ctx context.Context, userID, asset, amountRaw 
 // doc comment); used for InternalCreditBalance's negative-amount branch,
 // which debits rather than credits.
 func (r *LedgerRepo) DebitBalanceIdempotent(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) error {
+	return r.DebitBalanceMarketIdempotent(ctx, userID, "SPOT", asset, amountRaw, idempotencyKey)
+}
+
+// DebitBalanceMarketIdempotent is DebitBalanceIdempotent against an explicit
+// market pool — used by InternalCreditBalance for a Futures position-close
+// net-loss debit.
+func (r *LedgerRepo) DebitBalanceMarketIdempotent(ctx context.Context, userID, market, asset, amountRaw, idempotencyKey string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	fingerprint := fmt.Sprintf("debit:%s:%s:%s", userID, asset, amountRaw)
+	fingerprint := fmt.Sprintf("debit:%s:%s:%s:%s", userID, market, asset, amountRaw)
 	found, err := checkIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint)
 	if err != nil {
 		return err
@@ -906,7 +942,7 @@ func (r *LedgerRepo) DebitBalanceIdempotent(ctx context.Context, userID, asset, 
 	if found {
 		return tx.Commit(ctx)
 	}
-	if err := r.debitBalanceTx(ctx, tx, userID, asset, amountRaw); err != nil {
+	if err := r.debitBalanceMarketTx(ctx, tx, userID, market, asset, amountRaw); err != nil {
 		return err
 	}
 	if err := recordIdempotency(ctx, tx, "/internal/balance/credit", idempotencyKey, fingerprint); err != nil {

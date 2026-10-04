@@ -779,6 +779,11 @@ func (s *WalletServer) InternalEngineBackfill(w http.ResponseWriter, r *http.Req
 
 type internalLockBody struct {
 	UserID string `json:"userId"`
+	// Market is optional; an empty value defaults to the SPOT pool (see
+	// LedgerRepo.normalizeMarket). The matching-engine sends it explicitly
+	// for every Futures/Options-scoped call (see backendclient's *Market
+	// methods); callers that only ever touch SPOT can omit it.
+	Market string `json:"market,omitempty"`
 	Asset  string `json:"asset"`
 	Amount string `json:"amount"`
 }
@@ -862,7 +867,7 @@ func (s *WalletServer) InternalLockBalance(w http.ResponseWriter, r *http.Reques
 	// matching-engine today) gets the exact old behavior — see
 	// LedgerRepo.LockBalanceIdempotent, which no-ops the guard when the key
 	// is empty.
-	if err := s.Ledger.LockBalanceIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
+	if err := s.Ledger.LockBalanceMarketIdempotent(r.Context(), req.UserID, req.Market, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -881,7 +886,7 @@ func (s *WalletServer) InternalUnlockBalance(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.UnlockBalanceIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
+	if err := s.Ledger.UnlockBalanceMarketIdempotent(r.Context(), req.UserID, req.Market, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1027,7 +1032,7 @@ func (s *WalletServer) InternalSettleBalance(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.SettleLockedDebitIdempotent(r.Context(), req.UserID, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
+	if err := s.Ledger.SettleLockedDebitMarketIdempotent(r.Context(), req.UserID, req.Market, req.Asset, req.Amount, r.Header.Get("Idempotency-Key")); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -1092,12 +1097,12 @@ func (s *WalletServer) InternalCreditBalance(w http.ResponseWriter, r *http.Requ
 	}
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if amount.Sign() < 0 {
-		if err := s.Ledger.DebitBalanceIdempotent(r.Context(), req.UserID, req.Asset, amount.Neg(amount).String(), idempotencyKey); err != nil {
+		if err := s.Ledger.DebitBalanceMarketIdempotent(r.Context(), req.UserID, req.Market, req.Asset, amount.Neg(amount).String(), idempotencyKey); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 	} else if amount.Sign() > 0 {
-		if err := s.Ledger.CreditBalanceIdempotent(r.Context(), req.UserID, req.Asset, amount.String(), idempotencyKey); err != nil {
+		if err := s.Ledger.CreditBalanceMarketIdempotent(r.Context(), req.UserID, req.Market, req.Asset, amount.String(), idempotencyKey); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
