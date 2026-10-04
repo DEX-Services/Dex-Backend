@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -190,6 +191,103 @@ func (c *Client) Credit(ctx context.Context, accountID, asset, amount string) er
 // See Credit's doc comment on request IDs, retry behavior, and DebitAsync.
 func (c *Client) Debit(ctx context.Context, accountID, asset, amount string) error {
 	return c.callWithRetry(ctx, accountID, asset, amount, "debit", uuid.NewString())
+}
+
+type transferReq struct {
+	AccountID  string `json:"accountId"`
+	FromMarket string `json:"fromMarket"`
+	ToMarket   string `json:"toMarket"`
+	Asset      string `json:"asset"`
+	Amount     string `json:"amount"`
+	RequestID  string `json:"requestId"`
+}
+
+// TransferResult is the engine's own post-transfer snapshot, returned
+// straight through to the caller (the /wallet/transfer handler) so the
+// response reflects the engine's authoritative amount string rather than
+// Dex-Backend re-deriving it.
+type TransferResult struct {
+	Status     string `json:"status"`
+	AccountID  string `json:"accountId"`
+	FromMarket string `json:"fromMarket"`
+	ToMarket   string `json:"toMarket"`
+	Asset      string `json:"asset"`
+	Amount     string `json:"amount"`
+}
+
+// Transfer moves amount (human-decimal, matching the engine's own ledger
+// units — same convention as Credit/Debit, see RawUnitScale's doc comment)
+// of asset from fromMarket to toMarket within accountID's own engine-side
+// pools, calling the engine's POST /internal/transfer (Phase 2 of
+// ~/.claude/plans/wallet-separation.md). Synchronous and NOT fire-and-forget
+// like CreditAsync/DebitAsync: a user-initiated transfer must report its
+// real, immediate outcome back to the caller, not silently retry in the
+// background. Retries only on a retryable StatusError (429/5xx), reusing
+// requestID across attempts so the engine's own dedup (ledgerSyncDedup)
+// treats retries as one logical transfer.
+func (c *Client) Transfer(ctx context.Context, accountID, fromMarket, toMarket, asset, amount string) (*TransferResult, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("engine bridge not configured")
+	}
+	requestID := uuid.NewString()
+	var result *TransferResult
+	var err error
+	for attempt := 0; attempt < callInternalRetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(callInternalRetryDelay * time.Duration(attempt)):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		result, err = c.transferOnce(ctx, accountID, fromMarket, toMarket, asset, amount, requestID)
+		if err == nil {
+			return result, nil
+		}
+		var statusErr *StatusError
+		if !errors.As(err, &statusErr) || !statusErr.Retryable() {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
+func (c *Client) transferOnce(ctx context.Context, accountID, fromMarket, toMarket, asset, amount, requestID string) (*TransferResult, error) {
+	body, err := json.Marshal(transferReq{
+		AccountID: accountID, FromMarket: fromMarket, ToMarket: toMarket,
+		Asset: asset, Amount: amount, RequestID: requestID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/transfer", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Engine-Secret", c.secret)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("engineclient transfer: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusConflict {
+			// A genuine rejection (e.g. insufficient available balance in
+			// fromMarket) — not retryable, and the caller wants the actual
+			// reason surfaced to the end user rather than a generic status
+			// code.
+			b, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("%s", strings.TrimSpace(string(b)))
+		}
+		return nil, &StatusError{StatusCode: resp.StatusCode}
+	}
+	var result TransferResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("engineclient transfer: decode response: %w", err)
+	}
+	return &result, nil
 }
 
 // callInternalRetryAttempts/Delay bound Credit/Debit's own built-in retry

@@ -253,6 +253,7 @@ func main() {
 	mux.HandleFunc("/wallet/withdraw-request", walletSrv.WithdrawRequest)
 	mux.HandleFunc("/wallet/swap", walletSrv.Swap)
 	mux.HandleFunc("/wallet/swap/max", walletSrv.SwapPoolMax)
+	mux.HandleFunc("/wallet/transfer", walletSrv.Transfer)
 	mux.HandleFunc("/prop-firm/purchase", propFirmSrv.Purchase)
 	mux.HandleFunc("/admin/withdraw-approve", walletSrv.AdminApproveWithdrawal)
 	mux.HandleFunc("/admin/withdraw-recover", walletSrv.AdminRecoverWithdrawal)

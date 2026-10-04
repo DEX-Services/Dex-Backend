@@ -75,6 +75,69 @@ func (s *WalletServer) Balance(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validTransferMarkets are the engine-ledger pools a user can move funds
+// between directly — Phase 2 of ~/.claude/plans/wallet-separation.md.
+// Options isn't included yet: it's not exposed to end users as a funding
+// destination in this phase (no Options-facing UI/flow exists to receive
+// it), so a transfer request naming it is rejected the same as any other
+// unsupported market rather than silently accepted into a pool nothing can
+// use yet.
+var validTransferMarkets = map[string]bool{"SPOT": true, "FUTURES": true}
+
+type walletTransferBody struct {
+	FromMarket string `json:"fromMarket"`
+	ToMarket   string `json:"toMarket"`
+	Asset      string `json:"asset"`
+	Amount     string `json:"amount"`
+}
+
+// Transfer: POST /wallet/transfer {fromMarket, toMarket, asset, amount}
+// Moves funds between the authenticated user's own engine-ledger pools
+// (e.g. Spot -> Futures), instant and gated only on available balance in
+// fromMarket (no cooldowns or position-open restrictions — confirmed with
+// user). The engine is the live source of truth for both pools, so this
+// calls matching-engine's POST /internal/transfer synchronously and reports
+// its real outcome; Postgres's user_balances mirror follows via the
+// engine's own best-effort async sync, same as every other balance
+// mutation in this system.
+func (s *WalletServer) Transfer(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	claims, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	if s.EngineClient == nil || !s.EngineClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "engine transfer bridge not configured")
+		return
+	}
+	var req walletTransferBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	fromMarket := strings.ToUpper(strings.TrimSpace(req.FromMarket))
+	toMarket := strings.ToUpper(strings.TrimSpace(req.ToMarket))
+	if !validTransferMarkets[fromMarket] || !validTransferMarkets[toMarket] {
+		writeError(w, http.StatusBadRequest, "fromMarket and toMarket must each be one of SPOT, FUTURES")
+		return
+	}
+	if fromMarket == toMarket {
+		writeError(w, http.StatusBadRequest, "fromMarket and toMarket must differ")
+		return
+	}
+	asset := requestAsset(req.Asset)
+	result, err := s.EngineClient.Transfer(r.Context(), claims.UserID, fromMarket, toMarket, asset, req.Amount)
+	if err != nil {
+		s.Log.Warn("wallet transfer failed", "userId", claims.UserID, "from", fromMarket, "to", toMarket, "asset", asset, "err", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"transfer": result})
+}
+
 type withdrawRequestBody struct {
 	Amount string `json:"amount"`
 	Asset  string `json:"asset"`
