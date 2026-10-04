@@ -2,13 +2,20 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
 
 	"github.com/dex/dex-backend/internal/models"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrStakingIdempotencyKey mirrors repo.ErrP2PIdempotencyKey for the
+// staking wallet's own fund/unfund idempotency guard (FundStakingWalletAsset/
+// UnfundStakingWalletAsset) — see those functions' doc comments.
+var ErrStakingIdempotencyKey = errors.New("idempotency key was already used for another request")
 
 // secondsPerYear is the fixed denominator for APR -> per-second rate
 // conversion (365-day year, no leap-year adjustment — standard simple
@@ -50,6 +57,163 @@ func AccruedInterest(principalRaw *big.Int, aprBps int, startedAt, asOf time.Tim
 	// Truncate toward zero (floor, since interest is always non-negative here).
 	quo := new(big.Int).Quo(interest.Num(), interest.Denom())
 	return quo
+}
+
+// StakingWalletBalance is userID's staking wallet snapshot — structural
+// copy of models.P2PWalletBalance, minus the Asset field since this wallet
+// is BI2X-only (see ensureStakingWalletTables).
+type StakingWalletBalance struct {
+	AvailableRaw string `json:"availableRaw"`
+	ReservedRaw  string `json:"reservedRaw"`
+	TotalRaw     string `json:"totalRaw"`
+}
+
+func (r *StakingRepo) lockStakingWallet(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO staking_wallet_balances(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`, userID); err != nil {
+		return err
+	}
+	var one int
+	return tx.QueryRow(ctx, `SELECT 1 FROM staking_wallet_balances WHERE user_id=$1 FOR UPDATE`, userID).Scan(&one)
+}
+
+func scanStakingWallet(row pgx.Row) (*StakingWalletBalance, error) {
+	var b StakingWalletBalance
+	err := row.Scan(&b.AvailableRaw, &b.ReservedRaw, &b.TotalRaw)
+	return &b, err
+}
+
+func (r *StakingRepo) stakingWalletTx(ctx context.Context, tx pgx.Tx, userID string) (*StakingWalletBalance, error) {
+	return scanStakingWallet(tx.QueryRow(ctx, `SELECT available_raw::text,reserved_raw::text,(available_raw+reserved_raw)::text FROM staking_wallet_balances WHERE user_id=$1`, userID))
+}
+
+// WalletBalance returns userID's staking wallet snapshot, zero-valued if
+// they have never funded it.
+func (r *StakingRepo) WalletBalance(ctx context.Context, userID string) (*StakingWalletBalance, error) {
+	b, err := scanStakingWallet(r.pool.QueryRow(ctx, `SELECT available_raw::text,reserved_raw::text,(available_raw+reserved_raw)::text FROM staking_wallet_balances WHERE user_id=$1`, userID))
+	if err == pgx.ErrNoRows {
+		return &StakingWalletBalance{AvailableRaw: "0", ReservedRaw: "0", TotalRaw: "0"}, nil
+	}
+	return b, err
+}
+
+// FundStakingWalletAsset moves available main-wallet BI2X into the staking
+// wallet atomically — structural copy of P2PRepo.FundWalletAsset. moved=false
+// means an identical idempotent request was already applied.
+func (r *StakingRepo) FundStakingWalletAsset(ctx context.Context, userID, amountRaw, idempotencyKey string) (*StakingWalletBalance, bool, error) {
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return nil, false, err
+	}
+	key, err := validateIdempotencyKey(idempotencyKey, true)
+	if err != nil {
+		return nil, false, err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.ledger.lockBalance(ctx, tx, userID); err != nil {
+		return nil, false, err
+	}
+	if err := r.lockStakingWallet(ctx, tx, userID); err != nil {
+		return nil, false, err
+	}
+
+	var prior string
+	err = tx.QueryRow(ctx, `SELECT amount_raw::text FROM staking_wallet_entries WHERE user_id=$1 AND kind='main_to_staking' AND idempotency_key=$2`, userID, key).Scan(&prior)
+	if err == nil {
+		if prior != amountRaw {
+			return nil, false, ErrStakingIdempotencyKey
+		}
+		b, e := r.stakingWalletTx(ctx, tx, userID)
+		if e != nil {
+			return nil, false, e
+		}
+		return b, false, tx.Commit(ctx)
+	}
+	if err != pgx.ErrNoRows {
+		return nil, false, err
+	}
+
+	if err := r.ledger.debitBalanceTx(ctx, tx, userID, "BI2X", amountRaw); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE staking_wallet_balances SET available_raw=available_raw+$2::numeric,updated_at=now() WHERE user_id=$1`, userID, amountRaw); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO staking_wallet_entries(user_id,kind,amount_raw,idempotency_key) VALUES($1,'main_to_staking',$2,$3)`, userID, amountRaw, key); err != nil {
+		return nil, false, err
+	}
+	b, err := r.stakingWalletTx(ctx, tx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+// UnfundStakingWalletAsset moves available staking-wallet BI2X (funded but
+// not staked, or redeemed-and-returned) back to the main wallet — the
+// logical reverse of FundStakingWalletAsset, same idempotency guarantee.
+func (r *StakingRepo) UnfundStakingWalletAsset(ctx context.Context, userID, amountRaw, idempotencyKey string) (*StakingWalletBalance, bool, error) {
+	if err := validatePositiveAmount(amountRaw); err != nil {
+		return nil, false, err
+	}
+	key, err := validateIdempotencyKey(idempotencyKey, true)
+	if err != nil {
+		return nil, false, err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.ledger.lockBalance(ctx, tx, userID); err != nil {
+		return nil, false, err
+	}
+	if err := r.lockStakingWallet(ctx, tx, userID); err != nil {
+		return nil, false, err
+	}
+
+	var prior string
+	err = tx.QueryRow(ctx, `SELECT amount_raw::text FROM staking_wallet_entries WHERE user_id=$1 AND kind='staking_to_main' AND idempotency_key=$2`, userID, key).Scan(&prior)
+	if err == nil {
+		if prior != amountRaw {
+			return nil, false, ErrStakingIdempotencyKey
+		}
+		b, e := r.stakingWalletTx(ctx, tx, userID)
+		if e != nil {
+			return nil, false, e
+		}
+		return b, false, tx.Commit(ctx)
+	}
+	if err != pgx.ErrNoRows {
+		return nil, false, err
+	}
+
+	tag, err := tx.Exec(ctx, `UPDATE staking_wallet_balances SET available_raw=available_raw-$2::numeric,updated_at=now() WHERE user_id=$1 AND available_raw>=$2::numeric`, userID, amountRaw)
+	if err != nil {
+		return nil, false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, false, fmt.Errorf("insufficient available BI2X in staking wallet")
+	}
+	if err := r.ledger.creditBalanceTx(ctx, tx, userID, "BI2X", amountRaw); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO staking_wallet_entries(user_id,kind,amount_raw,idempotency_key) VALUES($1,'staking_to_main',$2,$3)`, userID, amountRaw, key); err != nil {
+		return nil, false, err
+	}
+	b, err := r.stakingWalletTx(ctx, tx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
 }
 
 // Positions returns every staking position for userID, most recently
@@ -102,11 +266,12 @@ func (r *StakingRepo) Events(ctx context.Context, userID string, limit int) ([]m
 	return out, rows.Err()
 }
 
-// Stake debits amountRaw of BI2X from userID's wallet balance and opens a
-// new staking position for it, in one transaction — mirrors
-// LedgerRepo.SwapBalance's shape (debit then insert, single tx, single
-// user, no extra app-level lock needed beyond the row lock debitBalanceTx
-// already takes on user_balances).
+// Stake moves amountRaw of BI2X from the staking wallet's available balance
+// into a new staking position, in one transaction — Phase 3 of
+// ~/.claude/plans/wallet-separation.md: staking no longer debits
+// user_balances directly (see ensureStakingWalletTables' doc comment); a
+// user must first move funds in via FundStakingWalletAsset, same as P2P's
+// CreateListing draws from p2p_wallet_balances rather than the main wallet.
 func (r *StakingRepo) Stake(ctx context.Context, userID, amountRaw string) (models.StakingPosition, error) {
 	if err := validatePositiveAmount(amountRaw); err != nil {
 		return models.StakingPosition{}, err
@@ -117,8 +282,15 @@ func (r *StakingRepo) Stake(ctx context.Context, userID, amountRaw string) (mode
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := r.ledger.debitBalanceTx(ctx, tx, userID, "BI2X", amountRaw); err != nil {
+	if err := r.lockStakingWallet(ctx, tx, userID); err != nil {
 		return models.StakingPosition{}, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE staking_wallet_balances SET available_raw=available_raw-$2::numeric,reserved_raw=reserved_raw+$2::numeric,updated_at=now() WHERE user_id=$1 AND available_raw>=$2::numeric`, userID, amountRaw)
+	if err != nil {
+		return models.StakingPosition{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return models.StakingPosition{}, fmt.Errorf("insufficient available BI2X in staking wallet; fund it first")
 	}
 
 	var p models.StakingPosition
@@ -206,8 +378,22 @@ func (r *StakingRepo) Redeem(ctx context.Context, userID, positionID, amountRaw 
 
 	payout := new(big.Int).Add(redeemAmount, interest)
 
-	if err := r.ledger.creditBalanceTx(ctx, tx, userID, "BI2X", payout.String()); err != nil {
+	// Release redeemAmount from the staking wallet's reserved_raw (reserved
+	// at Stake time) and credit the full payout (principal + interest) into
+	// available_raw — the interest itself was never reserved, so it's a
+	// pure credit on top of the release. Phase 3: the staking wallet, not
+	// user_balances, is what this feature pays into; see Stake's doc
+	// comment and ensureStakingWalletTables.
+	if err := r.lockStakingWallet(ctx, tx, userID); err != nil {
 		return RedeemResult{}, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE staking_wallet_balances SET reserved_raw=reserved_raw-$2::numeric,available_raw=available_raw+$3::numeric,updated_at=now() WHERE user_id=$1 AND reserved_raw>=$2::numeric`,
+		userID, redeemAmount.String(), payout.String())
+	if err != nil {
+		return RedeemResult{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return RedeemResult{}, fmt.Errorf("staking wallet reserved balance is inconsistent with position principal")
 	}
 
 	remaining := new(big.Int).Sub(principal, redeemAmount)

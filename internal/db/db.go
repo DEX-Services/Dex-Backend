@@ -134,6 +134,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"P2P multi-asset support (USDT/USDC)", ensureP2PMultiAssetSupport},
 		{"user_balances market-type partition (Spot/Futures/Options)", ensureUserBalancesMarketType},
 		{"engine_backfill_failures market-type partition", ensureEngineBackfillFailuresMarketType},
+		{"staking wallet tables", ensureStakingWalletTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1062,6 +1063,62 @@ CREATE TABLE IF NOT EXISTS staking_events (
 );
 CREATE INDEX IF NOT EXISTS idx_staking_events_user
     ON staking_events (user_id, created_at DESC);
+`
+
+// ensureStakingWalletTables adds a dedicated staking wallet (Phase 3 of
+// ~/.claude/plans/wallet-separation.md), a structural copy of P2P's own
+// wallet pattern (p2p_wallet_balances/p2p_wallet_entries/FundWalletAsset in
+// internal/repo/p2p.go) — staking's debit/credit activity is already
+// arm's-length from the live matching engine, so it gets the simpler
+// Postgres-wallet-plus-funding-transfer treatment rather than an
+// engine-ledger pool like Spot/Futures (Category B vs Category A in the
+// plan doc).
+//
+// staking_wallet_balances is single-asset (BI2X) by design — unlike P2P's
+// multi-asset table, staking has never supported anything else (see
+// ensureStakingTables' asset CHECK) — so it's keyed by user_id alone rather
+// than (user_id, asset), with no asset column to mismatch. available_raw
+// is funds moved in from the main wallet but not yet staked (fundable back
+// out, or stakeable); reserved_raw mirrors P2P's naming for the amount
+// currently locked into open staking_positions, kept even though nothing
+// else currently reads it, so a future partial-unstake-request feature (if
+// ever added) has the same reserve/release shape P2P already uses rather
+// than needing its own.
+//
+// Stake now draws directly from this wallet's available_raw instead of
+// debiting user_balances directly — a user funds the staking wallet first
+// (FundStakingWalletAsset, main -> staking, mirrors FundWalletAsset), then
+// Stake/Redeem move funds between this wallet's available/reserved columns
+// the same way P2P's order flow does with its own wallet. Redeemed
+// principal+interest lands back in this wallet's available_raw, not
+// straight back into user_balances — withdrawing it to the main wallet is
+// a separate, explicit transfer (FundStakingWalletAsset's logical reverse),
+// consistent with the plan's "funding-transfer" pattern rather than
+// Stake/Redeem silently crossing wallet boundaries on their own.
+const ensureStakingWalletTables = `
+CREATE TABLE IF NOT EXISTS staking_wallet_balances (
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    available_raw NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (available_raw >= 0),
+    reserved_raw  NUMERIC(38,0) NOT NULL DEFAULT 0 CHECK (reserved_raw >= 0),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id)
+);
+
+CREATE TABLE IF NOT EXISTS staking_wallet_entries (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    position_id     UUID REFERENCES staking_positions(id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('main_to_staking', 'staking_to_main', 'stake', 'redeem')),
+    amount_raw      NUMERIC(38,0) NOT NULL CHECK (amount_raw > 0),
+    idempotency_key TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_staking_wallet_entries_user
+    ON staking_wallet_entries (user_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_staking_wallet_fund_idempotency
+    ON staking_wallet_entries (user_id, kind, idempotency_key)
+    WHERE kind IN ('main_to_staking', 'staking_to_main') AND idempotency_key IS NOT NULL;
 `
 
 // ensureTreasuryEntryPredictionCategory widens platform_treasury_entries'

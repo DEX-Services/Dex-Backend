@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,6 +67,88 @@ func (s *StakingServer) acquireAccountSlot(ctx context.Context, accountID string
 	case <-ctx.Done():
 		return nil, false
 	}
+}
+
+// fundStakingWalletRequest mirrors fundP2PWalletRequest minus the Asset
+// field — the staking wallet is BI2X-only (see ensureStakingWalletTables).
+type fundStakingWalletRequest struct {
+	AmountRaw      string `json:"amountRaw"`
+	IdempotencyKey string `json:"idempotencyKey"`
+}
+
+func stakingWalletErrorStatus(err error) int {
+	if errors.Is(err, repo.ErrStakingIdempotencyKey) {
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
+}
+
+// WalletBalance handles GET /staking/wallet: the caller's staking wallet
+// snapshot (available/reserved/total BI2X) — Phase 3 of
+// ~/.claude/plans/wallet-separation.md.
+func (s *StakingServer) WalletBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	balance, err := s.Staking.WalletBalance(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load staking wallet")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
+}
+
+// FundWallet handles POST /staking/wallet/fund: moves available main-wallet
+// BI2X into the staking wallet, the only way to get funds into it (Stake
+// then draws from this wallet, never from the main wallet directly).
+func (s *StakingServer) FundWallet(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req fundStakingWalletRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	balance, _, err := s.Staking.FundStakingWalletAsset(r.Context(), accountID, req.AmountRaw, req.IdempotencyKey)
+	if err != nil {
+		writeError(w, stakingWalletErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
+}
+
+// UnfundWallet handles POST /staking/wallet/unfund: moves available
+// staking-wallet BI2X (funded but not staked, or redeemed-and-returned)
+// back to the main wallet.
+func (s *StakingServer) UnfundWallet(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	accountID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req fundStakingWalletRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	balance, _, err := s.Staking.UnfundStakingWalletAsset(r.Context(), accountID, req.AmountRaw, req.IdempotencyKey)
+	if err != nil {
+		writeError(w, stakingWalletErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
 }
 
 type stakeRequest struct {

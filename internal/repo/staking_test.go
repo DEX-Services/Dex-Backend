@@ -58,11 +58,27 @@ func TestAccruedInterest_ZeroPrincipalOrAprIsZero(t *testing.T) {
 	}
 }
 
+// fundStakingWallet is the test helper every staking test uses to get BI2X
+// into the staking wallet, Phase 3's replacement for crediting
+// user_balances directly: Stake now draws from staking_wallet_balances, not
+// the main wallet, so a test must fund that wallet first via
+// FundStakingWalletAsset, mirroring how a real user would.
+func fundStakingWallet(t *testing.T, ctx context.Context, ledger *LedgerRepo, staking *StakingRepo, userID, amountRaw string) {
+	t.Helper()
+	if err := ledger.CreditBalance(ctx, userID, "BI2X", amountRaw); err != nil {
+		t.Fatalf("credit main wallet: %v", err)
+	}
+	if _, _, err := staking.FundStakingWalletAsset(ctx, userID, amountRaw, "test-fund-"+userID); err != nil {
+		t.Fatalf("fund staking wallet: %v", err)
+	}
+}
+
 // TestStakeAndRedeem_FullCycle is an end-to-end integration test against a
-// real Postgres instance: stake debits the wallet, the position exists,
-// redeeming the full amount pays back principal (interest may be 0 if the
-// test runs faster than a second, which is fine and expected) and closes
-// the position, and the wallet balance reflects the payout.
+// real Postgres instance: stake moves funds from the staking wallet into a
+// position, the position exists, redeeming the full amount pays back
+// principal (interest may be 0 if the test runs faster than a second,
+// which is fine and expected) and closes the position, and the staking
+// wallet balance reflects the payout.
 func TestStakeAndRedeem_FullCycle(t *testing.T) {
 	pool := testPool(t)
 	ledger := NewLedgerRepo(pool)
@@ -70,9 +86,7 @@ func TestStakeAndRedeem_FullCycle(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "10000000000"); err != nil { // 10,000 BI2X at raw scale 6
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "10000000000") // 10,000 BI2X at raw scale 6
 
 	pos, err := staking.Stake(ctx, userID, "5000000000") // 5,000 BI2X
 	if err != nil {
@@ -82,12 +96,15 @@ func TestStakeAndRedeem_FullCycle(t *testing.T) {
 		t.Fatalf("unexpected position after stake: %+v", pos)
 	}
 
-	balances, err := ledger.BalancesFor(ctx, userID)
+	wallet, err := staking.WalletBalance(ctx, userID)
 	if err != nil {
-		t.Fatalf("balances: %v", err)
+		t.Fatalf("wallet balance: %v", err)
 	}
-	if balances["BI2X"] != "5000000000" {
-		t.Fatalf("BI2X balance after staking 5000 of 10000 = %s, want 5000000000 remaining", balances["BI2X"])
+	if wallet.AvailableRaw != "5000000000" {
+		t.Fatalf("staking wallet available after staking 5000 of 10000 = %s, want 5000000000 remaining", wallet.AvailableRaw)
+	}
+	if wallet.ReservedRaw != "5000000000" {
+		t.Fatalf("staking wallet reserved after staking 5000 = %s, want 5000000000", wallet.ReservedRaw)
 	}
 
 	positions, err := staking.Positions(ctx, userID)
@@ -109,16 +126,20 @@ func TestStakeAndRedeem_FullCycle(t *testing.T) {
 		t.Fatalf("redeemed principal = %s, want 5000000000", result.PrincipalRaw)
 	}
 
-	balancesAfter, err := ledger.BalancesFor(ctx, userID)
+	walletAfter, err := staking.WalletBalance(ctx, userID)
 	if err != nil {
-		t.Fatalf("balances after redeem: %v", err)
+		t.Fatalf("wallet balance after redeem: %v", err)
 	}
-	// Should be back to at least 10000000000 (the interest earned in this
-	// near-instant test is likely 0, but must never be negative or lost).
-	got, _ := new(big.Int).SetString(balancesAfter["BI2X"], 10)
+	if walletAfter.ReservedRaw != "0" {
+		t.Fatalf("staking wallet reserved after full redeem = %s, want 0", walletAfter.ReservedRaw)
+	}
+	// Should be back to at least 10000000000 available (the interest earned
+	// in this near-instant test is likely 0, but must never be negative or
+	// lost).
+	got, _ := new(big.Int).SetString(walletAfter.AvailableRaw, 10)
 	want, _ := new(big.Int).SetString("10000000000", 10)
 	if got.Cmp(want) < 0 {
-		t.Fatalf("BI2X balance after full redeem = %s, want >= %s (principal fully returned, plus any interest)", got, want)
+		t.Fatalf("staking wallet available after full redeem = %s, want >= %s (principal fully returned, plus any interest)", got, want)
 	}
 }
 
@@ -132,9 +153,7 @@ func TestPartialRedeem_KeepsRemainderStartTime(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "5000000000"); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "5000000000")
 	pos, err := staking.Stake(ctx, userID, "5000000000")
 	if err != nil {
 		t.Fatalf("stake: %v", err)
@@ -165,9 +184,7 @@ func TestRedeem_RejectsAmountExceedingPrincipal(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "1000000000"); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "1000000000")
 	pos, err := staking.Stake(ctx, userID, "1000000000")
 	if err != nil {
 		t.Fatalf("stake: %v", err)
@@ -187,9 +204,7 @@ func TestRedeem_RejectsAlreadyRedeemedPosition(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "1000000000"); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "1000000000")
 	pos, err := staking.Stake(ctx, userID, "1000000000")
 	if err != nil {
 		t.Fatalf("stake: %v", err)
@@ -203,7 +218,7 @@ func TestRedeem_RejectsAlreadyRedeemedPosition(t *testing.T) {
 }
 
 // TestStake_RejectsInsufficientBalance confirms staking more than the
-// account holds is rejected, exactly like an ordinary debit would be.
+// staking wallet holds is rejected, exactly like an ordinary debit would be.
 func TestStake_RejectsInsufficientBalance(t *testing.T) {
 	pool := testPool(t)
 	ledger := NewLedgerRepo(pool)
@@ -211,11 +226,95 @@ func TestStake_RejectsInsufficientBalance(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "100"); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "100")
 	if _, err := staking.Stake(ctx, userID, "200"); err == nil {
-		t.Fatal("expected stake to reject an amount exceeding the account's balance")
+		t.Fatal("expected stake to reject an amount exceeding the staking wallet's balance")
+	}
+}
+
+// TestStake_RejectsWhenStakingWalletNeverFunded confirms Stake fails (not
+// panics, not succeeds by falling back to the main wallet) for an account
+// that has never called FundStakingWalletAsset — Phase 3's whole point is
+// that Stake can no longer reach the main wallet at all.
+func TestStake_RejectsWhenStakingWalletNeverFunded(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	staking := NewStakingRepo(pool, ledger)
+	userID := newTestUser(t, pool)
+	ctx := context.Background()
+
+	// Fund the MAIN wallet only — never the staking wallet.
+	if err := ledger.CreditBalance(ctx, userID, "BI2X", "10000000000"); err != nil {
+		t.Fatalf("credit main wallet: %v", err)
+	}
+	if _, err := staking.Stake(ctx, userID, "100"); err == nil {
+		t.Fatal("expected stake to reject when the staking wallet was never funded, even though the main wallet has plenty")
+	}
+}
+
+// TestFundStakingWalletAsset_Idempotent confirms a retried fund request
+// with the same idempotency key is a safe no-op (mirrors
+// P2PRepo.FundWalletAsset's own guarantee).
+func TestFundStakingWalletAsset_Idempotent(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	staking := NewStakingRepo(pool, ledger)
+	userID := newTestUser(t, pool)
+	ctx := context.Background()
+
+	if err := ledger.CreditBalance(ctx, userID, "BI2X", "1000000000"); err != nil {
+		t.Fatalf("credit main wallet: %v", err)
+	}
+	key := "fund-key-1"
+	b1, moved1, err := staking.FundStakingWalletAsset(ctx, userID, "500000000", key)
+	if err != nil {
+		t.Fatalf("first fund: %v", err)
+	}
+	if !moved1 {
+		t.Fatal("expected first fund call to report moved=true")
+	}
+	b2, moved2, err := staking.FundStakingWalletAsset(ctx, userID, "500000000", key)
+	if err != nil {
+		t.Fatalf("retried fund: %v", err)
+	}
+	if moved2 {
+		t.Fatal("expected retried fund call with the same key to report moved=false")
+	}
+	if b1.AvailableRaw != b2.AvailableRaw {
+		t.Fatalf("retried fund changed the balance: %s -> %s", b1.AvailableRaw, b2.AvailableRaw)
+	}
+	// A different amount under the same key must fail outright, not silently
+	// apply the new amount.
+	if _, _, err := staking.FundStakingWalletAsset(ctx, userID, "999", key); err == nil {
+		t.Fatal("expected reusing the same idempotency key with a different amount to fail")
+	}
+}
+
+// TestUnfundStakingWalletAsset_RespectsAvailableNotReserved confirms
+// unfunding can only draw on available, not reserved (staked) funds —
+// mirrors how every other balance-reducing operation in this system
+// behaves.
+func TestUnfundStakingWalletAsset_RespectsAvailableNotReserved(t *testing.T) {
+	pool := testPool(t)
+	ledger := NewLedgerRepo(pool)
+	staking := NewStakingRepo(pool, ledger)
+	userID := newTestUser(t, pool)
+	ctx := context.Background()
+
+	fundStakingWallet(t, ctx, ledger, staking, userID, "1000000000")
+	if _, err := staking.Stake(ctx, userID, "900000000"); err != nil {
+		t.Fatalf("stake: %v", err)
+	}
+	// Only 100000000 remains available; unfunding more than that must fail.
+	if _, _, err := staking.UnfundStakingWalletAsset(ctx, userID, "200000000", "unfund-key-1"); err == nil {
+		t.Fatal("expected unfund exceeding available (not total) balance to fail")
+	}
+	b, _, err := staking.UnfundStakingWalletAsset(ctx, userID, "100000000", "unfund-key-2")
+	if err != nil {
+		t.Fatalf("unfund exactly available amount: %v", err)
+	}
+	if b.AvailableRaw != "0" {
+		t.Fatalf("staking wallet available after unfunding exactly what was available = %s, want 0", b.AvailableRaw)
 	}
 }
 
@@ -231,9 +330,7 @@ func TestEvents_RecordsInterestPaidPerRedemption(t *testing.T) {
 	userID := newTestUser(t, pool)
 	ctx := context.Background()
 
-	if err := ledger.CreditBalance(ctx, userID, "BI2X", "1000000000"); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	fundStakingWallet(t, ctx, ledger, staking, userID, "1000000000")
 	pos, err := staking.Stake(ctx, userID, "1000000000")
 	if err != nil {
 		t.Fatalf("stake: %v", err)
