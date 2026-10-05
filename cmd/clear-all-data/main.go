@@ -68,6 +68,32 @@ var tables = []string{
 	"referral_config",
 	"affiliate_links",
 	"user_referral_links",
+	// Added by Phase 1-4 of ~/.claude/plans/wallet-separation.md and the
+	// durability/idempotency work alongside it — missing from this list
+	// entirely before now, so a "clear everything" run left these tables'
+	// old rows behind even though every other table was wiped.
+	"engine_backfill_failures",
+	"internal_idempotency_keys",
+	"pending_backend_sync",
+	"staking_positions",
+	"staking_events",
+	"staking_wallet_balances",
+	"staking_wallet_entries",
+	"prediction_windows",
+	"prediction_orders",
+	"prediction_fills",
+	"prediction_positions",
+	"prediction_settlements",
+	"prediction_pending_fills",
+	"prediction_wallet_balances",
+	"prediction_wallet_entries",
+	"swap_pool_balances",
+	"swap_pool_entries",
+	"bi2x_allocation_balances",
+	"bi2x_allocation_history",
+	"partner_accounts",
+	"partner_profit_splits",
+	"prop_firm_purchases",
 	// Shared between Dex-Backend and the matching-engine (both migrate it)
 	"fee_config",
 	"fee_tiers",
