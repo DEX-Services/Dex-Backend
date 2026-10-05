@@ -807,46 +807,52 @@ func (s *WalletServer) runBackfill(ctx context.Context) (synced, failed, total i
 	// wins if a legitimate credit already changed the balance since the
 	// failure was recorded.
 	//
-	// AllNonzeroBalances/PendingBackfillFailures now return rows across all
-	// market pools (Spot/Futures/Options), but EngineClient.Credit only ever
-	// targets the engine's Spot pool (the admin credit endpoint defaults to
-	// Spot — see cmd/engine/main.go's /admin/balance handler). Restoring
-	// Futures/Options balances through this path isn't wired yet (tracked in
-	// ~/.claude/plans/wallet-separation.md's later phases), so this loop
-	// filters to SPOT rows only for now rather than mis-crediting a
-	// Futures/Options balance into the wrong pool.
-	seen := make(map[[2]string]bool, len(pending)+len(balances))
+	// AllNonzeroBalances/PendingBackfillFailures return rows across every
+	// market pool (Spot/Futures/Options) that lives in the engine's
+	// in-memory ledger — each row is credited into ITS OWN market via
+	// EngineClient.CreditMarket, not forced to Spot, so a Futures/Options
+	// balance restores into the same pool it was actually in before the
+	// engine restarted (previously this loop filtered non-SPOT rows out
+	// entirely, silently leaving Futures/Options at zero in the engine
+	// after every restart even though Postgres had the correct figure).
+	// Staking/Prediction/P2P never appear in AllNonzeroBalances at all —
+	// those wallets are plain Postgres tables with no engine mirror, so
+	// they need no backfill step; see each one's own schema comment.
+	seen := make(map[[3]string]bool, len(pending)+len(balances))
 	items := make([]backfillItem, 0, len(pending)+len(balances))
 	for _, p := range pending {
-		if p.Market != "" && p.Market != "SPOT" {
-			continue
+		market := p.Market
+		if market == "" {
+			market = "SPOT"
 		}
-		key := [2]string{p.UserID, p.Asset}
+		key := [3]string{p.UserID, market, p.Asset}
 		seen[key] = true
-		items = append(items, backfillItem{userID: p.UserID, asset: p.Asset, amount: p.Amount, alreadyHuman: true})
+		items = append(items, backfillItem{userID: p.UserID, market: market, asset: p.Asset, amount: p.Amount, alreadyHuman: true})
 	}
 	for _, b := range balances {
-		if b.Market != "" && b.Market != "SPOT" {
-			continue
+		market := b.Market
+		if market == "" {
+			market = "SPOT"
 		}
-		key := [2]string{b.UserID, b.Asset}
+		key := [3]string{b.UserID, market, b.Asset}
 		if seen[key] {
 			continue
 		}
-		items = append(items, backfillItem{userID: b.UserID, asset: b.Asset, amount: b.Amount})
+		items = append(items, backfillItem{userID: b.UserID, market: market, asset: b.Asset, amount: b.Amount})
 	}
 
 	return s.processBackfillItems(ctx, items)
 }
 
-// backfillItem is one (account, asset) pair runBackfill needs to credit.
-// amount is either a raw Postgres balance (needs rawToHumanUnits) or an
-// already-human-unit amount previously recorded by RecordBackfillFailure —
-// alreadyHuman distinguishes the two, since re-converting an
-// already-converted amount would silently shrink it by 10^6.
+// backfillItem is one (account, market, asset) triple runBackfill needs to
+// credit. amount is either a raw Postgres balance (needs rawToHumanUnits)
+// or an already-human-unit amount previously recorded by
+// RecordBackfillFailure — alreadyHuman distinguishes the two, since
+// re-converting an already-converted amount would silently shrink it by
+// 10^6.
 type backfillItem struct {
-	userID, asset, amount string
-	alreadyHuman          bool
+	userID, market, asset, amount string
+	alreadyHuman                  bool
 }
 
 // processBackfillItems is runBackfill's actual pacing/retry/durable-failure
@@ -883,20 +889,20 @@ func (s *WalletServer) processBackfillItems(ctx context.Context, items []backfil
 			}
 			amount = converted
 		}
-		if cerr := s.EngineClient.Credit(ctx, it.userID, it.asset, amount); cerr != nil {
-			s.Log.Error("backfill: credit failed", "err", cerr, "userId", it.userID, "asset", it.asset)
-			if rerr := s.Ledger.RecordBackfillFailure(ctx, it.userID, "SPOT", it.asset, amount, cerr.Error()); rerr != nil {
-				s.Log.Error("backfill: could not durably record failure", "err", rerr, "userId", it.userID, "asset", it.asset)
+		if cerr := s.EngineClient.CreditMarket(ctx, it.userID, it.market, it.asset, amount); cerr != nil {
+			s.Log.Error("backfill: credit failed", "err", cerr, "userId", it.userID, "market", it.market, "asset", it.asset)
+			if rerr := s.Ledger.RecordBackfillFailure(ctx, it.userID, it.market, it.asset, amount, cerr.Error()); rerr != nil {
+				s.Log.Error("backfill: could not durably record failure", "err", rerr, "userId", it.userID, "market", it.market, "asset", it.asset)
 			}
 			failed++
 			continue
 		}
 		if it.alreadyHuman {
-			// This was a previously-failed pair that just succeeded — clear
-			// its durable record so it stops being retried on every future
-			// run once it's actually fixed.
-			if cerr := s.Ledger.ClearBackfillFailure(ctx, it.userID, "SPOT", it.asset); cerr != nil {
-				s.Log.Error("backfill: could not clear resolved failure record", "err", cerr, "userId", it.userID, "asset", it.asset)
+			// This was a previously-failed triple that just succeeded —
+			// clear its durable record so it stops being retried on every
+			// future run once it's actually fixed.
+			if cerr := s.Ledger.ClearBackfillFailure(ctx, it.userID, it.market, it.asset); cerr != nil {
+				s.Log.Error("backfill: could not clear resolved failure record", "err", cerr, "userId", it.userID, "market", it.market, "asset", it.asset)
 			}
 		}
 		synced++

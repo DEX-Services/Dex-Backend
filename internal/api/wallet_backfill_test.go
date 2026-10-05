@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -220,5 +221,48 @@ func TestProcessBackfillItems_RecordsAndClearsDurableFailures(t *testing.T) {
 		if p.UserID == userID && p.Asset == "USDC" {
 			t.Fatalf("expected the durable failure record for %s/USDC to be cleared after a successful retry, still present: %+v", userID, p)
 		}
+	}
+}
+
+// TestProcessBackfillItems_RestoresNonSpotMarket is a regression test for
+// the gap this backfill fix closes: a Futures/Options balance used to be
+// filtered out of runBackfill entirely (left at zero in the engine forever
+// after a restart, even with the correct figure sitting in Postgres). This
+// asserts a FUTURES item is credited with its own market, not silently
+// dropped or forced to SPOT.
+func TestProcessBackfillItems_RestoresNonSpotMarket(t *testing.T) {
+	pool := testPool(t)
+	ledger := repo.NewLedgerRepo(pool)
+	userID := newBackfillTestUser(t, pool)
+
+	var gotMarket string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Market string `json:"market"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		gotMarket = body.Market
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := &WalletServer{
+		Server:       &Server{Log: slog.Default()},
+		Ledger:       ledger,
+		EngineClient: engineclient.NewForTest(srv.URL, "s", srv.Client()),
+	}
+
+	items := []backfillItem{{userID: userID, market: "FUTURES", asset: "BI2XUSD", amount: "71000000"}} // 71.0 BI2XUSD raw
+	synced, failed, _, err := s.processBackfillItems(context.Background(), items)
+	if err != nil {
+		t.Fatalf("processBackfillItems: %v", err)
+	}
+	if failed != 0 || synced != 1 {
+		t.Fatalf("synced=%d failed=%d, want synced=1 failed=0", synced, failed)
+	}
+	if gotMarket != "FUTURES" {
+		t.Fatalf("engine credit request carried market=%q, want FUTURES — a non-SPOT item must restore into its OWN market, not fall back to the engine's SPOT default", gotMarket)
 	}
 }

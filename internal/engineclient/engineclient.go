@@ -138,6 +138,12 @@ func NewForTest(baseURL, secret string, httpClient *http.Client) *Client {
 
 type syncReq struct {
 	AccountID string `json:"accountId"`
+	// Market is optional; an empty value defaults to the engine's SPOT pool
+	// (see /internal/ledger/sync's own doc comment on cmd/engine/main.go).
+	// Only CreditMarket/DebitMarket ever set this — every existing
+	// Credit/Debit caller leaves it empty, preserving their current
+	// SPOT-only behavior exactly.
+	Market    string `json:"market,omitempty"`
 	Asset     string `json:"asset"`
 	Amount    string `json:"amount"`
 	Direction string `json:"direction"`
@@ -184,13 +190,29 @@ func (e *StatusError) Retryable() bool {
 // SAME request ID across attempts so the engine's own dedup treats them as
 // one logical call, exactly like Async's retry loop does.
 func (c *Client) Credit(ctx context.Context, accountID, asset, amount string) error {
-	return c.callWithRetry(ctx, accountID, asset, amount, "credit", uuid.NewString())
+	return c.callWithRetry(ctx, accountID, "", asset, amount, "credit", uuid.NewString())
 }
 
 // Debit tells the engine to subtract amount from accountID's asset balance.
 // See Credit's doc comment on request IDs, retry behavior, and DebitAsync.
 func (c *Client) Debit(ctx context.Context, accountID, asset, amount string) error {
-	return c.callWithRetry(ctx, accountID, asset, amount, "debit", uuid.NewString())
+	return c.callWithRetry(ctx, accountID, "", asset, amount, "debit", uuid.NewString())
+}
+
+// CreditMarket is Credit targeting an explicit engine market pool (e.g.
+// "FUTURES") instead of the SPOT default — used by runBackfill to restore
+// a Futures/Options balance into the engine's in-memory ledger after a
+// restart wipes it (the gap documented on runBackfill's own doc comment:
+// Postgres's user_balances mirror is the durable copy for every market,
+// but the engine never automatically re-reads it on startup for anything
+// but SPOT until this).
+func (c *Client) CreditMarket(ctx context.Context, accountID, market, asset, amount string) error {
+	return c.callWithRetry(ctx, accountID, market, asset, amount, "credit", uuid.NewString())
+}
+
+// DebitMarket is Debit's CreditMarket counterpart.
+func (c *Client) DebitMarket(ctx context.Context, accountID, market, asset, amount string) error {
+	return c.callWithRetry(ctx, accountID, market, asset, amount, "debit", uuid.NewString())
 }
 
 type transferReq struct {
@@ -302,7 +324,7 @@ const (
 	callInternalRetryDelay    = 250 * time.Millisecond
 )
 
-func (c *Client) callWithRetry(ctx context.Context, accountID, asset, amount, direction, requestID string) error {
+func (c *Client) callWithRetry(ctx context.Context, accountID, market, asset, amount, direction, requestID string) error {
 	var err error
 	for attempt := 0; attempt < callInternalRetryAttempts; attempt++ {
 		if attempt > 0 {
@@ -312,7 +334,7 @@ func (c *Client) callWithRetry(ctx context.Context, accountID, asset, amount, di
 				return ctx.Err()
 			}
 		}
-		err = c.call(ctx, accountID, asset, amount, direction, requestID)
+		err = c.call(ctx, accountID, market, asset, amount, direction, requestID)
 		if err == nil {
 			return nil
 		}
@@ -324,11 +346,11 @@ func (c *Client) callWithRetry(ctx context.Context, accountID, asset, amount, di
 	return err
 }
 
-func (c *Client) call(ctx context.Context, accountID, asset, amount, direction, requestID string) error {
+func (c *Client) call(ctx context.Context, accountID, market, asset, amount, direction, requestID string) error {
 	if !c.Enabled() {
 		return nil
 	}
-	body, err := json.Marshal(syncReq{AccountID: accountID, Asset: asset, Amount: amount, Direction: direction, RequestID: requestID})
+	body, err := json.Marshal(syncReq{AccountID: accountID, Market: market, Asset: asset, Amount: amount, Direction: direction, RequestID: requestID})
 	if err != nil {
 		return err
 	}
@@ -377,14 +399,14 @@ const (
 func (c *Client) CreditAsync(op, accountID, asset, amount string) {
 	requestID := uuid.NewString()
 	Async(op, func(ctx context.Context) error {
-		return c.call(ctx, accountID, asset, amount, "credit", requestID)
+		return c.call(ctx, accountID, "", asset, amount, "credit", requestID)
 	})
 }
 
 func (c *Client) DebitAsync(op, accountID, asset, amount string) {
 	requestID := uuid.NewString()
 	Async(op, func(ctx context.Context) error {
-		return c.call(ctx, accountID, asset, amount, "debit", requestID)
+		return c.call(ctx, accountID, "", asset, amount, "debit", requestID)
 	})
 }
 
