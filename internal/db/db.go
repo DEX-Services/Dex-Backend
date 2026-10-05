@@ -654,7 +654,28 @@ BEGIN
 	END IF;
 END $wallet$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS user_balances_user_id_uidx ON user_balances (user_id);
+-- Guarded by market_type's absence: ensureUserBalancesMarketType (below,
+-- in the migration list) drops this exact index and replaces it with
+-- user_balances_user_id_market_uidx (user_id, market_type) the moment a
+-- user_balances row can legitimately have more than one row per user_id
+-- (one per market pool) — see that migration's own doc comment. Once that
+-- has run even once, creating THIS single-column unique index again is not
+-- just redundant, it's actively wrong: real per-market rows make user_id
+-- non-unique by design, and attempting to (re-)create a unique index over
+-- it fails outright on that duplication (confirmed live: "could not create
+-- unique index ... SQLSTATE 23505" blocked this service from starting at
+-- all on an otherwise-healthy, already-migrated database — this migration
+-- ran unconditionally on every single process boot, not just once, with no
+-- guard against the schema having already moved past what it assumes).
+DO $wallet$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'user_balances' AND column_name = 'market_type'
+	) THEN
+		CREATE UNIQUE INDEX IF NOT EXISTS user_balances_user_id_uidx ON user_balances (user_id);
+	END IF;
+END $wallet$;
 
 DO $wallet$
 BEGIN

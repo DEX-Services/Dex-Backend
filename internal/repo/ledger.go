@@ -573,12 +573,28 @@ func (r *LedgerRepo) UnlockBalanceMarketIdempotent(ctx context.Context, userID, 
 // deliberately an absolute replacement rather than unlock-then-lock, so a
 // quote refresh cannot temporarily expose an unfunded or over-locked state.
 func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets map[string]string) error {
+	return r.ReplaceLocksForMarket(ctx, userID, "SPOT", targets)
+}
+
+// ReplaceLocksForMarket is ReplaceLocksFor against an explicit market pool
+// — see ReleaseLocksForMarket's doc comment for why a Futures/Options desk
+// needs this: its ladder's locked-margin figure must be checked and set
+// against that same pool's row, not SPOT's (confirmed bug: a Futures desk
+// topped up via TransferBetweenPools/the engine's own ledger still failed
+// every requote with "insufficient balance to lock" because this function
+// kept checking the SPOT row, which the desk's Futures activity never
+// touched).
+func (r *LedgerRepo) ReplaceLocksForMarket(ctx context.Context, userID, market string, targets map[string]string) error {
+	market, err := normalizeMarket(market)
+	if err != nil {
+		return err
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
 	for asset, amountRaw := range targets {
@@ -589,13 +605,16 @@ func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets
 		if err := validateNonNegativeAmount(amountRaw); err != nil {
 			return err
 		}
-		pending, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
-		if err != nil {
-			return err
+		pending := new(big.Int)
+		if market == "SPOT" {
+			pending, err = r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+			if err != nil {
+				return err
+			}
 		}
 		lockedColumn := lockedColumns[normalized]
 		ct, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = $2::numeric, updated_at = now()
-			WHERE user_id = $1 AND market_type = 'SPOT' AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String())
+			WHERE user_id = $1 AND market_type = $4 AND `+column+` - $2::numeric - $3::numeric >= 0`, userID, amountRaw, pending.String(), market)
 		if err != nil {
 			return err
 		}
@@ -607,59 +626,102 @@ func (r *LedgerRepo) ReplaceLocksFor(ctx context.Context, userID string, targets
 }
 
 // ReleaseLocksFor clears all trading locks for one internal desk wallet and
-// asset after the matching engine has restarted and discarded its in-memory
-// orders. It preserves the wallet's balance. Desk wallets (mm:<base>:<market>
-// account ids) already get per-desk isolation via their own distinct
-// userID, so their user_balances row always lives under market_type='SPOT'
-// regardless of which market the desk itself trades — see lockBalance.
+// asset in the SPOT pool, after the matching engine has restarted and
+// discarded its in-memory orders. It preserves the wallet's balance.
+// Deprecated for a Futures/Options desk (see ReleaseLocksForMarket) — kept
+// as the SPOT-only wrapper most callers (a Spot desk, or the base leg of
+// any desk, which is always SPOT-only regardless of the desk's own market
+// — see legAsset in bots' mm/service.go) still want.
 func (r *LedgerRepo) ReleaseLocksFor(ctx context.Context, userID, asset string) error {
+	return r.ReleaseLocksForMarket(ctx, userID, "SPOT", asset)
+}
+
+// ReleaseLocksForMarket is ReleaseLocksFor against an explicit market pool.
+// A desk wallet (mm:<base>:<market> account id) gets isolation from every
+// OTHER desk via its own distinct userID, but a Futures/Options desk's own
+// quote-leg balance still has to live under market_type='FUTURES'/'OPTIONS'
+// in this same row-per-(user,market) schema — the engine's live risk ledger
+// checks that pool specifically, and this table is its durable mirror
+// (confirmed bug: a desk funded via the SPOT-only path here had its
+// deposited collateral land in Postgres SPOT while every order it placed
+// reserved against the engine's FUTURES pool, leaving FUTURES's balance
+// permanently at 0 and every requote rejected "insufficient balance").
+func (r *LedgerRepo) ReleaseLocksForMarket(ctx context.Context, userID, market, asset string) error {
 	normalized, _, err := normalizeAsset(asset)
 	if err != nil {
 		return err
 	}
+	market, err = normalizeMarket(market)
+	if err != nil {
+		return err
+	}
 	lockedColumn := lockedColumns[normalized]
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = $2`, userID, market); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// ResetBalanceFor clears a desk wallet's balance and trading locks for one
-// asset. It is used only when deleting/reclaiming an internal desk wallet.
+// ResetBalanceFor clears a desk wallet's SPOT balance and trading locks for
+// one asset. Deprecated for a Futures/Options desk — see
+// ResetBalanceForMarket.
 func (r *LedgerRepo) ResetBalanceFor(ctx context.Context, userID, asset string) error {
+	return r.ResetBalanceForMarket(ctx, userID, "SPOT", asset)
+}
+
+// ResetBalanceForMarket is ResetBalanceFor against an explicit market pool
+// — see ReleaseLocksForMarket's doc comment for why a Futures/Options desk
+// needs this. Used only when deleting/reclaiming an internal desk wallet.
+func (r *LedgerRepo) ResetBalanceForMarket(ctx context.Context, userID, market, asset string) error {
 	normalized, column, err := normalizeAsset(asset)
 	if err != nil {
 		return err
 	}
+	market, err = normalizeMarket(market)
+	if err != nil {
+		return err
+	}
 	lockedColumn := lockedColumns[normalized]
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = 0, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = $2`, userID, market); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// SyncBalanceFor makes an internal desk wallet's durable balance match its
-// authoritative desk allocation and clears trading locks. It is used only
-// during matching-engine restart recovery, after the engine has discarded all
+// SyncBalanceFor makes an internal desk wallet's durable SPOT balance match
+// its authoritative desk allocation and clears trading locks. Deprecated
+// for a Futures/Options desk — see SyncBalanceForMarket. Used only during
+// matching-engine restart recovery, after the engine has discarded all
 // in-memory orders and positions for that desk.
 func (r *LedgerRepo) SyncBalanceFor(ctx context.Context, userID, asset, amountRaw string) error {
+	return r.SyncBalanceForMarket(ctx, userID, "SPOT", asset, amountRaw)
+}
+
+// SyncBalanceForMarket is SyncBalanceFor against an explicit market pool —
+// see ReleaseLocksForMarket's doc comment for why a Futures/Options desk
+// needs this.
+func (r *LedgerRepo) SyncBalanceForMarket(ctx context.Context, userID, market, asset, amountRaw string) error {
 	normalized, column, err := normalizeAsset(asset)
+	if err != nil {
+		return err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return err
 	}
@@ -672,10 +734,10 @@ func (r *LedgerRepo) SyncBalanceFor(ctx context.Context, userID, asset, amountRa
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = $2::numeric, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = 'SPOT'`, userID, amountRaw); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+` = $2::numeric, `+lockedColumn+` = 0, updated_at = now() WHERE user_id = $1 AND market_type = $3`, userID, amountRaw, market); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1411,9 +1473,28 @@ func (r *LedgerRepo) PendingWithdrawalHoldsFor(ctx context.Context, userID strin
 	return holds, rows.Err()
 }
 
-// AvailableBalanceFor returns balance minus trading locks and pending withdrawal holds.
+// AvailableBalanceFor returns SPOT balance minus trading locks and pending
+// withdrawal holds. Deprecated for a Futures/Options desk — see
+// AvailableBalanceForMarket.
 func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token string) (string, error) {
+	return r.AvailableBalanceForMarket(ctx, userID, "SPOT", token)
+}
+
+// AvailableBalanceForMarket is AvailableBalanceFor against an explicit
+// market pool — see ReleaseLocksForMarket's doc comment for why a desk
+// trading Futures/Options needs this. The pending-withdrawal-hold
+// deduction is gated to SPOT only, same reasoning as LockBalanceMarket's
+// identical gate: withdrawals only ever debit the SPOT pool, so a pending
+// withdrawal should never constrain a different market's available figure
+// — not that a desk wallet can withdraw on-chain anyway, but this keeps
+// the one subquery shared between both code paths correct for every
+// caller.
+func (r *LedgerRepo) AvailableBalanceForMarket(ctx context.Context, userID, market, token string) (string, error) {
 	normalized, column, err := normalizeAsset(token)
+	if err != nil {
+		return "0", err
+	}
+	market, err = normalizeMarket(market)
 	if err != nil {
 		return "0", err
 	}
@@ -1423,15 +1504,18 @@ func (r *LedgerRepo) AvailableBalanceFor(ctx context.Context, userID, token stri
 		return "0", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.lockBalance(ctx, tx, userID); err != nil {
+	if err := r.lockBalanceMarket(ctx, tx, userID, market); err != nil {
 		return "0", err
 	}
-	pendingHold, err := r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
-	if err != nil {
-		return "0", err
+	pendingHold := new(big.Int)
+	if market == "SPOT" {
+		pendingHold, err = r.pendingWithdrawalHoldTx(ctx, tx, userID, normalized)
+		if err != nil {
+			return "0", err
+		}
 	}
 	var balanceRaw, lockedRaw string
-	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1 AND market_type = 'SPOT'`, userID).Scan(&balanceRaw, &lockedRaw); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT `+column+`::text, `+lockedColumn+`::text FROM user_balances WHERE user_id = $1 AND market_type = $2`, userID, market).Scan(&balanceRaw, &lockedRaw); err != nil {
 		return "0", err
 	}
 	balance, ok := new(big.Int).SetString(balanceRaw, 10)

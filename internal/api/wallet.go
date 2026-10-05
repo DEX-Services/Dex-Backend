@@ -942,6 +942,7 @@ type internalSpotSettleBody struct {
 
 type internalReplaceLocksBody struct {
 	UserID string            `json:"userId"`
+	Market string            `json:"market"`
 	Locks  map[string]string `json:"locks"`
 }
 
@@ -1045,7 +1046,7 @@ func (s *WalletServer) InternalReplaceLocks(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "userId and locks are required")
 		return
 	}
-	if err := s.Ledger.ReplaceLocksFor(r.Context(), req.UserID, req.Locks); err != nil {
+	if err := s.Ledger.ReplaceLocksForMarket(r.Context(), req.UserID, req.Market, req.Locks); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -1062,7 +1063,7 @@ func (s *WalletServer) InternalReleaseLocks(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.ReleaseLocksFor(r.Context(), req.UserID, req.Asset); err != nil {
+	if err := s.Ledger.ReleaseLocksForMarket(r.Context(), req.UserID, req.Market, req.Asset); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1085,39 +1086,22 @@ func (s *WalletServer) InternalAvailableBalance(w http.ResponseWriter, r *http.R
 	}
 	userID := strings.TrimSpace(r.URL.Query().Get("userId"))
 	asset := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("asset")))
+	// market is optional; empty defaults to SPOT (see
+	// LedgerRepo.normalizeMarket) for back-compat with callers that predate
+	// Phase 1's market partition. A Futures/Options desk wallet must pass
+	// its own market explicitly, or this reads the wrong pool entirely —
+	// see AvailableBalanceForMarket's doc comment for the bug this closes.
+	market := r.URL.Query().Get("market")
 	if userID == "" || asset == "" {
 		writeError(w, http.StatusBadRequest, "userId and asset are required")
 		return
 	}
-	balances, err := s.Ledger.BalancesFor(r.Context(), userID)
+	rawAvailable, err := s.Ledger.AvailableBalanceForMarket(r.Context(), userID, market, asset)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load balance: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "load available balance: "+err.Error())
 		return
 	}
-	locked, err := s.Ledger.LockedBalancesFor(r.Context(), userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load locked balance: "+err.Error())
-		return
-	}
-	rawTotal, ok := balances[asset]
-	if !ok {
-		writeError(w, http.StatusBadRequest, "unsupported asset "+asset)
-		return
-	}
-	total, ok := new(big.Int).SetString(rawTotal, 10)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "invalid balance amount")
-		return
-	}
-	lockedAmt, ok := new(big.Int).SetString(locked[asset], 10)
-	if !ok {
-		lockedAmt = big.NewInt(0)
-	}
-	available := new(big.Int).Sub(total, lockedAmt)
-	if available.Sign() < 0 {
-		available = big.NewInt(0)
-	}
-	humanAvailable, err := rawToHumanUnits(available.String())
+	humanAvailable, err := rawToHumanUnits(rawAvailable)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "convert balance: "+err.Error())
 		return
@@ -1135,7 +1119,7 @@ func (s *WalletServer) InternalResetBalance(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.ResetBalanceFor(r.Context(), req.UserID, req.Asset); err != nil {
+	if err := s.Ledger.ResetBalanceForMarket(r.Context(), req.UserID, req.Market, req.Asset); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1153,7 +1137,7 @@ func (s *WalletServer) InternalSyncBalance(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.Ledger.SyncBalanceFor(r.Context(), req.UserID, req.Asset, req.Amount); err != nil {
+	if err := s.Ledger.SyncBalanceForMarket(r.Context(), req.UserID, req.Market, req.Asset, req.Amount); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
