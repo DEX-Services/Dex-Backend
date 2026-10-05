@@ -137,6 +137,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"staking wallet tables", ensureStakingWalletTables},
 		{"prediction wallet tables", ensurePredictionWalletTables},
 		{"P2P wallet unfund idempotency", ensureP2PWalletUnfundIdempotency},
+		{"SIP/SWP plan tables", ensureSipSwpTables},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1524,6 +1525,68 @@ const ensureP2PWalletUnfundIdempotency = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_wallet_unfund_idempotency
     ON p2p_wallet_entries (user_id,kind,idempotency_key)
     WHERE kind='p2p_to_main' AND idempotency_key IS NOT NULL;
+`
+
+// ensureSipSwpTables adds real scheduled Spot execution for SIP
+// (Systematic Investment Plan) and SWP (Systematic Withdrawal Plan) —
+// previously src/pages/SIP.tsx was 100% frontend mock data with no backend
+// at all. A plan is pure metadata/audit (never a balance pool itself, so no
+// engine mirror needed, unlike user_balances): a SIP buys amount_usd_raw's
+// worth of `asset` via a real Spot MARKET order against the user's own
+// quote_asset balance on each scheduled date; a SWP sells amount_usd_raw's
+// worth of `asset` the same way, crediting quote_asset back. See
+// internal/sipswp's worker for the actual scheduling/execution logic this
+// schema supports.
+//
+// next_run_date is the scheduling key a background worker polls
+// (idx_sip_swp_plans_due) rather than a precise cron time, since a plan's
+// cadence is day-granularity ("the 5th of every month") not time-of-day —
+// the worker just needs to notice "today" has arrived for a plan sometime
+// during that day, so a brief restart never causes a missed cycle.
+//
+// sip_swp_executions' UNIQUE(plan_id, scheduled_date) is the worker's own
+// idempotency guard: a crash-and-retry mid-tick can't double-execute the
+// same day's cycle, since the second insert attempt for the same pair
+// simply fails the constraint and the worker treats that as "already
+// handled, move on" rather than placing a second real order.
+const ensureSipSwpTables = `
+CREATE TABLE IF NOT EXISTS sip_swp_plans (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL CHECK (kind IN ('SIP','SWP')),
+    name            TEXT NOT NULL,
+    asset           TEXT NOT NULL,
+    quote_asset     TEXT NOT NULL DEFAULT 'BI2XUSD',
+    amount_usd_raw  NUMERIC(38,0) NOT NULL CHECK (amount_usd_raw > 0),
+    frequency       TEXT NOT NULL CHECK (frequency IN ('DAILY','WEEKLY','MONTHLY','YEARLY')),
+    day_of_period   INT,
+    start_date      DATE NOT NULL,
+    end_date        DATE,
+    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','cancelled','completed')),
+    next_run_date   DATE NOT NULL,
+    executions_completed INT NOT NULL DEFAULT 0,
+    total_usd_raw   NUMERIC(38,0) NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sip_swp_plans_user ON sip_swp_plans (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sip_swp_plans_due ON sip_swp_plans (next_run_date) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS sip_swp_executions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id         UUID NOT NULL REFERENCES sip_swp_plans(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    scheduled_date  DATE NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('completed','skipped','failed')),
+    order_id        TEXT,
+    amount_usd_raw  NUMERIC(38,0) NOT NULL,
+    qty_raw         NUMERIC(38,0),
+    price           NUMERIC(38,18),
+    skip_reason     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, scheduled_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sip_swp_executions_plan ON sip_swp_executions (plan_id, scheduled_date DESC);
 `
 
 // ensureEngineBackfillFailuresMarketType adds the same market_type
