@@ -268,6 +268,33 @@ func (c *Client) BalanceForMarket(ctx context.Context, accountID, market, asset 
 	return out, err
 }
 
+// tickerResponse is a minimal projection of the engine's /ticker payload —
+// only the field SpotMidPrice actually needs, not the full set (fees,
+// funding rate, 24h stats) the real endpoint returns.
+type tickerResponse struct {
+	MidPrice string `json:"midPrice"`
+}
+
+// SpotMidPrice fetches the current SPOT mid price for symbol (e.g.
+// "BI2X-BI2XUSD") as a human-decimal string, same convention as every
+// other price figure in this API. Used by the SIP/SWP worker
+// (internal/api/sipswp.go) to convert a plan's fixed USD amount into a
+// base-asset quantity at execution time — the engine's /ticker is a public
+// (non-gated) endpoint, so this goes through tradeCall purely for its
+// existing HTTP-client plumbing, not because the secret header is actually
+// required here.
+func (c *Client) SpotMidPrice(ctx context.Context, symbol string) (string, error) {
+	var out tickerResponse
+	err := c.tradeCall(ctx, http.MethodGet, "/ticker", url.Values{"symbol": {symbol}, "market": {"SPOT"}}, &out)
+	if err != nil {
+		return "", err
+	}
+	if out.MidPrice == "" {
+		return "", fmt.Errorf("no mid price available for %s", symbol)
+	}
+	return out.MidPrice, nil
+}
+
 // HaltedSymbol is one entry of the engine's current halt state.
 type HaltedSymbol struct {
 	Symbol string `json:"symbol"`

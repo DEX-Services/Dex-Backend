@@ -139,6 +139,7 @@ func main() {
 	go srv.Nonces.Run(ctx)
 
 	stakingRepo := repo.NewStakingRepo(pool, ledgerRepo)
+	sipSwpRepo := repo.NewSipSwpRepo(pool)
 	walletSrv := &api.WalletServer{
 		Server:       srv,
 		Ledger:       ledgerRepo,
@@ -182,6 +183,12 @@ func main() {
 	feeSrv := &api.FeeServer{Server: srv, Fees: feesClient, FeeTiers: feeTierRepo, BI2XPrice: bi2xprice.NewHTTPReader()}
 	referralSrv := &api.ReferralServer{Server: srv, Referrals: referralRepo}
 	stakingSrv := &api.StakingServer{Server: srv, Staking: stakingRepo}
+	sipSwpSrv := &api.SipSwpServer{Server: srv, Trade: tradeSrv, Plans: sipSwpRepo}
+	// Runs unconditionally (unlike the withdrawal watchdog below, which is
+	// gated on DEXVAULT_ADDRESS/TREASURY_PRIVATE_KEY) — a SIP/SWP plan is a
+	// pure Spot MARKET order against the engine, with no on-chain/vault
+	// dependency at all.
+	go sipSwpSrv.RunSipSwpWorker(ctx)
 
 	if vaultAddress := os.Getenv("DEXVAULT_ADDRESS"); vaultAddress != "" {
 		chainClient, err := chain.NewClient(ctx, os.Getenv("FUJI_RPC_URL"), vaultAddress, os.Getenv("USDC_ADDRESS"))
@@ -325,6 +332,19 @@ func main() {
 	mux.HandleFunc("/staking/redeem", stakingSrv.Redeem)
 	mux.HandleFunc("/staking/positions", stakingSrv.Positions)
 	mux.HandleFunc("/staking/history", stakingSrv.History)
+
+	mux.HandleFunc("/sip/plans", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			sipSwpSrv.ListPlans(w, r)
+			return
+		}
+		sipSwpSrv.CreatePlan(w, r)
+	})
+	mux.HandleFunc("/sip/plans/get", sipSwpSrv.GetPlan)
+	mux.HandleFunc("/sip/plans/executions", sipSwpSrv.ListExecutions)
+	mux.HandleFunc("/sip/plans/pause", sipSwpSrv.PausePlan)
+	mux.HandleFunc("/sip/plans/resume", sipSwpSrv.ResumePlan)
+	mux.HandleFunc("/sip/plans/cancel", sipSwpSrv.CancelPlan)
 	mux.HandleFunc("/bi2x/price", feeSrv.Price)
 	mux.HandleFunc("/fees/tiers", feeSrv.Tiers)
 	mux.HandleFunc("/fees/my-subscription", feeSrv.MySubscription)

@@ -10,8 +10,9 @@ import "time"
 // cycle is computed at execution time from the live price, not stored here
 // (see SipSwpExecution.QtyRaw for what a specific cycle actually traded).
 type SipSwpPlan struct {
-	ID                  string    `json:"id"`
-	Kind                string    `json:"kind"` // "SIP" or "SWP"
+	ID     string `json:"id"`
+	UserID string `json:"-"` // never serialized — the owning session is implicit everywhere this is returned to a client; the SIP/SWP worker (internal/api/sipswp.go) needs it to place an order on the plan owner's behalf
+	Kind   string `json:"kind"` // "SIP" or "SWP"
 	Name                string    `json:"name"`
 	Asset               string    `json:"asset"`        // base asset bought (SIP) or sold (SWP), e.g. "BI2X"
 	QuoteAsset          string    `json:"quoteAsset"`   // cash asset debited (SIP) or credited (SWP), e.g. "BI2XUSD"

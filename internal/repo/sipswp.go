@@ -50,6 +50,14 @@ func NewSipSwpRepo(pool *pgxpool.Pool) *SipSwpRepo {
 	return &SipSwpRepo{pool: pool}
 }
 
+// Begin starts a transaction for the caller to run RecordExecution and
+// AdvancePlanAfterExecution in together (the SIP/SWP worker's call site —
+// see internal/api/sipswp.go) so a crash between the two never leaves a
+// recorded execution whose plan was never advanced, or vice versa.
+func (r *SipSwpRepo) Begin(ctx context.Context) (pgx.Tx, error) {
+	return r.pool.Begin(ctx)
+}
+
 func validSipSwpFrequency(f string) bool {
 	switch f {
 	case "DAILY", "WEEKLY", "MONTHLY", "YEARLY":
@@ -126,7 +134,7 @@ func scanSipSwpPlan(row pgx.Row) (*models.SipSwpPlan, error) {
 	var endDate *time.Time
 	var amountRaw, totalRaw string
 	if err := row.Scan(
-		&p.ID, &p.Kind, &p.Name, &p.Asset, &p.QuoteAsset, &amountRaw, &p.Frequency, &dayOfPeriod,
+		&p.ID, &p.UserID, &p.Kind, &p.Name, &p.Asset, &p.QuoteAsset, &amountRaw, &p.Frequency, &dayOfPeriod,
 		&startDate, &endDate, &p.Status, &nextRunDate, &p.ExecutionsCompleted, &totalRaw,
 		&p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
@@ -144,7 +152,7 @@ func scanSipSwpPlan(row pgx.Row) (*models.SipSwpPlan, error) {
 	return &p, nil
 }
 
-const sipSwpPlanColumns = `id, kind, name, asset, quote_asset, amount_usd_raw::text, frequency, day_of_period,
+const sipSwpPlanColumns = `id, user_id, kind, name, asset, quote_asset, amount_usd_raw::text, frequency, day_of_period,
 	start_date, end_date, status, next_run_date, executions_completed, total_usd_raw::text, created_at, updated_at`
 
 // GetPlan scopes by user_id in the same WHERE clause rather than fetching

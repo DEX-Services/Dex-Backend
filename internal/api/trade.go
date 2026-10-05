@@ -222,30 +222,51 @@ func (s *TradeServer) Order(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "LIMIT"
 	}
-	// Hold this account's slot across reconcile-then-submit so a second
-	// order from the same account can't read Postgres mid-window and
-	// corrupt the engine mirror — see acctLocks' doc comment on TradeServer.
-	release, ok := s.acquireAccountSlot(r.Context(), accountID)
-	if !ok {
-		writeError(w, http.StatusTooManyRequests, "too many concurrent orders for this account; retry shortly")
-		return
-	}
-	defer release()
-	if err := s.reconcileOrderBalance(r.Context(), accountID, req.Symbol, req.Market, req.Side); err != nil {
-		s.tradeError(w, err)
-		return
-	}
-	response, err := s.Engine.SubmitOrder(r.Context(), engineclient.TradeOrder{
+	response, err := s.submitOrderReconciled(r.Context(), accountID, engineclient.TradeOrder{
 		AccountID: accountID, Symbol: req.Symbol, Market: req.Market, Side: req.Side,
 		Type: req.Type, Price: req.Price, Qty: req.Qty, StopPrice: req.StopPrice,
 		ReduceOnly: req.ReduceOnly, SlippageBps: req.SlippageBps, Leverage: req.Leverage,
 		MarginMode: req.MarginMode, OptionType: req.OptionType, Strike: req.Strike, Expiry: req.Expiry,
 	})
 	if err != nil {
+		if errors.Is(err, errAccountSlotBusy) {
+			writeError(w, http.StatusTooManyRequests, "too many concurrent orders for this account; retry shortly")
+			return
+		}
 		s.tradeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// errAccountSlotBusy is submitOrderReconciled's sentinel for "this
+// account's order slot didn't free up in time" — distinct from every other
+// error submitOrderReconciled can return (a reconcile failure or the
+// engine's own rejection), since Order maps it to 429 specifically rather
+// than whatever status tradeError would otherwise pick.
+var errAccountSlotBusy = errors.New("account order slot busy")
+
+// submitOrderReconciled is Order's actual reconcile-then-submit sequence,
+// factored out so the SIP/SWP worker (internal/api/sipswp.go) can place a
+// real order through the exact same safety path a user-initiated order
+// goes through — the per-account slot serialization and balance-drift
+// reconcile this wraps exist specifically to prevent a documented
+// historical bug (see reconcileOrderBalance's doc comment on the
+// Balance-vs-Available incident), and a scheduled SIP/SWP order is no less
+// exposed to that drift than a manual one.
+func (s *TradeServer) submitOrderReconciled(ctx context.Context, accountID string, order engineclient.TradeOrder) (engineclient.OrderResponse, error) {
+	// Hold this account's slot across reconcile-then-submit so a second
+	// order from the same account can't read Postgres mid-window and
+	// corrupt the engine mirror — see acctLocks' doc comment on TradeServer.
+	release, ok := s.acquireAccountSlot(ctx, accountID)
+	if !ok {
+		return engineclient.OrderResponse{}, errAccountSlotBusy
+	}
+	defer release()
+	if err := s.reconcileOrderBalance(ctx, accountID, order.Symbol, order.Market, order.Side); err != nil {
+		return engineclient.OrderResponse{}, err
+	}
+	return s.Engine.SubmitOrder(ctx, order)
 }
 
 // reconcileOrderBalance repairs the engine mirror immediately before risk
