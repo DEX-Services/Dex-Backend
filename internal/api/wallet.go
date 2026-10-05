@@ -189,8 +189,27 @@ func (s *WalletServer) BalancesByArea(w http.ResponseWriter, r *http.Request) {
 		futuresBal, err := s.EngineClient.BalanceForMarket(ctx, claims.UserID, "FUTURES", "BI2XUSD")
 		if err != nil {
 			s.Log.Error("balances-by-area: futures balance lookup failed", "userId", claims.UserID, "err", err)
+		} else if availableRaw, convErr := humanToRawUnits(futuresBal.Available); convErr != nil {
+			s.Log.Error("balances-by-area: futures balance conversion failed", "userId", claims.UserID, "err", convErr)
 		} else {
-			areas["FUTURES"] = areaBalance{AvailableRaw: futuresBal.Available, ReservedRaw: futuresBal.Reserved, TotalRaw: futuresBal.Balance}
+			// The engine's /admin/balance (what BalanceForMarket calls)
+			// reports Balance/Reserved/Available as plain decimal strings
+			// (e.g. "71"), the same convention rawToHumanUnits/
+			// humanToRawUnits elsewhere in this file convert against — NOT
+			// this platform's six-decimal raw integer scale every other
+			// areaBalance field uses. Converting only Available and
+			// swallowing errors on Reserved/Total individually would leave
+			// areaBalance inconsistent (e.g. Available in raw units next to
+			// Reserved/Total still in decimal), so this converts all three
+			// together or shows the area as unavailable, same "unknown vs
+			// zero" handling as the err != nil branch above.
+			reservedRaw, rErr := humanToRawUnits(futuresBal.Reserved)
+			totalRaw, tErr := humanToRawUnits(futuresBal.Balance)
+			if rErr != nil || tErr != nil {
+				s.Log.Error("balances-by-area: futures balance conversion failed", "userId", claims.UserID, "reservedErr", rErr, "totalErr", tErr)
+			} else {
+				areas["FUTURES"] = areaBalance{AvailableRaw: availableRaw, ReservedRaw: reservedRaw, TotalRaw: totalRaw}
+			}
 		}
 	}
 
@@ -894,6 +913,25 @@ func rawToHumanUnits(raw string) (string, error) {
 	}
 	r := new(big.Rat).SetFrac(n, big.NewInt(1_000_000))
 	return strings.TrimRight(strings.TrimRight(r.FloatString(6), "0"), "."), nil
+}
+
+// humanToRawUnits is rawToHumanUnits's inverse: converts the matching
+// engine's own decimal representation (e.g. BalanceResponse.Balance/
+// Reserved/Available from /admin/balance, as returned by
+// EngineClient.BalanceForMarket) to this platform's six-decimal raw integer
+// representation, so an engine-sourced figure can be returned through the
+// same areaBalance{AvailableRaw,ReservedRaw,TotalRaw} shape every other
+// wallet area uses (BalancesByArea's FUTURES branch).
+func humanToRawUnits(human string) (string, error) {
+	r, ok := new(big.Rat).SetString(human)
+	if !ok {
+		return "", fmt.Errorf("invalid decimal token amount %q", human)
+	}
+	r.Mul(r, big.NewRat(1_000_000, 1))
+	if !r.IsInt() {
+		return "", fmt.Errorf("decimal token amount %q has more than six fractional digits", human)
+	}
+	return r.Num().String(), nil
 }
 
 // InternalEngineBackfill: POST /internal/engine-backfill
