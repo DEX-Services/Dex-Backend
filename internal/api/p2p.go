@@ -155,6 +155,36 @@ func (s *P2PServer) FundWallet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
 }
 
+// UnfundWallet: POST /p2p/wallet/unfund moves available P2P-wallet balance
+// back into the main (SPOT) wallet — the reverse of FundWallet above.
+func (s *P2PServer) UnfundWallet(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	userID, ok := s.claims(w, r)
+	if !ok {
+		return
+	}
+	var req fundP2PWalletRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	if asset == "" {
+		asset = "BI2XUSD"
+	}
+	balance, moved, err := s.P2P.UnfundWalletAsset(r.Context(), userID, asset, req.AmountRaw, req.IdempotencyKey)
+	if err != nil {
+		writeError(w, p2pErrorStatus(err), err.Error())
+		return
+	}
+	if moved && s.Engine != nil {
+		s.Engine.CreditAsync("p2p wallet unfund credit", userID, asset, req.AmountRaw)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balance": balance})
+}
+
 func (s *P2PServer) Listings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		// P2P-L1: the marketplace previously returned every active listing

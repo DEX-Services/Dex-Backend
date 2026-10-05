@@ -289,6 +289,7 @@ func main() {
 	mux.HandleFunc("/p2p/profile", p2pSrv.Profile)
 	mux.HandleFunc("/p2p/fee-rates", p2pSrv.FeeRates)
 	mux.HandleFunc("/p2p/wallet/fund", p2pSrv.FundWallet)
+	mux.HandleFunc("/p2p/wallet/unfund", p2pSrv.UnfundWallet)
 	mux.HandleFunc("/p2p/listings", p2pSrv.Listings)
 	mux.HandleFunc("/p2p/my-listings", p2pSrv.MyListings)
 	mux.HandleFunc("/p2p/buy", p2pSrv.Buy)

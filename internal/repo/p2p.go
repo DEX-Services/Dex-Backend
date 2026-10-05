@@ -320,7 +320,17 @@ func (r *P2PRepo) FundWalletAsset(ctx context.Context, userID, asset, amountRaw,
 	if err != nil {
 		return nil, false, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+`=`+column+`-$2::numeric,updated_at=now() WHERE user_id=$1 AND `+column+`-`+lockedColumn+`-$3::numeric >= $2::numeric`, userID, amountRaw, pending.String())
+	// market_type='SPOT' is required here, not optional: this platform's
+	// user_balances has one row per (user_id, market_type) since Phase 1 of
+	// ~/.claude/plans/wallet-separation.md (a user can also have a FUTURES
+	// row). Without this filter the WHERE clause's own balance-sufficiency
+	// check is the only thing standing between this UPDATE and silently
+	// debiting the wrong pool's row — "main wallet" in this function's name
+	// has always meant SPOT specifically (P2P funds from the user's
+	// tradable balance, never their margin), so this makes that explicit
+	// instead of relying on it happening to still be the only row that
+	// matches.
+	tag, err := tx.Exec(ctx, `UPDATE user_balances SET `+column+`=`+column+`-$2::numeric,updated_at=now() WHERE user_id=$1 AND market_type='SPOT' AND `+column+`-`+lockedColumn+`-$3::numeric >= $2::numeric`, userID, amountRaw, pending.String())
 	if err != nil {
 		return nil, false, err
 	}
@@ -331,6 +341,91 @@ func (r *P2PRepo) FundWalletAsset(ctx context.Context, userID, asset, amountRaw,
 		return nil, false, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,kind,asset,amount_raw,idempotency_key) VALUES($1,'main_to_p2p',$2,$3,$4)`, userID, asset, amountRaw, key); err != nil {
+		return nil, false, err
+	}
+	b, err := r.walletTx(ctx, tx, userID, asset)
+	if err != nil {
+		return nil, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+// UnfundWallet moves available P2P-wallet BI2XUSD back into the main
+// (SPOT) wallet atomically. moved=false means an identical idempotent
+// request was already applied.
+func (r *P2PRepo) UnfundWallet(ctx context.Context, userID, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
+	return r.UnfundWalletAsset(ctx, userID, "BI2XUSD", amountRaw, idempotencyKey)
+}
+
+func (r *P2PRepo) UnfundWalletAsset(ctx context.Context, userID, asset, amountRaw, idempotencyKey string) (*models.P2PWalletBalance, bool, error) {
+	asset, err := normalizeP2PAsset(asset)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := validateP2PAmount(amountRaw); err != nil {
+		return nil, false, err
+	}
+	key, err := validateIdempotencyKey(idempotencyKey, true)
+	if err != nil {
+		return nil, false, err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err = r.ledger.lockBalance(ctx, tx, userID); err != nil {
+		return nil, false, err
+	}
+	if err = r.lockWallet(ctx, tx, userID, asset); err != nil {
+		return nil, false, err
+	}
+
+	var prior string
+	var priorAsset string
+	err = tx.QueryRow(ctx, `SELECT asset,amount_raw::text FROM p2p_wallet_entries WHERE user_id=$1 AND kind='p2p_to_main' AND idempotency_key=$2`, userID, key).Scan(&priorAsset, &prior)
+	if err == nil {
+		if priorAsset != asset || prior != amountRaw {
+			return nil, false, ErrP2PIdempotencyKey
+		}
+		b, e := r.walletTx(ctx, tx, userID, asset)
+		if e != nil {
+			return nil, false, e
+		}
+		return b, false, tx.Commit(ctx)
+	}
+	if err != pgx.ErrNoRows {
+		return nil, false, err
+	}
+
+	_, column, err := normalizeAsset(asset)
+	if err != nil {
+		return nil, false, err
+	}
+	// Debit the P2P wallet's own available_raw first (guarded by the same
+	// row lock taken above via lockWallet) — mirrors FundWalletAsset's
+	// ordering but in reverse: there the main wallet is debited first and
+	// the P2P wallet credited second, here the P2P wallet is debited first
+	// and the main (SPOT) wallet credited second.
+	tag, err := tx.Exec(ctx, `UPDATE p2p_wallet_balances SET available_raw=available_raw-$3::numeric,updated_at=now() WHERE user_id=$1 AND asset=$2 AND available_raw>=$3::numeric`, userID, asset, amountRaw)
+	if err != nil {
+		return nil, false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, false, fmt.Errorf("insufficient available %s in P2P wallet", asset)
+	}
+	// market_type='SPOT' is required here for the same reason as in
+	// FundWalletAsset above: user_balances has one row per
+	// (user_id, market_type) since Phase 1 of
+	// ~/.claude/plans/wallet-separation.md, and "main wallet" has always
+	// meant SPOT specifically for P2P purposes.
+	if _, err = tx.Exec(ctx, `UPDATE user_balances SET `+column+`=`+column+`+$2::numeric,updated_at=now() WHERE user_id=$1 AND market_type='SPOT'`, userID, amountRaw); err != nil {
+		return nil, false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO p2p_wallet_entries(user_id,kind,asset,amount_raw,idempotency_key) VALUES($1,'p2p_to_main',$2,$3,$4)`, userID, asset, amountRaw, key); err != nil {
 		return nil, false, err
 	}
 	b, err := r.walletTx(ctx, tx, userID, asset)

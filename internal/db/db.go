@@ -136,6 +136,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		{"engine_backfill_failures market-type partition", ensureEngineBackfillFailuresMarketType},
 		{"staking wallet tables", ensureStakingWalletTables},
 		{"prediction wallet tables", ensurePredictionWalletTables},
+		{"P2P wallet unfund idempotency", ensureP2PWalletUnfundIdempotency},
 	} {
 		slog.Info("running database migration", "migration", migration.name)
 		if _, err := pool.Exec(ctx, migration.sql); err != nil {
@@ -1505,6 +1506,24 @@ ALTER TABLE p2p_admin_wallet_entries ADD CONSTRAINT p2p_admin_wallet_entries_ass
 INSERT INTO p2p_price_history (asset, fiat_currency, price, price_date)
 VALUES ('USDT', 'INR', 100, CURRENT_DATE)
 ON CONFLICT (asset, fiat_currency, price_date) DO NOTHING;
+`
+
+// ensureP2PWalletUnfundIdempotency adds a real unique-constraint-backed
+// idempotency guarantee for the new P2P-to-main "unfund" direction
+// (kind='p2p_to_main'), mirroring idx_p2p_wallet_fund_idempotency's
+// existing guarantee for kind='main_to_p2p'. The original index was scoped
+// to only 'main_to_p2p' because unfund didn't exist yet; rather than widen
+// that index's WHERE clause (which would require dropping and recreating
+// it — same net effect, more ceremony), this adds a second partial unique
+// index scoped to 'p2p_to_main' specifically. Without this, a retried
+// unfund request's idempotency check would only be an app-level
+// SELECT-before-INSERT, not a real DB constraint — a race condition under
+// concurrent retries, same class of bug the original index prevents for
+// funding.
+const ensureP2PWalletUnfundIdempotency = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p2p_wallet_unfund_idempotency
+    ON p2p_wallet_entries (user_id,kind,idempotency_key)
+    WHERE kind='p2p_to_main' AND idempotency_key IS NOT NULL;
 `
 
 // ensureEngineBackfillFailuresMarketType adds the same market_type
