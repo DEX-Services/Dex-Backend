@@ -98,7 +98,7 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 60
+	cfg.MaxConns = 25
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
