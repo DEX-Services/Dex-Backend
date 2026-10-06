@@ -88,17 +88,23 @@ func New(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	slog.Info("initializing postgres", "timeout", "60s")
-	// Explicitly cap pool size: three services share one Aiven Postgres
-	// instance with a hard 100-connection limit. Without an explicit
-	// MaxConns, pgxpool defaults to max(4, NumCPU()) per process, which is
-	// unbounded relative to the shared limit on larger deploy hosts.
-	// matching-engine caps at 20, bots at 10; backend (heaviest HTTP/auth
-	// traffic) gets 25, leaving headroom under the shared limit.
+	// Explicitly cap pool size: four services share one Aiven Postgres
+	// instance with a hard 25-connection limit (dropped from 100 — Aiven
+	// plan downgrade, 2026-10-06). Without an explicit MaxConns, pgxpool
+	// defaults to max(4, NumCPU()) per process, which is unbounded relative
+	// to the shared limit on larger deploy hosts — exactly what caused
+	// repeated "remaining connection slots are reserved for roles with the
+	// SUPERUSER attribute" exhaustion the same day the limit dropped.
+	// matching-engine caps at 6, bots at 4, prediction-service at 4
+	// (previously completely uncapped — a second real contributor to that
+	// exhaustion, not just this service); backend (heaviest HTTP/auth
+	// traffic) gets 10, leaving 1 connection of headroom under the shared
+	// limit for a manual psql/diagnostic session.
 	cfg, err := pgxpool.ParseConfig(connString)
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 25
+	cfg.MaxConns = 10
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
